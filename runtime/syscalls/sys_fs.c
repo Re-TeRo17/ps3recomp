@@ -33,6 +33,16 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
+/* ---- Bink movie skip state (see fmv_skip_* at the end of the file) ---- */
+static struct {
+    int      fd;                 /* 0 = no movie open */
+    uint32_t frames, width, height;
+    uint32_t bink;               /* guest address of the BINK struct once found */
+    int      skipped;            /* a skip was issued; a looping movie may restart: re-skip allowed */
+    unsigned long long skip_ms;  /* tick of the last skip (FrameNum re-asserted for ~1 s) */
+    char     path[512];
+} g_fmv;
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -163,6 +173,212 @@ static void ps3game_fallback(char* path, size_t cap)
     if (stat(alt, &st) != 0)
         return;
     snprintf(path, cap, "%s", alt);
+}
+
+/* ---------------------------------------------------------------------------
+ * Mods folder: a file under <mods dir> at the same path, relative to the VFS
+ * root, as a game file is read INSTEAD of that file. Nothing under the root is
+ * touched; the original just is not opened.
+ *
+ *   mods\PS3_GAME\USRDIR\x   replaces   <root>\PS3_GAME\USRDIR\x   (/dev_bdvd/PS3_GAME/USRDIR/x)
+ *   mods\game\BCES00052\...  replaces   <root>\game\BCES00052\...   (/dev_hdd0/game/BCES00052/...)
+ *
+ * A leading "PS3_GAME" is optional on both sides (mods\USRDIR\x works too): the
+ * translators above drop or add it depending on which file exists, so it is
+ * not part of the key. Names are compared case-insensitively on Windows.
+ *
+ * The directory is walked ONCE, by ps3_mods_init(), into a hash set of keys; a
+ * lookup is a hash probe, never a disk access, and an empty or missing folder
+ * leaves the table empty so every call returns at its first test.
+ *
+ * Reads only. The callers ask after they know the open is read-only (and for
+ * stat, so the size the guest sees is the mod file's). Writes, mkdir, unlink,
+ * rename never reach it, so a save is never redirected into the folder.
+ * Directory listings are NOT extended: a mod-only file can be opened and
+ * stat'ed by name but does not show up in an opendir/readdir of its folder.
+ * -----------------------------------------------------------------------*/
+typedef struct { char* key; char* host; volatile int logged; } ps3_mod_ent;
+static ps3_mod_ent* g_mod_tab;           /* open addressing, power-of-two size */
+static size_t       g_mod_cap;
+static size_t       g_mod_n;             /* files held; 0 = feature idle */
+static char         g_mod_root[512];     /* VFS root, '/' separators, no leading "./" or trailing '/' */
+static size_t       g_mod_rootlen;
+
+static char mod_fold(char c)
+{
+    if (c == '\\') return '/';
+#ifdef _WIN32
+    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
+#endif
+    return c;
+}
+
+/* "./a\B/c" -> "a/b/c" (folded). Drops a leading "PS3_GAME/" when strip_game. */
+static int mod_key(const char* rel, int strip_game, char* out, size_t cap)
+{
+    while (rel[0] == '.' && (rel[1] == '/' || rel[1] == '\\')) rel += 2;
+    while (rel[0] == '/' || rel[0] == '\\') rel++;
+    if (strip_game) {
+        static const char g[] = "ps3_game";
+        size_t i = 0;
+        while (i < 8 && rel[i] && (rel[i] >= 'A' && rel[i] <= 'Z' ? rel[i] + 32 : rel[i]) == g[i]) i++;
+        if (i == 8 && (rel[8] == '/' || rel[8] == '\\')) rel += 9;
+    }
+    size_t n = 0;
+    for (; *rel; rel++) {
+        if (n + 1 >= cap) return 0;
+        out[n++] = mod_fold(*rel);
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static uint64_t mod_hash(const char* s)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
+
+static ps3_mod_ent* mod_find(const char* key)
+{
+    size_t i = (size_t)mod_hash(key) & (g_mod_cap - 1);
+    while (g_mod_tab[i].key) {
+        if (strcmp(g_mod_tab[i].key, key) == 0) return &g_mod_tab[i];
+        i = (i + 1) & (g_mod_cap - 1);
+    }
+    return NULL;
+}
+
+static int mod_add(const char* key, const char* host)
+{
+    if (!g_mod_cap || (g_mod_n + 1) * 2 > g_mod_cap) {
+        size_t ncap = g_mod_cap ? g_mod_cap * 2 : 256;
+        ps3_mod_ent* nt = (ps3_mod_ent*)calloc(ncap, sizeof *nt);
+        if (!nt) return 0;
+        for (size_t i = 0; i < g_mod_cap; i++) {
+            if (!g_mod_tab[i].key) continue;
+            size_t j = (size_t)mod_hash(g_mod_tab[i].key) & (ncap - 1);
+            while (nt[j].key) j = (j + 1) & (ncap - 1);
+            nt[j] = g_mod_tab[i];
+        }
+        free(g_mod_tab);
+        g_mod_tab = nt; g_mod_cap = ncap;
+    }
+    if (mod_find(key)) return 1;         /* both PS3_GAME\x and x present: the first wins */
+    size_t i = (size_t)mod_hash(key) & (g_mod_cap - 1);
+    while (g_mod_tab[i].key) i = (i + 1) & (g_mod_cap - 1);
+    size_t kl = strlen(key) + 1, hl = strlen(host) + 1;
+    char* k = (char*)malloc(kl); char* h = (char*)malloc(hl);
+    if (k) memcpy(k, key, kl);
+    if (h) memcpy(h, host, hl);
+    if (!k || !h) { free(k); free(h); return 0; }
+    g_mod_tab[i].key = k; g_mod_tab[i].host = h; g_mod_tab[i].logged = 0;
+    g_mod_n++;
+    return 1;
+}
+
+/* Walk <dir>\<sub> and add every regular file. */
+static void mod_scan(const char* dir, const char* sub, int depth)
+{
+    if (depth > 24) return;
+    char pat[1100];
+#ifdef _WIN32
+    snprintf(pat, sizeof pat, "%s\\%s%s*", dir, sub, sub[0] ? "\\" : "");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const char* nm = fd.cFileName;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+        char rel[1024];
+        snprintf(rel, sizeof rel, "%s%s%s", sub, sub[0] ? "\\" : "", nm);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            mod_scan(dir, rel, depth + 1);
+        } else {
+            char host[1100], key[1024];
+            snprintf(host, sizeof host, "%s\\%s", dir, rel);
+            if (mod_key(rel, 1, key, sizeof key)) mod_add(key, host);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    snprintf(pat, sizeof pat, "%s/%s", dir, sub);
+    DIR* d = opendir(pat);
+    if (!d) return;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        const char* nm = de->d_name;
+        if (!strcmp(nm, ".") || !strcmp(nm, "..")) continue;
+        char rel[1024], host[1100];
+        snprintf(rel, sizeof rel, "%s%s%s", sub, sub[0] ? "/" : "", nm);
+        snprintf(host, sizeof host, "%s/%s", dir, rel);
+        struct stat st;
+        if (stat(host, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            mod_scan(dir, rel, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            char key[1024];
+            if (mod_key(rel, 1, key, sizeof key)) mod_add(key, host);
+        }
+    }
+    closedir(d);
+#endif
+}
+
+/* Index <mods_dir> against the VFS root <vfs_root>. Returns the number of files
+ * found (0 when the folder is missing or empty: the feature stays idle and
+ * prints nothing). Call once, before the guest runs. */
+int ps3_mods_init(const char* mods_dir, const char* vfs_root)
+{
+    g_mod_n = 0;
+    if (!mods_dir || !*mods_dir) return 0;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", mods_dir);
+    for (size_t n = strlen(dir); n > 1 && (dir[n - 1] == '/' || dir[n - 1] == '\\'); n--) dir[n - 1] = '\0';
+    mod_scan(dir, "", 0);
+    if (!g_mod_n) return 0;
+    /* The root, in the form the translators build host paths from. "." / empty
+     * root: everything is relative to it. */
+    char* r = g_mod_root; size_t rl = 0;
+    const char* v = vfs_root ? vfs_root : "";
+    while (v[0] == '.' && (v[1] == '/' || v[1] == '\\')) v += 2;
+    if (v[0] == '.' && v[1] == '\0') v++;
+    for (; *v && rl + 1 < sizeof g_mod_root; v++) r[rl++] = mod_fold(*v);
+    while (rl && r[rl - 1] == '/') rl--;
+    r[rl] = '\0'; g_mod_rootlen = rl;
+    fprintf(stderr, "[mods] on: %zu files in %s\n", g_mod_n, dir);
+    return (int)g_mod_n;
+}
+
+/* If host_path (a translated, final host path) names a file the mods folder
+ * replaces, rewrite it to the mod file and return 1. `guest` is only for the
+ * one-time log line. Read paths only -- see the block comment above. */
+int ps3_mods_resolve(const char* guest, char* host_path, size_t cap)
+{
+    if (!g_mod_n || !host_path) return 0;
+    char norm[1100];
+    size_t n = 0;
+    const char* p = host_path;
+    while (p[0] == '.' && (p[1] == '/' || p[1] == '\\')) p += 2;
+    for (; *p && n + 1 < sizeof norm; p++) norm[n++] = mod_fold(*p);
+    norm[n] = '\0';
+    const char* rel = norm;
+    if (g_mod_rootlen) {
+        if (n <= g_mod_rootlen || memcmp(norm, g_mod_root, g_mod_rootlen) != 0 || norm[g_mod_rootlen] != '/')
+            return 0;
+        rel = norm + g_mod_rootlen + 1;
+    }
+    char key[1100];
+    if (!mod_key(rel, 1, key, sizeof key)) return 0;
+    ps3_mod_ent* e = mod_find(key);
+    if (!e) return 0;
+    if (!e->logged) {
+        e->logged = 1;
+        fprintf(stderr, "[mods] %s -> %s\n", guest && *guest ? guest : host_path, e->host);
+    }
+    snprintf(host_path, cap, "%s", e->host);
+    return 1;
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
@@ -343,6 +559,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    if (flags == CELL_FS_O_RDONLY) ps3_mods_resolve(ps3_path, host_path, sizeof host_path);   /* mods folder: reads only */
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
@@ -426,6 +643,18 @@ int64_t sys_fs_open(ppu_context* ctx)
             mode = "rb";
     }
 
+    /* PS3_NO_FMV=1: Bink movies (.bik) answer "not found", so a test run
+     * skips the cutscene a level opens with (ToD plays l01_s01_ntro_fmv
+     * before metropolis even with -no_movies). */
+    { static int nofmv = -1;
+      if (nofmv < 0) { const char* e = getenv("PS3_NO_FMV"); nofmv = e && *e && *e != '0'; }
+      const size_t hl = strlen(host_path);
+      if (nofmv && hl > 4 && host_path[hl - 4] == '.' && (host_path[hl - 3] | 0x20) == 'b' &&
+          (host_path[hl - 2] | 0x20) == 'i' && (host_path[hl - 1] | 0x20) == 'k') {
+          fprintf(stderr, "[sys_fs] PS3_NO_FMV: hiding %s\n", host_path);
+          return (int64_t)(int32_t)CELL_ENOENT;
+      } }
+
     FILE* fp = fopen(host_path, mode);
 
     /* Transient open failures: on Windows an existing, correctly-pathed file can
@@ -485,6 +714,33 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
+
+    /* Bink movie opened: remember fd + header (Bink 1 header is little-endian:
+     * 'BIK?' magic, Frames u32 @0x08, Width u32 @0x14, Height u32 @0x18) for
+     * the skip key (src/input/tod_fmv_skip.cpp). */
+    {
+        const size_t hl = strlen(host_path);
+        if (!(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC)) && hl > 4 &&
+            host_path[hl - 4] == '.' && (host_path[hl - 3] | 0x20) == 'b' &&
+            (host_path[hl - 2] | 0x20) == 'i' && (host_path[hl - 1] | 0x20) == 'k') {
+            unsigned char h[0x1C];
+            long pos = ftell(fp);
+            size_t n = fread(h, 1, sizeof h, fp);
+            fseek(fp, pos < 0 ? 0 : pos, SEEK_SET);
+            if (n == sizeof h && h[0] == 'B' && h[1] == 'I' && h[2] == 'K') {
+#define LE32(o) ((uint32_t)h[o] | ((uint32_t)h[(o)+1] << 8) | ((uint32_t)h[(o)+2] << 16) | ((uint32_t)h[(o)+3] << 24))
+                g_fmv.fd = slot + 3; g_fmv.frames = LE32(8); g_fmv.width = LE32(0x14); g_fmv.height = LE32(0x18);
+#undef LE32
+                g_fmv.bink = 0; g_fmv.skipped = 0;
+                strncpy(g_fmv.path, host_path, sizeof g_fmv.path - 1);
+                g_fmv.path[sizeof g_fmv.path - 1] = 0;
+                fprintf(stderr, "[fmv-skip] open fd=%d Frames=%u W=%u H=%u %s\n", g_fmv.fd,
+                        g_fmv.frames, g_fmv.width, g_fmv.height, host_path);
+            } else {
+                fprintf(stderr, "[fmv-skip] %s: not a Bink 1 header, skip disabled\n", host_path);
+            }
+        }
+    }
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     f->active = 1;
@@ -677,6 +933,10 @@ int64_t sys_fs_close(ppu_context* ctx)
         f->fp = NULL;
     }
     f->active = 0;
+    if (g_fmv.fd == fd) {
+        fprintf(stderr, "[fmv-skip] close fd=%d\n", fd);
+        memset(&g_fmv, 0, sizeof g_fmv);
+    }
 
     return CELL_OK;
 }
@@ -785,6 +1045,7 @@ int64_t sys_fs_stat(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    ps3_mods_resolve(ps3_path, host_path, sizeof host_path);   /* mods folder: the size the guest sees is the mod file's */
 
     struct stat st;
 #ifdef _WIN32
@@ -1163,4 +1424,122 @@ void sys_fs_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_FS_UNLINK,     sys_fs_unlink);
     lv2_syscall_register(tbl, SYS_FS_LSEEK,      sys_fs_lseek);
     lv2_syscall_register(tbl, SYS_FS_FTRUNCATE,  sys_fs_ftruncate);
+}
+
+/* ---------------------------------------------------------------------------
+ * Bink movie skip (driven by src/input/host_input.cpp, on the game's pad-polling thread)
+ *
+ * The Bink 1 BINK struct (RAD, statically linked in the ELF) starts, big-endian in
+ * guest memory: +0 Width, +4 Height, +8 Frames, +0xC FrameNum, +0x10 LastFrameNum.
+ * fmv_skip_request() finds it by scanning guest memory for the triple (W,H,Frames)
+ * taken from the .bik header (once per movie, cached), then writes FrameNum = Frames
+ * (past the last frame = finished; the less safe Frames-1 would still show one frame).
+ * PS3_FMV_DIAG=1: logs header info at open and the FrameNum every second (poll).
+ * -------------------------------------------------------------------------*/
+static uint32_t fmv_rd(uint32_t a)
+{
+    uint32_t v = *(volatile uint32_t*)vm_to_host(a);
+    return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
+}
+
+static int fmv_readable(uint32_t a, uint32_t* run_end)
+{
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(vm_to_host(a), &mbi, sizeof mbi)) return 0;
+    *run_end = (uint32_t)(a + ((uint8_t*)mbi.BaseAddress + mbi.RegionSize - (uint8_t*)vm_to_host(a)));
+    if (*run_end < a) *run_end = 0xFFFFFFFFu;
+    return mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+           (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY));
+#else
+    *run_end = a + 0x10000; return vm_is_valid_addr(a);
+#endif
+}
+
+int fmv_skip_active(void)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("TOD_FMV_SKIP"); en = !(e && e[0] == '0'); }
+    if (!en || !g_fmv.fd) return 0;
+    /* no "skipped" gate: a looping movie (menu attract) restarts after the skip and must be skippable again */
+    if (!g_fmv.frames || !g_fmv.width || !g_fmv.height) return 0;
+    return 1;
+}
+
+static unsigned long long fmv_now_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    return (unsigned long long)time(NULL) * 1000;
+#endif
+}
+
+static uint32_t fmv_find(void)
+{
+    const uint32_t lo = 0x10000000u, hi = 0x30000000u;
+    uint32_t found = 0, n = 0, a = lo;
+    while (a < hi) {
+        uint32_t end;
+        if (!fmv_readable(a, &end)) { uint32_t nx = (a | 0xFFF) + 1; a = nx > a ? nx : hi; continue; }
+        if (end > hi) end = hi;
+        for (; a + 0x14 <= end; a += 4) {
+            if (fmv_rd(a) == g_fmv.width && fmv_rd(a + 4) == g_fmv.height && fmv_rd(a + 8) == g_fmv.frames &&
+                fmv_rd(a + 0xC) < g_fmv.frames) {
+                if (!found) found = a;
+                n++;
+                fprintf(stderr, "[fmv-skip] candidate #%u at 0x%08X FrameNum=%u Last=%u\n", n, a,
+                        fmv_rd(a + 0xC), fmv_rd(a + 0x10));
+            }
+        }
+        if (a < end) a = end;
+    }
+    return found;
+}
+
+void fmv_skip_request(void)
+{
+    if (!fmv_skip_active()) return;
+    if (!g_fmv.bink) g_fmv.bink = fmv_find();
+    if (!g_fmv.bink) { fprintf(stderr, "[fmv-skip] struct not found\n"); return; }
+    /* The LAST frame, not one past it: FrameNum = Frames made Bink wrap to frame 1
+     * and the movie started over (22/10 test). On the last frame the player sees
+     * the natural end and closes the movie. */
+    const uint32_t last = g_fmv.frames > 1 ? g_fmv.frames - 1 : g_fmv.frames;
+    write_be32(g_fmv.bink + 0xC, last);
+    write_be32(g_fmv.bink + 0x10, last > 1 ? last - 1 : last);
+    g_fmv.skipped = 1; g_fmv.skip_ms = fmv_now_ms();
+    fprintf(stderr, "[fmv-skip] bink=0x%08X Frames=%u FrameNum=%u (was set)\n", g_fmv.bink, g_fmv.frames, last);
+}
+
+/* Called every pad poll: PS3_FMV_DIAG=1 prints the FrameNum once a second */
+void fmv_skip_diag_poll(void)
+{
+    /* After a skip, for up to 1 s keep FrameNum at the last frame while the .bik stays open: a looping movie
+     * (menu attract l00_s00_attr_fmv) otherwise restarts from frame ~20. Struct validated each time. */
+    if (g_fmv.fd && g_fmv.skipped && g_fmv.bink && g_fmv.frames > 1 && fmv_now_ms() - g_fmv.skip_ms < 1000) {
+        uint32_t end;
+        if (fmv_readable(g_fmv.bink, &end) && end >= g_fmv.bink + 0x14 &&
+            fmv_rd(g_fmv.bink) == g_fmv.width && fmv_rd(g_fmv.bink + 4) == g_fmv.height &&
+            fmv_rd(g_fmv.bink + 8) == g_fmv.frames && fmv_rd(g_fmv.bink + 0xC) < g_fmv.frames - 1) {
+            write_be32(g_fmv.bink + 0xC, g_fmv.frames - 1);
+            write_be32(g_fmv.bink + 0x10, g_fmv.frames > 2 ? g_fmv.frames - 2 : g_fmv.frames - 1);
+            fprintf(stderr, "[fmv-skip] FrameNum went back (loop): re-asserted last frame\n");
+        }
+    }
+    static int diag = -1; static unsigned long long last;
+    if (diag < 0) { const char* e = getenv("PS3_FMV_DIAG"); diag = e && *e && *e != '0'; }
+    if (!diag || !g_fmv.fd) return;
+#ifdef _WIN32
+    unsigned long long now = GetTickCount64();
+#else
+    unsigned long long now = (unsigned long long)time(NULL) * 1000;
+#endif
+    if (now - last < 1000) return;
+    last = now;
+    { static int tries; if (!g_fmv.bink && tries < 3) { tries++; g_fmv.bink = fmv_find(); } }
+    if (g_fmv.bink)
+        fprintf(stderr, "[fmv-skip] diag bink=0x%08X FrameNum=%u/%u\n", g_fmv.bink, fmv_rd(g_fmv.bink + 0xC), g_fmv.frames);
+    else
+        fprintf(stderr, "[fmv-skip] diag: struct not found (W=%u H=%u F=%u)\n", g_fmv.width, g_fmv.height, g_fmv.frames);
 }

@@ -87,6 +87,9 @@ s32 cellAudioPortStart(u32 portNum);
 /* NID: 0x5B1E2C73 */
 s32 cellAudioPortStop(u32 portNum);
 
+/* NID: 0x56DFE179 */
+s32 cellAudioSetPortLevel(u32 portNum, float level);
+
 /* NID: 0x04AF134E */
 s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key);
 

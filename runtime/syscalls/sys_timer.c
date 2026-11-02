@@ -28,11 +28,13 @@ sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 #ifdef _WIN32
 static LARGE_INTEGER s_qpc_freq;
 static int           s_qpc_init = 0;
+static uint64_t      s_tb_mult;   /* PS3_TIMEBASE_FREQ * 2^32 / qpc freq: the guest timebase without a division per mftb */
 
 static void ensure_qpc_init(void)
 {
     if (!s_qpc_init) {
         QueryPerformanceFrequency(&s_qpc_freq);
+        s_tb_mult = (uint64_t)(((unsigned __int128)PS3_TIMEBASE_FREQ << 32) / (uint64_t)s_qpc_freq.QuadPart);
         s_qpc_init = 1;
     }
 }
@@ -65,18 +67,277 @@ int lv2_deadline_passed(int64_t deadline)
  * polled. Overflow-safe split multiply (rem < qpf, so
  * rem * 79.8e6 < ~8e14 << 2^63).
  * -----------------------------------------------------------------------*/
+/* TOD_DT_DIAG=1: per-thread count of timebase reads + sampled cost (TSC cycles per read, every 64th call);
+ * dt_diag_report() (called from the host flip) prints deltas every 5 s. */
+#if defined(__GNUC__)
+#include <x86intrin.h>
+#endif
+#define DT_MAX_THR 48
+struct dt_thr { uint64_t calls, cyc, cyc_n, last_calls; unsigned tid; };
+static struct dt_thr* g_dt_thr[DT_MAX_THR]; static int g_dt_nthr;
+static __thread struct dt_thr* tl_dt;
+volatile long long g_dt_cnt[4];   /* [0] sys_time_get_system_time  [1] cellGcmGetVBlankCount  [2] cellGcmGetLastFlipTime  [3] cellGcmGetFlipStatus */
+int g_dt_on = -1;
+static uint64_t ppu_timebase_impl(void);
+static struct dt_thr* dt_reg(void)
+{
+    struct dt_thr* t = (struct dt_thr*)calloc(1, sizeof *t);
+    t->tid = (unsigned)GetCurrentThreadId();
+    int i = __atomic_fetch_add(&g_dt_nthr, 1, __ATOMIC_RELAXED);
+    if (i >= DT_MAX_THR) { __atomic_fetch_sub(&g_dt_nthr, 1, __ATOMIC_RELAXED); return t; }
+    g_dt_thr[i] = t; tl_dt = t; return t;
+}
+/* TOD_DT_DIAG=2: one-shot memory micro-benchmark at the first timebase read (process start). */
+static double dt_chase(size_t bytes, size_t steps)
+{
+    const size_t n = bytes / 64; uint32_t* nx = (uint32_t*)VirtualAlloc(NULL, n * 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!nx) return -1;
+    uint32_t* perm = (uint32_t*)malloc(n * sizeof(uint32_t)); for (size_t i = 0; i < n; i++) perm[i] = (uint32_t)i;
+    uint64_t r = 88172645463325252ull;
+    for (size_t i = n - 1; i > 0; i--) { r ^= r << 13; r ^= r >> 7; r ^= r << 17; size_t j = r % (i + 1); uint32_t t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    for (size_t i = 0; i < n; i++) nx[(size_t)perm[i] * 16] = perm[(i + 1) % n];
+    uint32_t c = perm[0]; LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
+    for (size_t i = 0; i < steps; i++) c = nx[(size_t)c * 16];
+    QueryPerformanceCounter(&b);
+    volatile uint32_t sink = c; (void)sink; free(perm); VirtualFree(nx, 0, MEM_RELEASE);
+    return (double)(b.QuadPart - a.QuadPart) * 1e9 / (double)f.QuadPart / (double)steps;
+}
+static void dt_membench(void)
+{
+    const double a = dt_chase(1u << 20, 4000000), b = dt_chase(16u << 20, 4000000), c = dt_chase(256u << 20, 4000000);
+    const size_t mb = 64u << 20; char* s = (char*)VirtualAlloc(NULL, 2 * mb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    double gbs = -1;
+    if (s) { memset(s, 1, 2 * mb); LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        for (int k = 0; k < 8; k++) memcpy(s + mb, s, mb);
+        QueryPerformanceCounter(&t1); gbs = 8.0 * mb / ((double)(t1.QuadPart - t0.QuadPart) / f.QuadPart) / 1e9; VirtualFree(s, 0, MEM_RELEASE); }
+    fprintf(stderr, "[dtmb] cpu=%u chase 1MB=%.2f ns 16MB=%.2f ns 256MB=%.2f ns memcpy=%.1f GB/s\n", (unsigned)GetCurrentProcessorNumber(), a, b, c, gbs);
+}
+/* TOD_DT_DIAG=3: also bucket the timebase reads by host return address (symbol via dbghelp in the 5 s report). */
+static struct { uintptr_t ra; uint64_t n, last, busy; } g_dt_ra[512]; static int g_dt_mode3;
+static struct { uintptr_t key, f0, f1; uint64_t n; } g_dt_c2[256];
+static void dt_ra_note(uintptr_t ra)
+{
+    unsigned h = (unsigned)((ra >> 2) ^ (ra >> 11)) & 511;
+    const uint64_t now = __rdtsc();
+    for (int k = 0; k < 512; k++, h = (h + 1) & 511) {
+        if (g_dt_ra[h].ra == ra) { g_dt_ra[h].n++; const uint64_t d = now - g_dt_ra[h].last; if (d < 20000) g_dt_ra[h].busy += d; g_dt_ra[h].last = now; return; }
+        if (!g_dt_ra[h].ra) { g_dt_ra[h].ra = ra; g_dt_ra[h].n = 1; g_dt_ra[h].last = now; return; } }
+}
+static void dt_ra_report(unsigned nf)
+{
+    typedef struct { unsigned long SizeOfStruct, TypeIndex; unsigned long long Reserved[2]; unsigned long Index, Size; unsigned long long ModBase; unsigned long Flags; unsigned long long Value, Address; unsigned long Register, Scope, Tag, NameLen, MaxNameLen; char Name[256]; } SYMI;
+    typedef int (__stdcall *fInit)(HANDLE, const char*, int); typedef int (__stdcall *fFrom)(HANDLE, unsigned long long, unsigned long long*, SYMI*);
+    static HMODULE dh; static fInit pInit; static fFrom pFrom; static int ok = -1;
+    if (ok < 0) { dh = LoadLibraryA("dbghelp.dll"); if (dh) { pInit = (fInit)GetProcAddress(dh, "SymInitialize"); pFrom = (fFrom)GetProcAddress(dh, "SymFromAddr"); }
+                  ok = (pInit && pFrom && pInit(GetCurrentProcess(), NULL, 1)); }
+    for (int k = 0; k < 6; k++) {
+        int b = -1; for (int j = 0; j < 512; j++) if (g_dt_ra[j].n && (b < 0 || g_dt_ra[j].n > g_dt_ra[b].n)) b = j;
+        if (b < 0) break;
+        char nm[300] = "?"; unsigned long long disp = 0;
+        if (ok) { SYMI s; memset(&s, 0, sizeof s); s.SizeOfStruct = 88; s.MaxNameLen = 255; if (pFrom(GetCurrentProcess(), g_dt_ra[b].ra, &disp, &s)) snprintf(nm, sizeof nm, "%s+0x%llx", s.Name, disp); }
+        fprintf(stderr, "[dt-ra] %.0f/flip, loop-busy %.2f ms/flip (<5.5us gaps) %s\n", (double)g_dt_ra[b].n / nf, (double)g_dt_ra[b].busy / 3.59e6 / nf, nm);
+        g_dt_ra[b].n = 0; g_dt_ra[b].busy = 0;
+    }
+    for (int j = 0; j < 512; j++) g_dt_ra[j].n = 0;
+    for (int k = 0; k < 8; k++) {   /* (callee, caller) pairs, 1 sample in 16 reads */
+        int b = -1; for (int j = 0; j < 256; j++) if (g_dt_c2[j].n && (b < 0 || g_dt_c2[j].n > g_dt_c2[b].n)) b = j;
+        if (b < 0) break;
+        char n0[200] = "?", n1[200] = "?"; unsigned long long d0 = 0, d1 = 0;
+        if (ok) { SYMI s; memset(&s, 0, sizeof s); s.SizeOfStruct = 88; s.MaxNameLen = 255;
+                  if (pFrom(GetCurrentProcess(), g_dt_c2[b].f0, &d0, &s)) snprintf(n0, sizeof n0, "%s", s.Name);
+                  memset(&s, 0, sizeof s); s.SizeOfStruct = 88; s.MaxNameLen = 255;
+                  if (pFrom(GetCurrentProcess(), g_dt_c2[b].f1, &d1, &s)) snprintf(n1, sizeof n1, "%s+0x%llx", s.Name, d1); }
+        fprintf(stderr, "[dt-ra2] %.0f/flip %s <- %s\n", 16.0 * (double)g_dt_c2[b].n / nf, n0, n1);
+        g_dt_c2[b].n = 0;
+    }
+    for (int j = 0; j < 256; j++) g_dt_c2[j].n = 0;
+}
 uint64_t ppu_timebase_now(void)
+{
+    if (g_dt_on < 0) { const char* e = getenv("TOD_DT_DIAG"); g_dt_on = (e && e[0] >= '1'); g_dt_mode3 = (e && e[0] == '3'); if (e && e[0] == '2') dt_membench(); }
+    if (__builtin_expect(g_dt_on, 0)) {
+        struct dt_thr* t = tl_dt ? tl_dt : dt_reg();
+        t->calls++;
+        if (g_dt_mode3) {
+            dt_ra_note((uintptr_t)__builtin_return_address(0));
+            if ((t->calls & 15) == 0) {   /* caller chain by unwind tables: bucket (frame0, frame1) */
+                void* bt[3] = { 0, 0, 0 };
+                if (RtlCaptureStackBackTrace(1, 3, bt, NULL) >= 2) {
+                    const uintptr_t key = (uintptr_t)bt[1] ^ ((uintptr_t)bt[0] << 1);
+                    unsigned h = (unsigned)((key >> 2) ^ (key >> 10)) & 255;
+                    for (int k = 0; k < 256; k++, h = (h + 1) & 255) {
+                        if (g_dt_c2[h].key == key) { g_dt_c2[h].n++; break; }
+                        if (!g_dt_c2[h].key) { g_dt_c2[h].key = key; g_dt_c2[h].f0 = (uintptr_t)bt[0]; g_dt_c2[h].f1 = (uintptr_t)bt[1]; g_dt_c2[h].n = 1; break; }
+                    }
+                }
+            }
+        }
+        if ((t->calls & 63) == 0) {
+            const unsigned long long a = __rdtsc(); const uint64_t r = ppu_timebase_impl(); t->cyc += __rdtsc() - a; t->cyc_n++;
+            return r;
+        }
+    }
+    return ppu_timebase_impl();
+}
+void dt_diag_report(unsigned flips_now)
+{
+    static unsigned long long t_last, tsc_last; static unsigned flips_last; static long long c_last[4];
+    if (g_dt_on < 0) { const char* e = getenv("TOD_DT_DIAG"); g_dt_on = (e && e[0] >= '1'); g_dt_mode3 = (e && e[0] == '3'); if (e && e[0] == '2') dt_membench(); }
+    if (!g_dt_on) return;
+    extern unsigned long long ps3_qpc_us(void);
+    const unsigned long long now = ps3_qpc_us(), tsc = __rdtsc();
+    if (!t_last) { t_last = now; tsc_last = tsc; flips_last = flips_now; return; }
+    if (now - t_last < 5000000ull) return;
+    const double us = (double)(now - t_last), ghz = (double)(tsc - tsc_last) / us / 1000.0;
+    const unsigned nf = flips_now - flips_last ? flips_now - flips_last : 1;
+    fprintf(stderr, "[dt] t=%.0fs flips=%u tsc=%.2fGHz sysT=%lld vbl=%lld lastflip=%lld flipstat=%lld |",
+            now / 1e6, nf, ghz, g_dt_cnt[0] - c_last[0], g_dt_cnt[1] - c_last[1], g_dt_cnt[2] - c_last[2], g_dt_cnt[3] - c_last[3]);
+    for (int k = 0; k < 4; k++) c_last[k] = g_dt_cnt[k];
+    const int n = g_dt_nthr < DT_MAX_THR ? g_dt_nthr : DT_MAX_THR;
+    for (int i = 0; i < n; i++) {
+        struct dt_thr* t = g_dt_thr[i]; const uint64_t c = t->calls, d = c - t->last_calls; t->last_calls = c;
+        if (d < 1000) continue;
+        fprintf(stderr, " [tid%u %.0f tb/flip, %.0f cyc/call (%.1f ns)]", t->tid, (double)d / nf,
+                t->cyc_n ? (double)t->cyc / t->cyc_n : 0.0, t->cyc_n ? (double)t->cyc / t->cyc_n / ghz : 0.0);
+        t->cyc = 0; t->cyc_n = 0;
+    }
+    fprintf(stderr, "\n");
+    if (g_dt_mode3) dt_ra_report(nf);
+    t_last = now; tsc_last = tsc; flips_last = flips_now;
+}
+#if defined(_WIN32) && defined(__x86_64__)
+#include <intrin.h>
+/* ---------------------------------------------------------------------------
+ * PS3_TB_TSC=1 (perf115, default OFF): the guest timebase off the TSC instead of a QueryPerformanceCounter call per read.
+ * Idea (and the shape of the calibration) adapted from RACiT's runtime patch (MIT, (c) 2026 HighDrexler;
+ * ps3recomp-0001-racacit-runtime-fixes P:31528-31620). The guest reads the timebase ~100k times a frame (mftb spin polls,
+ * profiler scopes); a QPC call is ~25-40 ns, an rdtsc ~7 ns. With an invariant TSC (CPUID 0x80000007 EDX bit 8, what QPC runs
+ * on) the QPC reading is ESTIMATED as qpc0 + (tsc - tsc0) * mul >> 48, with mul = QPC ticks per TSC tick measured over a
+ * baseline that only grows (calibrated after the first 50 ms, then re-anchored on the real QPC once a second). The estimate
+ * feeds the SAME path as before (ps3_guest_ticks: pause/hold, then the 32.32 multiply), so the guest clock keeps its epoch.
+ * Never goes backwards: a re-anchor starts from max(estimate, QPC), the slope is positive, and a thread that read its TSC just
+ * before another re-anchored (tsc < tsc0) sees a zero delta, not a wrapped one.
+ * PS3_TB_CHECK=1: at every re-anchor "[tb] re-anchor: ..." (how far the TSC estimate had drifted from the real QPC, in QPC
+ * ticks and ns; the TSC rate) and per-thread monotonicity (reads where the value went backwards, worst step) every 5 s.
+ * PS3_TB_TSC=0 / unset = a QPC call per read, exactly as before. */
+typedef struct { uint64_t tsc0, qpc0, mul; } tb_tsc_anchor;   /* qpc = qpc0 + ((tsc - tsc0) * mul >> 48) */
+static tb_tsc_anchor s_tsa[2];
+static volatile long s_tsa_cur = -1;       /* -1: not calibrated yet */
+static volatile long s_tsa_busy;
+static volatile uint64_t s_tsa_next;       /* TSC value of the next re-anchor */
+static uint64_t s_tsa_cal_tsc, s_tsa_cal_qpc;
+static int s_tb_tsc = -1;                  /* -1 undecided, 0 off, 1 on */
+static int s_tb_chk = -1;
+static volatile long s_tb_back_n; static volatile long long s_tb_back_worst;   /* PS3_TB_CHECK: per-thread backwards steps */
+
+static inline int64_t tsa_at(const tb_tsc_anchor* a, uint64_t t)
+{
+    const int64_t dt = (int64_t)(t - a->tsc0);
+    if (dt <= 0) return (int64_t)a->qpc0;
+    return (int64_t)(a->qpc0 + (uint64_t)(((unsigned __int128)(uint64_t)dt * a->mul) >> 48));
+}
+
+static int64_t tsa_slow(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const uint64_t t = __rdtsc();
+    const uint64_t qpc = (uint64_t)now.QuadPart;
+    const long cur = s_tsa_cur;
+    if (InterlockedCompareExchange(&s_tsa_busy, 1, 0) != 0)          /* another thread is re-anchoring */
+        return cur >= 0 ? tsa_at(&s_tsa[cur], t) : (int64_t)qpc;
+    uint64_t r = qpc;
+    if (!s_tsa_cal_tsc) { s_tsa_cal_tsc = t; s_tsa_cal_qpc = qpc; }
+    else {
+        const uint64_t dq = qpc - s_tsa_cal_qpc, qf = (uint64_t)s_qpc_freq.QuadPart, dts = t - s_tsa_cal_tsc;
+        if (dq >= qf / 20u && dts) {
+            const uint64_t mul = (uint64_t)((double)dq / (double)dts * 281474976710656.0);   /* QPC ticks per TSC tick, 2^-48 (double: no __udivti3 in this link) */
+            if (cur >= 0) {
+                const uint64_t est = (uint64_t)tsa_at(&s_tsa[cur], t);
+                if (s_tb_chk > 0)
+                    fprintf(stderr, "[tb] re-anchor: TSC estimate %+lld QPC ticks (%+.0f ns) from the real QPC; TSC %.4f GHz; baseline %.1f s%c",
+                            (long long)(est - qpc), ((double)(long long)(est - qpc)) * 1e9 / (double)qf,
+                            (double)dts / ((double)dq / (double)qf) / 1e9, (double)dq / (double)qf, 10);
+                if (est > r) r = est;
+            }
+            const long nxt = cur >= 0 ? 1 - cur : 0;
+            s_tsa[nxt].tsc0 = t; s_tsa[nxt].qpc0 = r; s_tsa[nxt].mul = mul;
+            s_tsa_next = t + (uint64_t)((double)dts * (double)qf / (double)dq);   /* one second on */
+            InterlockedExchange(&s_tsa_cur, nxt);
+        }
+    }
+    InterlockedExchange(&s_tsa_busy, 0);
+    return (int64_t)r;
+}
+
+static int tb_tsc_decide(void)
+{
+    const char* e = getenv("PS3_TB_TSC");
+    int on = e && e[0] && e[0] != '0';
+    if (on) { int r[4] = { 0, 0, 0, 0 }; __cpuid(r, 0x80000007); on = (r[3] & (1 << 8)) != 0;
+              if (!on) fprintf(stderr, "[tb] PS3_TB_TSC=1 ignored: no invariant TSC\n"); }
+    { const char* c = getenv("PS3_TB_CHECK"); s_tb_chk = (c && c[0] && c[0] != '0') ? 1 : 0; }
+    s_tb_tsc = on;
+    if (on) fprintf(stderr, "[tb] timebase from the invariant TSC (PS3_TB_TSC=1), calibrated against QPC%s\n", s_tb_chk > 0 ? " (PS3_TB_CHECK=1)" : "");
+    return on;
+}
+
+/* The host clock in QPC ticks. */
+static inline int64_t tb_host_qpc(void)
+{
+    int on = s_tb_tsc;
+    if (__builtin_expect(on < 0, 0)) on = tb_tsc_decide();
+    if (on) {
+        /* Per thread, never backwards: a re-anchor can change the slope by a few ppm while another thread still reads the old
+         * anchor, which could step one reader back by a tick (100 ns); the clamp makes it exact. */
+        static __thread int64_t last;
+        int64_t q;
+        const long cur = s_tsa_cur;
+        const uint64_t t = cur >= 0 ? __rdtsc() : 0;
+        q = (cur >= 0 && t < s_tsa_next) ? tsa_at(&s_tsa[cur], t) : tsa_slow();
+        if (q < last) q = last; else last = q;
+        return q;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+#elif defined(_WIN32)
+static inline int64_t tb_host_qpc(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+#endif
+
+static uint64_t ppu_timebase_impl(void)
 {
 #ifdef _WIN32
     static LONGLONG t0 = 0;
     ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    const int64_t g = ps3_guest_ticks(now.QuadPart);
+    const int64_t q = tb_host_qpc();
+    if (!t0) t0 = q;   /* benign race: same anchor either way */
+    const int64_t g = ps3_guest_ticks(q);
     uint64_t d = g > t0 ? (uint64_t)(g - t0) : 0;
-    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
+    /* d * F / q as a 32.32 fixed-point multiply (two 64-bit divisions were most of this function's own cost;
+     * the mftb spin-polls of the guest call it ~100k times per frame). Error < d * 2^-32 / 8 ticks: nothing. */
+    const uint64_t tb = (uint64_t)(((unsigned __int128)d * s_tb_mult) >> 32);
+#if defined(__x86_64__)
+    if (__builtin_expect(s_tb_chk > 0, 0)) {   /* PS3_TB_CHECK: this thread's reads must not go backwards */
+        static __thread uint64_t last;
+        if (tb < last) { InterlockedIncrement(&s_tb_back_n); const long long w = (long long)(last - tb);
+                         if (w > s_tb_back_worst) s_tb_back_worst = w; }
+        last = tb;
+        static volatile uint64_t next_rep;
+        const uint64_t nowt = __rdtsc();
+        if (nowt > next_rep && InterlockedExchange64((volatile LONG64*)&next_rep, (LONG64)(nowt + 18000000000ull)) < (LONG64)nowt) {
+            const long n = s_tb_back_n;
+            fprintf(stderr, "[tb] monotonic check: %ld backwards reads so far, worst step %lld ticks\n", n, s_tb_back_worst);
+        }
+    }
+#endif
+    return tb;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -171,18 +432,158 @@ void (*g_lv2_usleep_pre)(ppu_context* ctx, uint64_t* usec) = 0;
 /* Windows: sleeps from this many microseconds up to 1 ms wait on a timer
  * and spin only their end (DOD3_AB=usleepspin moves it past 1000). */
 int g_usleep_spin_below = 500;
+#ifndef PS3_PRECISE_DEFAULT
+#define PS3_PRECISE_DEFAULT 0   /* perf108: PS3_PRECISE_USLEEP=1 turns on the main's precise short polls */
+#endif
 
+/* TOD_PIPE_DIAG=1: guest-side wait accounting for the per-flip [pipe] line (rsx_draw_engine.c).
+ * [0] = RSX sync wait (lr in the title's func_005xxxxx fence code), [1] = frame limiter (func_00692D40). */
+volatile long long g_pipe_usl_us[2]; volatile long g_pipe_usl_n[2];
+static int64_t sys_timer_usleep_impl(ppu_context* ctx);
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
+    { extern volatile int g_tl_on; extern void tl_usleep(int, uint64_t, uint32_t, uint32_t);   /* TOD_TIMELINE */
+      if (g_tl_on) { const uint64_t us = LV2_ARG_U64(ctx, 0);
+          { /* fence38: which cell does the title poll? 48C0A8 = spin534EC0 (cell in r31), 5BD1C8 = spin614FF0 (byte 0x10690080) */
+            extern void tl_f38(int, uint32_t, uint64_t, uint64_t);
+            const uint32_t lr0 = (uint32_t)ctx->lr;
+            if (lr0 == 0x48C0A8u && vm_base) { const uint32_t ea0 = (uint32_t)ctx->gpr[31]; uint64_t q; memcpy(&q, vm_base + ea0, 8);
+                tl_f38(3, lr0, ea0, __builtin_bswap64(q)); }
+            else if (lr0 == 0x5BD1C8u && vm_base) tl_f38(3, lr0, 0x10690080u, vm_base[0x10690080u]); }
+          tl_usleep(0, us, (uint32_t)ctx->lr, (uint32_t)ctx->thread_id);
+          const int64_t r = sys_timer_usleep_impl(ctx); tl_usleep(1, us, (uint32_t)ctx->lr, (uint32_t)ctx->thread_id); return r; } }
+    static int diag = -1;
+    if (diag < 0) { const char* e = getenv("TOD_PIPE_DIAG"); diag = (e && e[0] == '1'); }
+    if (!diag) return sys_timer_usleep_impl(ctx);
+    extern unsigned long long ps3_qpc_us(void);
+    const uint32_t lr = (uint32_t)ctx->lr;
+    const int b = (lr >= 0x500000u && lr < 0x510000u) ? 0 : (lr >= 0x692000u && lr < 0x693000u) ? 1 : -1;
+    const unsigned long long t0 = ps3_qpc_us();
+    const int64_t r = sys_timer_usleep_impl(ctx);
+    if (b >= 0) { g_pipe_usl_us[b] += (long long)(ps3_qpc_us() - t0); g_pipe_usl_n[b]++; }
+    return r;
+}
+/* PS3_USLEEP_ACT=1 (perf108): requested vs ACTUAL duration of every guest usleep, per (caller lr, thread), every 5 s on
+ * stderr: calls, average asked/actual us, and a histogram of the actual time (<40,<80,<160,<320,<640,<1280,<2560,more us).
+ * Unlocked counters (a diagnostic). Off: one load+branch. */
+#ifdef _WIN32
+static int64_t sys_timer_usleep_impl0(ppu_context* ctx);
+static int64_t sys_timer_usleep_impl(ppu_context* ctx)
+{
+    static int act = -1;
+    if (act < 0) { const char* e = getenv("PS3_USLEEP_ACT"); act = (e && e[0] >= '1') ? 1 : 0; }
+    if (__builtin_expect(!act, 1)) return sys_timer_usleep_impl0(ctx);
+    ensure_qpc_init();
+    enum { AH = 64, NB = 8 };
+    static uint32_t a_lr[AH], a_tid[AH]; static uint64_t a_n[AH], a_ask[AH], a_act[AH]; static uint64_t a_h[AH][NB];
+    static volatile int a_used; static long long win;
+    const uint64_t asked = LV2_ARG_U64(ctx, 0);
+    const uint32_t lr = (uint32_t)ctx->lr, tid = (uint32_t)ctx->thread_id;
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    const int64_t r = sys_timer_usleep_impl0(ctx);
+    QueryPerformanceCounter(&q1);
+    const double us = (double)(q1.QuadPart - q0.QuadPart) * 1e6 / (double)s_qpc_freq.QuadPart;
+    int i = 0, used = a_used;
+    for (; i < used; i++) if (a_lr[i] == lr && a_tid[i] == tid) break;
+    if (i == used && used < AH) { a_lr[used] = lr; a_tid[used] = tid; a_used = used + 1; }
+    if (i < AH) {
+        int b = 0; { double lim = 40.0; while (b < NB - 1 && us >= lim) { b++; lim *= 2.0; } }
+        a_n[i]++; a_ask[i] += asked; a_act[i] += (uint64_t)us; a_h[i][b]++;
+    }
+    if (q1.QuadPart - win > 5 * s_qpc_freq.QuadPart) {
+        static volatile long busy;
+        if (win && !InterlockedExchange(&busy, 1)) {
+            fprintf(stderr, "[usleep-act] 5 s, top (lr, tid) by total actual us:\n");
+            for (int k = 0; k < 10; k++) {
+                int best = -1;
+                for (int j = 0; j < AH && j < a_used; j++) if (a_n[j] && (best < 0 || a_act[j] > a_act[best])) best = j;
+                if (best < 0) break;
+                fprintf(stderr, "  lr=0x%08X tid=%u n=%llu asked_avg=%.0f actual_avg=%.0f total_ms=%.1f hist[<40,80,160,320,640,1280,2560,more]=",
+                        a_lr[best], a_tid[best], (unsigned long long)a_n[best], (double)a_ask[best] / (double)a_n[best],
+                        (double)a_act[best] / (double)a_n[best], (double)a_act[best] / 1000.0);
+                for (int h = 0; h < NB; h++) fprintf(stderr, "%s%llu", h ? "," : "", (unsigned long long)a_h[best][h]);
+                fprintf(stderr, "\n");
+                a_n[best] = 0; a_ask[best] = 0; a_act[best] = 0; for (int h = 0; h < NB; h++) a_h[best][h] = 0;
+            }
+            for (int j = 0; j < AH; j++) { a_n[j] = 0; a_ask[j] = 0; a_act[j] = 0; for (int h = 0; h < NB; h++) a_h[j][h] = 0; }
+            fflush(stderr);
+            InterlockedExchange(&busy, 0);
+        }
+        win = q1.QuadPart;
+    }
+    return r;
+}
+#define sys_timer_usleep_impl sys_timer_usleep_impl0
+#else
+static int64_t sys_timer_usleep_impl(ppu_context* ctx);
+#endif
+static int64_t sys_timer_usleep_impl(ppu_context* ctx)
+{
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    { extern void ps3_cpu_note(void); ps3_cpu_note(); }
     if (g_lv2_usleep_pre) g_lv2_usleep_pre(ctx, &usec);
     if (g_lv2_usleep_hook && g_lv2_usleep_hook((uint32_t)ctx->lr, usec)) return CELL_OK;
+    /* TOD_USLEEP_HIST=1: every 5 s, the guest usleeps by caller LR and requested time (log2 bucket of us), top 16.
+     * Unlocked counters: a diagnostic, a lost increment under a race changes nothing. */
+    { static int on = -1;
+      if (on < 0) { const char* e = getenv("TOD_USLEEP_HIST"); on = (e && e[0] >= '1'); }
+      if (__builtin_expect(on, 0)) {
+        enum { H = 512 };
+        static uint32_t k_lr[H]; static uint8_t k_b[H]; static uint32_t k_n[H]; static uint64_t k_us[H]; static uint32_t k_tid[H];
+        static unsigned long long win;
+        extern unsigned long long ps3_qpc_us(void);
+        unsigned b = 0; { uint64_t u = usec; while (u > 1 && b < 31) { u >>= 1; b++; } }
+        const uint32_t lr = (uint32_t)ctx->lr;
+        unsigned h = (lr * 2654435761u + b * 40503u) >> 7 & (H - 1);
+        for (int k = 0; k < H; k++, h = (h + 1) & (H - 1)) {
+            if (k_n[h] && k_lr[h] == lr && k_b[h] == b) { k_n[h]++; k_us[h] += usec; break; }
+            if (!k_n[h]) { k_lr[h] = lr; k_b[h] = (uint8_t)b; k_n[h] = 1; k_us[h] = usec; k_tid[h] = (uint32_t)ctx->thread_id; break; }
+        }
+        const unsigned long long now = ps3_qpc_us();
+        if (!win) win = now;
+        else if (now - win >= 5000000ull) {
+            win = now;
+            static volatile long busy;
+            if (!InterlockedExchange(&busy, 1)) {
+                fprintf(stderr, "[usleep-hist] 5 s, top callers (lr, asked us bucket [2^b,2^b+1), calls, avg asked us, tid):\n");
+                for (int r = 0; r < 16; r++) {
+                    int best = -1;
+                    for (int j = 0; j < H; j++) if (k_n[j] && (best < 0 || k_n[j] > k_n[best])) best = j;
+                    if (best < 0) break;
+                    fprintf(stderr, "  lr=0x%08X us=[%u,%u) n=%u avg=%.0f tid=%u\n", k_lr[best], 1u << k_b[best], 2u << k_b[best],
+                            k_n[best], (double)k_us[best] / k_n[best], k_tid[best]);
+                    k_n[best] = 0;
+                }
+                for (int j = 0; j < H; j++) k_n[j] = 0;
+                fflush(stderr);
+                InterlockedExchange(&busy, 0);
+            }
+        }
+      } }
     /* A single sleep longer than a second is almost always a computed delay
      * gone wrong (a negative interval, a timebase in the wrong units) -- and a
      * thread asleep for an hour looks exactly like a hang. Say so. */
     if (usec > 1000000ull) { static int n = 0; if (n < 32 && ++n)
         fprintf(stderr, "[timer] LONG usleep(%llu us = %.1f s) lr=0x%08llX tid=%u\n",
                 (unsigned long long)usec, usec / 1e6, (unsigned long long)ctx->lr, (unsigned)ctx->thread_id); }
+    /* PS3_USLEEP_LR=<hex lr>: for the loop that sleeps at that lr, every 2 s
+     * the asked sleep and the work time between sleeps (avg/max, ms) -- a
+     * "work; usleep(period)" producer runs late when work + sleep > period. */
+    { static long long want = -1;
+      if (want < 0) { const char* e = getenv("PS3_USLEEP_LR"); want = e ? (long long)strtoull(e, NULL, 16) : 0; }
+      if (want && (uint32_t)ctx->lr == (uint32_t)want) {
+          extern unsigned long long ps3_qpc_us(void);
+          static unsigned long long last, t0; static double psum, pmax; static unsigned n2;
+          unsigned long long now = ps3_qpc_us();
+          if (last) { double pd = (now - last) / 1000.0; psum += pd; if (pd > pmax) pmax = pd; n2++; }
+          last = now;
+          if (!t0) t0 = now;
+          if (now - t0 >= 2000000ull && n2) {
+              fprintf(stderr, "[usleep-lr] lr=0x%08X asked %.2f ms, %u loops in %.1f s, period avg %.2f max %.2f ms (work+oversleep = period - asked)\n",
+                      (uint32_t)want, usec / 1000.0, n2, (now - t0) / 1e6, psum / n2, pmax);
+              t0 = now; psum = pmax = 0; n2 = 0;
+          }
+      } }
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (n < 60 && ++n)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
@@ -378,10 +779,65 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        /* Poll runs: a thread that keeps coming back with short sleeps (a mftb/usleep poll of a job group or of the
+         * walker's fence: tens of thousands a second, 30-50 us each) has nothing to do but wait, and the spin took
+         * a whole core -- one the parallel walker's workers need. The first usl_esc_us of such a run still spins
+         * to the exact deadline, so a one-off short sleep keeps its precision; past that, each further poll waits
+         * on the thread's high-resolution timer for usl_nap_us (it wakes within ~0.5 ms) and returns without the
+         * spin. A gap of more than usl_gap_us between two sleeps (the guest did real work) starts a new run.
+         * TOD_USLEEP_ESC=<esc us>[,<nap us>[,<gap us>]]; 0 = the old pure spin. */
+        static __declspec(thread) int64_t tl_last_end, tl_run_start;
+        static int64_t usl_esc_us = -1, usl_nap_us = 100, usl_gap_us = 100;
+        if (usl_esc_us < 0) {
+            const char* e = getenv("TOD_USLEEP_ESC");
+            long long a1 = 100, a2 = 100, a3 = 100;
+            if (e) sscanf(e, "%lld,%lld,%lld", &a1, &a2, &a3);
+            usl_nap_us = a2; usl_gap_us = a3; usl_esc_us = a1;
+        }
+        /* 30/10: the nap applies to the MAIN PPU thread only (thread_id 1, the one that spends ~50% of a core
+         * polling job groups and the walker). The 27/10 try applied it to every guest thread and the audio
+         * synth's periodic threads woke late (one 42 ms gap at fastoon). TOD_USLEEP_ESC_ALL=1 = every thread. */
+        static int usl_all = -1;
+        if (usl_all < 0) { const char* e = getenv("TOD_USLEEP_ESC_ALL"); usl_all = (e && e[0] == '1') ? 1 : 0; }
+        /* perf108 PS3_PRECISE_USLEEP: the main's short polls (30 us at 534EC0: 6/frame, 1.5 ms/frame; 5BD1C8) used to hit this
+         * nap after 100 us of a run, and a 100 us high-resolution-timer nap takes ~0.5 ms (the timer's resolution), so the
+         * guest saw the cell it polls 0.2-0.5 ms late. Precise: the run spins (_mm_pause, not SwitchToThread: that can hand the
+         * core to a ready host thread for a whole quantum) up to PS3_PRECISE_RUN_US (default 1500) before the first nap, then as
+         * before -- the CPU bound is that many us per wait run. PS3_PRECISE_USLEEP=0 = the old behaviour. */
+        static int pr = -1; static int64_t pr_run_us = 1500; static int pr_yield = 0;
+        if (pr < 0) {
+            const char* e = getenv("PS3_PRECISE_USLEEP"); pr = e ? (e[0] != '0') : PS3_PRECISE_DEFAULT;
+            const char* r = getenv("PS3_PRECISE_RUN_US"); if (r) pr_run_us = atoll(r);
+            const char* y = getenv("PS3_PRECISE_YIELD"); pr_yield = (y && y[0] == '1');
+        }
+        const int64_t esc_eff = pr ? (pr_run_us > usl_esc_us ? pr_run_us : usl_esc_us) : usl_esc_us;
+        if (usl_esc_us > 0 && (usl_all || ctx->thread_id == 1)) {
+            const int64_t f = s_qpc_freq.QuadPart;
+            if (qpc_start.QuadPart - tl_last_end > usl_gap_us * f / 1000000) tl_run_start = qpc_start.QuadPart;
+            if (qpc_start.QuadPart - tl_run_start > esc_eff * f / 1000000) {
+                static __declspec(thread) HANDLE nap = NULL;
+                if (!nap) nap = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                if (nap) {
+                    LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(usl_nap_us * 10);
+                    SetWaitableTimer(nap, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(nap, INFINITE);
+                    QueryPerformanceCounter(&qpc_now);
+                    tl_last_end = qpc_now.QuadPart;
+                    return CELL_OK;
+                }
+            }
+        }
+        if (pr && !pr_yield && (usl_all || ctx->thread_id == 1)) {
+            do {
+                _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause();
+                QueryPerformanceCounter(&qpc_now);
+            } while (qpc_now.QuadPart < qpc_deadline);
+        } else
         do {
             SwitchToThread();
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
+        tl_last_end = qpc_now.QuadPart;
     }
 #else
     if (usec > 0) {

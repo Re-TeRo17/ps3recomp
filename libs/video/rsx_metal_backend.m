@@ -2577,7 +2577,7 @@ static NSString* const kEngHelperMSL = @
 "fragment float4 eng_depth_pack_fs(BOut i [[stage_in]],\n"
 "                                 depth2d<float> src [[texture(0)]],\n"
 "                                 sampler s [[sampler(0)]]) {\n"
-"    uint v = uint(clamp(src.read(uint2(i.pos.xy)), 0.0, 1.0) * 16777215.0 + 0.5);\n"
+"    uint v = min(uint(clamp(src.read(uint2(i.pos.xy)), 0.0, 1.0) * 16777215.0 + 0.5), 16777215u);\n"   /* holo124: 1.0 -> 16777216 wrapped to 0 */
 "    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
 "}\n"
 "/* The present blit scaling down (an internal resolution above the window's,\n"

@@ -58,6 +58,19 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 /* As spu_workload_find, but also returns the image's indirect-branch table id. */
 spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out);
 
+/* Prefix registration, for an image whose TAIL is rewritten by the guest after
+ * the program is built (a parameter block appended to the code that the PPU
+ * fills in before every DMA load): `fingerprint` is FNV-1a-64 over only the
+ * first `hashed_len` bytes of the loaded run. spu_workload_find_prefix hashes
+ * the first hashed_len bytes of `run` (when run_len >= hashed_len) for each
+ * registered prefix length and returns the entry on a match. Exact-fingerprint
+ * entries are tried first by callers; prefix entries are a fallback. */
+void spu_workload_register_prefix(uint64_t fingerprint, uint32_t hashed_len,
+                                  spu_lifted_entry_fn fn, int image_id,
+                                  const char* name);
+spu_lifted_entry_fn spu_workload_find_prefix(const void* run, size_t run_len,
+                                             int* image_id_out);
+
 /* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
  * kernel handoff: kernel context at LS 0x100, entry ABI of
  * cellSpursModuleEntry(context, ea) with the workload's u64 data in r4.

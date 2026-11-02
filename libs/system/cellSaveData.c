@@ -52,6 +52,7 @@
  * Internal helpers
  * -----------------------------------------------------------------------*/
 
+void cellSaveData_flush_async(void);   /* hitch116: wait for deferred (PS3_SAVEDATA_ASYNC) writes */
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 /* PS3_SAVEDATA_ROOT=<dir>: keep save data somewhere else -- a test harness
  * can then run from a snapshot without touching the player's own saves. */
@@ -449,6 +450,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
+    cellSaveData_flush_async();
     save_root_init();
     ensure_dirs(s_save_root);
 
@@ -565,6 +567,150 @@ static void pfd_add(const char* save_path, const char* name)
     FILE* fp = fopen(path, "ab");
     if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
 }
+
+/* ---------------------------------------------------------------------------
+ * hitch116 02/11: PS3_SAVEDATA_ASYNC=1 (default OFF) -- asynchronous file writes for cellSaveDataListAutoSave.
+ *
+ * The title's "Auto Save Thread" calls ListAutoSave during play and the whole game stalls ~310-480 ms around it
+ * (log/hitch104: ListAutoSave 79 ms wall, ICON0 101 KB + GAME.SAV 591 KB + PARAM.SFO through fopen/fwrite/fclose).
+ * With the toggle on, process_file_op / write_param_sfo COPY the buffer, report success to the guest at once and a
+ * worker thread performs the writes in FIFO order. Safety rules (a save is never lost or reordered):
+ *   - only WRITE / WRITE_NOTRUNC and PARAM.SFO are deferred; READ and DELETE flush first and run synchronously;
+ *   - every other savedata entry (savedata_execute, enumerate_save_dirs, cellSaveDataDelete) flushes first, so a
+ *     load or a listing right after a save always sees the finished files;
+ *   - sys_process_exit and the window-closed exit path call cellSaveData_flush_async() (atexit too);
+ *   - a failed deferred write is logged ([savedata-async] FAILED); a failed enqueue falls back to the sync write.
+ * ---------------------------------------------------------------------------*/
+#ifdef _WIN32
+#  define SD_TLS __declspec(thread)
+#else
+#  define SD_TLS __thread
+#endif
+static SD_TLS int t_sd_async;        /* this thread is inside an async-enabled ListAutoSave */
+
+static int savedata_async_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_SAVEDATA_ASYNC"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+
+/* THE write of one save file; the synchronous path and the worker both use it. 0 = ok, -1 = failed. */
+static int savedata_write_now(const char* save_path, const char* file_path, const char* name,
+                              int from_start_trunc, uint32_t offset, const void* data, size_t size, int secure)
+{
+    ensure_dirs(save_path);
+    FILE* fp = fopen(file_path, from_start_trunc ? "wb" : "r+b");
+    if (!fp) fp = fopen(file_path, "wb");
+    if (!fp) {
+        printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
+        return -1;
+    }
+    if (offset > 0) {
+#ifdef _MSC_VER
+        _fseeki64(fp, (long long)offset, SEEK_SET);
+#else
+        fseeko(fp, (off_t)offset, SEEK_SET);
+#endif
+    }
+    size_t wrote = fwrite(data, 1, size, fp);
+    int failed = wrote != size;
+    if (fclose(fp) != 0) failed = 1;
+    if (!failed && secure) pfd_add(save_path, name);
+    return failed ? -1 : 0;
+}
+
+#ifdef _WIN32
+typedef struct sd_job {
+    struct sd_job* next;
+    char save_path[1024], file_path[1024], name[CELL_SAVEDATA_FILENAME_SIZE + 1];
+    int trunc, secure; uint32_t offset; size_t size; uint8_t* data;
+} sd_job;
+static CRITICAL_SECTION s_sd_cs;
+static CONDITION_VARIABLE s_sd_work_cv, s_sd_idle_cv;
+static INIT_ONCE s_sd_once = INIT_ONCE_STATIC_INIT;
+static sd_job *s_sd_head, *s_sd_tail;
+static int s_sd_pending;                       /* queued + running */
+static volatile LONG s_sd_started;
+
+static DWORD WINAPI sd_worker(LPVOID arg)
+{
+    (void)arg;
+    EnterCriticalSection(&s_sd_cs);
+    for (;;) {
+        while (!s_sd_head) SleepConditionVariableCS(&s_sd_work_cv, &s_sd_cs, INFINITE);
+        sd_job* j = s_sd_head;
+        s_sd_head = j->next; if (!s_sd_head) s_sd_tail = NULL;
+        LeaveCriticalSection(&s_sd_cs);
+        LARGE_INTEGER q0, q1, f; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&f);
+        int rc = savedata_write_now(j->save_path, j->file_path, j->name, j->trunc, j->offset, j->data, j->size, j->secure);
+        QueryPerformanceCounter(&q1);
+        fprintf(stderr, "[savedata-async] %s '%s' %u bytes in %.1f ms\n", rc ? "FAILED writing" : "wrote", j->name,
+                (unsigned)j->size, (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        fflush(stderr);
+        free(j->data); free(j);
+        EnterCriticalSection(&s_sd_cs);
+        if (--s_sd_pending == 0) WakeAllConditionVariable(&s_sd_idle_cv);
+    }
+    return 0;
+}
+
+static BOOL CALLBACK sd_init_once(PINIT_ONCE o, PVOID p, PVOID* c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_sd_cs);
+    InitializeConditionVariable(&s_sd_work_cv);
+    InitializeConditionVariable(&s_sd_idle_cv);
+    HANDLE h = CreateThread(NULL, 0, sd_worker, NULL, 0, NULL);
+    if (!h) return FALSE;
+    CloseHandle(h);
+    InterlockedExchange(&s_sd_started, 1);
+    return TRUE;
+}
+
+/* Wait until every deferred write has hit the disk. Cheap no-op when nothing was ever queued. */
+void cellSaveData_flush_async(void)
+{
+    if (!s_sd_started) return;
+    EnterCriticalSection(&s_sd_cs);
+    int waits = 0;
+    while (s_sd_pending > 0) {
+        if (!SleepConditionVariableCS(&s_sd_idle_cv, &s_sd_cs, 5000) && ++waits >= 6) {
+            fprintf(stderr, "[savedata-async] flush gave up after 30 s (%d jobs pending)\n", s_sd_pending);
+            break;
+        }
+    }
+    LeaveCriticalSection(&s_sd_cs);
+}
+
+/* Copy the data and hand the write to the worker. Returns 1 = queued, 0 = could not (caller writes synchronously). */
+static int savedata_async_queue(const char* save_path, const char* file_path, const char* name,
+                                int trunc, uint32_t offset, const void* data, size_t size, int secure)
+{
+    if (strlen(save_path) >= sizeof(((sd_job*)0)->save_path) || strlen(file_path) >= sizeof(((sd_job*)0)->file_path) ||
+        strlen(name) >= sizeof(((sd_job*)0)->name))
+        return 0;
+    if (!InitOnceExecuteOnce(&s_sd_once, sd_init_once, NULL, NULL)) return 0;
+    sd_job* j = (sd_job*)calloc(1, sizeof(*j));
+    uint8_t* d = (uint8_t*)malloc(size ? size : 1);
+    if (!j || !d) { free(j); free(d); return 0; }
+    memcpy(d, data, size);
+    strcpy(j->save_path, save_path); strcpy(j->file_path, file_path); strcpy(j->name, name);
+    j->trunc = trunc; j->secure = secure; j->offset = offset; j->size = size; j->data = d;
+    static LONG s_atexit_done;
+    if (!InterlockedExchange(&s_atexit_done, 1)) atexit(cellSaveData_flush_async);
+    EnterCriticalSection(&s_sd_cs);
+    if (s_sd_tail) s_sd_tail->next = j; else s_sd_head = j;
+    s_sd_tail = j; s_sd_pending++;
+    LeaveCriticalSection(&s_sd_cs);
+    WakeConditionVariable(&s_sd_work_cv);
+    return 1;
+}
+#else
+void cellSaveData_flush_async(void) {}
+static int savedata_async_queue(const char* a, const char* b, const char* c, int d, uint32_t e, const void* f, size_t g, int h)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; return 0; }
+#endif
 
 static u32 savedata_file_type(const char* save_path, const char* name)
 {
@@ -686,6 +832,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
+        cellSaveData_flush_async();
         FILE* fp = fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
@@ -708,39 +855,21 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
-        ensure_dirs(save_path);
-        const char* mode;
-        if (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0) {
-            mode = "wb";
-        } else {
-            mode = "r+b";
-        }
-        FILE* fp = fopen(file_path, mode);
-        if (!fp) {
-            fp = fopen(file_path, "wb");
-        }
-        if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
-            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
-        }
-        if (set->fileOffset > 0) {
-#ifdef _MSC_VER
-            _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
-#else
-            fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
-#endif
-        }
+        const int from_start = set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0;
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
-        size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
-        int failed = wrote != write_size;
-        if (fclose(fp) != 0) failed = 1;
-        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
-            pfd_add(save_path, name);
-        return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
+        const int secure = set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE;
+        if (t_sd_async && savedata_async_queue(save_path, file_path, name, from_start, set->fileOffset,
+                                                set->fileBuf, write_size, secure))
+            return (s32)write_size;                  /* deferred: the worker writes the copy */
+        cellSaveData_flush_async();                  /* keep FIFO order if an earlier file is still queued */
+        if (savedata_write_now(save_path, file_path, name, from_start, set->fileOffset, set->fileBuf, write_size, secure))
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+        return (s32)write_size;
     }
 
     case CELL_SAVEDATA_FILEOP_DELETE:
+        cellSaveData_flush_async();
         remove(file_path);
         return 0;
 
@@ -780,6 +909,8 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     size_t n = ps3_psf_build(buf, sizeof buf, dir, title, sub, detail, param->attribute, lp);
     if (!n) return;
 
+    if (t_sd_async && savedata_async_queue(save_path, sfo_path, "PARAM.SFO", 1, 0, buf, n, 0)) return;
+    cellSaveData_flush_async();
     FILE* fp = fopen(sfo_path, "wb");
     if (!fp) return;
     fwrite(buf, 1, n, fp);
@@ -849,6 +980,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
+    cellSaveData_flush_async();   /* hitch116: a previous deferred autosave must be on disk before this call looks at it */
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
 
@@ -1227,6 +1359,38 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
+/* The save half of ListAutoLoad: the title picks the directory from the
+ * listing in funcFixed (an empty listing on a first save, when it names a new
+ * one), then funcStat/funcFile write it. Ratchet & Clank: Tools of
+ * Destruction saves through this; unimplemented, it answered CELL_OK without
+ * calling back and the title reported its game data corrupted. */
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataFixedCallback funcFixed,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile,
+                             u32 container, void* userdata)
+{
+    (void)container;
+    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+    printf("[cellSaveData] ListAutoSave(version=%u)\n", version);
+#ifdef _WIN32
+    /* hitch104 02/11: the title Auto Save Thread runs this; each autosave of the user 36-min play log coincided with a 310-480 ms frame. Log the wall time. */
+    LARGE_INTEGER hq0, hq1, hqf; QueryPerformanceCounter(&hq0); QueryPerformanceFrequency(&hqf);
+    /* hitch116: PS3_SAVEDATA_ASYNC=1 defers the file writes of THIS call to a worker (see savedata_async_queue). */
+    t_sd_async = savedata_async_enabled();
+    const s32 hr = savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+    t_sd_async = 0;
+    QueryPerformanceCounter(&hq1);
+    fprintf(stderr, "[savedata-time] ListAutoSave took %.1f ms (rc=0x%X)\n",
+            (double)(hq1.QuadPart - hq0.QuadPart) * 1000.0 / (double)hqf.QuadPart, (unsigned)hr);
+    fflush(stderr);
+    return hr;
+#else
+    return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+#endif
+}
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -1562,10 +1726,25 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
 }
 
+/* ListAutoSave: the same nine arguments as ListAutoLoad. */
+static void hle_cellSaveDataListAutoSave(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoSave(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[4],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+}
+
 void cellSaveData_register_ctx_handlers(void)
 {
     /* Overrides the generated 8-arg registration: ctx handlers are dispatched
      * before the generic table. */
+    ps3_hle_register_ctx(0x4DD03A4Eu, "cellSaveDataListAutoSave",
+                         hle_cellSaveDataListAutoSave);
     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
                          hle_cellSaveDataUserAutoLoad);
     ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",

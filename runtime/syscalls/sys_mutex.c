@@ -195,6 +195,23 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
+    /* Queue behind a signalled cond waiter that has not re-acquired yet (it
+     * owns the mutex in LV2 terms). A recursive re-lock by the current owner
+     * is not behind anyone. */
+    if (!(m->owner_tid == caller_tid && m->lock_count > 0)) {
+        int64_t pdl = timeout_us ? lv2_usec_deadline(timeout_us) : 0;
+        unsigned spins = 0;
+        while (__atomic_load_n(&m->pending_reacquire, __ATOMIC_SEQ_CST) > 0) {
+            if (timeout_us && lv2_deadline_passed(pdl))
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+#ifdef _WIN32
+            if (++spins < 200) SwitchToThread(); else Sleep(0);
+#else
+            (void)spins; sched_yield();
+#endif
+        }
+    }
+
 #ifdef _WIN32
     if (timeout_us == 0) {
         /* Infinite wait */
@@ -284,6 +301,11 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         m->lock_count++;
         return CELL_OK;
     }
+
+    /* A cond waiter that was signalled already owns this mutex as far as LV2 is
+     * concerned (see pending_reacquire in sys_mutex.h). */
+    if (__atomic_load_n(&m->pending_reacquire, __ATOMIC_SEQ_CST) > 0)
+        return (int64_t)(int32_t)CELL_EBUSY;
 
 #ifdef _WIN32
     if (!TryEnterCriticalSection(&m->cs)) {

@@ -289,6 +289,61 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
         return;
     }
 
+    /* surf54 31/10: the walk below called rsx_swizzle_offset (a loop over the bit pairs) and the format switch of decode_texel for
+     * every texel -- 15 MB of textures took 56 ms (the area-entry bursts of 385 textures, 25 MB, 67 ms). The Morton offset is
+     * separable (x's bits and y's bits land at fixed positions), so two tables of w and h entries give any texel's offset as
+     * xo[x] | yo[y], and the A8R8G8B8 family -- most of the big textures -- is one 32-bit rotate per texel. The same bytes as
+     * before come out. TEX_DECODE_SLOW=1 goes back to the old walk. */
+    static int slow = -1; if (slow < 0) { const char* e = getenv("TEX_DECODE_SLOW"); slow = e && e[0] && e[0] != '0'; }
+    if (!slow && w <= 4096u && h <= 4096u) {
+        u32 xo[4096], yo[4096];
+        const int sw = tl->swizzled;
+        if (sw) {
+            for (u32 x = 0; x < w; x++) xo[x] = rsx_swizzle_offset(x, 0, l2w, l2h);
+            for (u32 y = 0; y < h; y++) yo[y] = rsx_swizzle_offset(0, y, l2w, l2h);
+        }
+        const u32 bf = tl->base_format;
+        if ((bf == 0x85u || bf == 0x9Eu) && sbpp == 4u && dbpp == 4u) {
+            const u32 keep_a = bf == 0x9Eu;
+            for (u32 y = 0; y < h; y++) {
+                u32* drow = (u32*)(d + (size_t)y * dst_pitch);
+                const u8* srow = sw ? src : src + (size_t)y * tl->row_bytes;
+                const size_t yb = sw ? (size_t)yo[y] * 4u : 0u;
+                for (u32 x = 0; x < w; x++) {
+                    u32 v;
+                    memcpy(&v, srow + (sw ? yb + (size_t)xo[x] * 4u : (size_t)x * 4u), 4);
+                    if (!argb_as_rgba) v = (v >> 8) | (v << 24);          /* guest A,R,G,B -> host R,G,B,A */
+                    if (keep_a) v = (v & 0x00FFFFFFu) | 0xFF000000u;       /* D8R8G8B8: the top byte is not a channel */
+                    drow[x] = v;
+                }
+            }
+            return;
+        }
+        if ((tl->fmt == RSX_TEXFMT_R16G16 || tl->fmt == RSX_TEXFMT_R16G16F) && sbpp == 4u && dbpp == 4u && bf != 0x85u && bf != 0x9Eu) {
+            /* two big-endian 16-bit components: swap the bytes of each half (a 256x256 one is rewritten by the arena every frame) */
+            for (u32 y = 0; y < h; y++) {
+                u32* drow = (u32*)(d + (size_t)y * dst_pitch);
+                const u8* srow = sw ? src : src + (size_t)y * tl->row_bytes;
+                const size_t yb = sw ? (size_t)yo[y] * 4u : 0u;
+                for (u32 x = 0; x < w; x++) {
+                    u32 v;
+                    memcpy(&v, srow + (sw ? yb + (size_t)xo[x] * 4u : (size_t)x * 4u), 4);
+                    drow[x] = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                }
+            }
+            return;
+        }
+        for (u32 y = 0; y < h; y++) {
+            u8* drow = d + (size_t)y * dst_pitch;
+            for (u32 x = 0; x < w; x++) {
+                const u8* s = sw ? src + ((size_t)xo[x] | (size_t)yo[y]) * sbpp
+                                 : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
+                decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+            }
+        }
+        return;
+    }
+
     /* Morton order interleaves the low bits of x and y, so a swizzled image
      * has to be walked texel by texel; so does anything the host cannot take
      * as stored. */

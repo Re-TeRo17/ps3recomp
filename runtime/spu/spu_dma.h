@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "spu_coherency.h"
 #include <stdint.h>
+#include <intrin.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -163,11 +164,46 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* ---------------------------------------------------------------------------
+ * MFC fast path (SPU_MFC_FAST: 1 = on [default], 0 = off, 2 = check).
+ *
+ * mfc_submit_slow / mfc_do_transfer_slow below carry ~60 diagnostic blocks
+ * (each a cached-env test) in front of the real work. The hot SPURS graphics
+ * lane issues thousands of small GET/PUTs per frame, so when NO diagnostic is
+ * armed the fast variants run only the behavioural part: tag bookkeeping,
+ * the malformed/commit checks, the copy, reservation notify, overlay/code
+ * tracking. Anything unusual (list commands, rejected or uncommitted
+ * transfers, SDCRZ, the WWS batch fetch, the first PM transfers) goes to the
+ * slow path unchanged, so its logging stays identical.
+ * Mode 2 (self test): every fast-eligible transfer is also run through the
+ * slow path and the results (rc + bytes written) compared; mismatches are
+ * counted and printed ([mfc-check]).
+ * ---------------------------------------------------------------------------*/
+static int s_mfc_pm_pn = 0;    /* PM-run DMA trace counter (see mfc_submit_slow) */
+static int s_mfc_fast_mode = -1;
+static inline int mfc_fast_mode(void)
+{
+    if (s_mfc_fast_mode >= 0) return s_mfc_fast_mode;
+    static const char* const names[] = {
+        "SPU_DMA_WATCH", "SPU_DMA_RANGE", "SPU_DMA_RANGE_MAX", "SPU_DMA_LAX", "SPU_DMACHK", "SPU_GETHIST",
+        "SPU_PUTHIST", "SPU_MFC_TRACE", "SPU_DMA_SKIP_DUMP", "SPU_STACKEA_WATCH", "SPU_DMATRACE_ALL",
+        "YDKJ_DMA_IMG", "SPU_DUMP_GET", "SPU_DSP_IMAGE_EA", "LBP_SKIP_NULL_DMA", "SPU_OVL_DIAG",
+        "SPU_SMC_WATCH", "SPU_POISON_DMA", "SPU_CMDHIST", "SPU_STOP_DUMP", "SPU_PUT4_LOG", "SPU_WATCHEA",
+        "SPU_WATCHLSA", "SPU_ROWCOV", "SPU_VRAMPC", "SPU_H2LSRC", "SPU_PUTEA", "YDKJ_CRI_CHAIN",
+        "SPU_DMA_REPEAT_LIMIT", "SPU_DMA_REPEAT_HALT_GETS", "SPU_DMA_POLL_MIXED", "SPU_DMATRACE",
+        "SPU_DMATRACE_RAW", "SPU_CMDDUMP", "SPU_LOCKGUARD", "SPU_LS_WATCH", "SPU_DMA_LOG", NULL };
+    int mode = 1;
+    { const char* e = getenv("SPU_MFC_FAST"); if (e) mode = atoi(e); }
+    if (mode) for (int i = 0; names[i]; i++) if (getenv(names[i])) { mode = 0; break; }
+    s_mfc_fast_mode = mode;
+    return mode;
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
-static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+static inline int mfc_do_transfer_slow(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
     /* Memory ordering against the PPU threads. On the Cell the MFC sees main
@@ -747,8 +783,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
-         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
-        { uint32_t e = (uint32_t)ea;
+         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash.
+         * SPU_POISON_DMA=1 only: it scanned every PUT's payload. */
+        static int s_poison = -1;
+        if (s_poison < 0) s_poison = getenv("SPU_POISON_DMA") ? 1 : 0;
+        if (s_poison) { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
@@ -764,6 +803,327 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     }
 
     return 0;
+}
+
+
+#define MFC_FAST_NA (-100)
+
+/* SPU_MFC_FAST2=1 (default 0): cheaper fast path, same behaviour. It (a) skips
+ * spu_overlay_note_get when the GET cannot affect any overlay bookkeeping,
+ * (b) copies the common 16/32/64/128/256 byte transfers with constant-size
+ * memcpy, (c) tests the reservation bitmap inline instead of one call per
+ * 128-byte line, and (d) lets DMA list commands skip mfc_submit_slow's
+ * diagnostic blocks (the first 32 lists still go there so the log is unchanged). */
+static int s_mfc_fast2 = -1;
+static inline int mfc_fast2(void)
+{
+    if (s_mfc_fast2 >= 0) return s_mfc_fast2;
+    const char* e = getenv("SPU_MFC_FAST2");
+    s_mfc_fast2 = (e && atoi(e) != 0) ? 1 : 0;
+    return s_mfc_fast2;
+}
+
+/* May this GET change any state spu_overlay_note_get maintains? It only acts when
+ * (1) a diagnostic is armed (g_ovl_note_always), (2) a content-signature overlay can
+ * match (needs a GET of >= 512 bytes), (3) the source EA is one of the EA-keyed
+ * overlays (bloom filter, no false negatives), (4) the GET overlaps a resident code
+ * span of this context, or (5) it touches a 256-byte LS page that holds a registered
+ * dynamic overlay (invalidation). Anything else is a no-op there. */
+static inline int mfc_get_note_needed(const spu_context* spu, uint32_t ea, uint32_t lsa, uint32_t size, const uint8_t* ls_ptr)
+{
+    extern uint8_t g_ovl_sig_bloom[512];
+    extern volatile uint32_t g_ovl_note_always, g_ovl_sig_n;
+    extern uint8_t g_ovl_ea_bloom[512];
+    extern unsigned char g_spu_dyn_page[SPU_LS_SIZE >> 8];
+    if (g_ovl_note_always) return 1;
+    if (size >= 512 && g_ovl_sig_n) { extern int g_ovl_bloom_on; uint32_t w; memcpy(&w, ls_ptr, 4); uint32_t hs = (w * 0x9E3779B1u) >> 20; if (g_ovl_bloom_on == 0 || ((g_ovl_sig_bloom[hs >> 3] >> (hs & 7)) & 1u)) return 1; }
+    { uint32_t h = (ea * 0x9E3779B1u) >> 20;
+      if ((g_ovl_ea_bloom[h >> 3] >> (h & 7)) & 1u) return 1; }
+    if (spu->resident_code[0].image_id | spu->resident_code[1].image_id |
+        spu->resident_code[2].image_id | spu->resident_code[3].image_id) return 1;
+    for (uint32_t pg = lsa >> 8, pe = (lsa + size - 1) >> 8; pg <= pe; pg++)
+        if (g_spu_dyn_page[pg & ((SPU_LS_SIZE >> 8) - 1)]) return 1;
+    return 0;
+}
+
+/* SPU_MFC_STATS=1: per (image, GET/PUT, log2 size) count, bytes and TSC cycles spent in the
+ * copy itself (fast path only), printed at exit as [mfc-stats]. Answers whether time under
+ * the MFC channel is data movement (large copies) or something else. Default off. */
+static int s_mfc_stats = -1;
+static uint64_t g_mfc_st[64][2][16][3];
+static void mfc_stats_dump(void)
+{
+    for (int i = 0; i < 64; i++) for (int d = 0; d < 2; d++) for (int b = 0; b < 16; b++) {
+        const uint64_t* r = g_mfc_st[i][d][b];
+        if (r[0]) fprintf(stderr, "[mfc-stats] img=%d %s size<=%u n=%llu bytes=%llu Mcyc=%.2f cyc/call=%.0f cyc/B=%.3f\n",
+                          i, d ? "PUT" : "GET", 1u << b, (unsigned long long)r[0], (unsigned long long)r[1],
+                          r[2] / 1e6, (double)r[2] / r[0], r[1] ? (double)r[2] / r[1] : 0.0);
+    }
+}
+static inline int mfc_stats_on(void)
+{
+    if (s_mfc_stats >= 0) return s_mfc_stats;
+    const char* e = getenv("SPU_MFC_STATS");
+    s_mfc_stats = (e && atoi(e)) ? 1 : 0;
+    if (s_mfc_stats) atexit(mfc_stats_dump);
+    return s_mfc_stats;
+}
+static inline void mfc_stats_add(const spu_context* spu, int put, uint32_t size, uint64_t cyc)
+{
+    unsigned b = 0; while (b < 15 && (1u << b) < size) b++;
+    uint64_t* r = g_mfc_st[spu->image_id & 63][put][b];
+    __atomic_fetch_add(&r[0], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&r[1], size, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&r[2], cyc, __ATOMIC_RELAXED);
+}
+
+/* Constant-size copies for the sizes MFC jobs issue all the time. */
+static inline void mfc_copy_sz(void* d, const void* s, uint32_t size)
+{
+    switch (size) {
+    case 16:  memcpy(d, s, 16);  break;
+    case 32:  memcpy(d, s, 32);  break;
+    case 48:  memcpy(d, s, 48);  break;
+    case 64:  memcpy(d, s, 64);  break;
+    case 128: memcpy(d, s, 128); break;
+    case 256: memcpy(d, s, 256); break;
+    default:  memcpy(d, s, size); break;
+    }
+}
+
+/* Inline spu_coh_is_reserved (same bitmap, same armed test). */
+static inline int mfc_coh_reserved(uint32_t a)
+{
+    extern int g_spu_coh_armed;
+    extern unsigned char g_spu_coh_bitmap[];
+    return g_spu_coh_armed && ((g_spu_coh_bitmap[a >> 10] >> ((a >> 7) & 7)) & 1u);
+}
+/* Behavioural part of mfc_do_transfer_slow for a well-formed GET/PUT when no
+ * diagnostic is armed. MFC_FAST_NA = not handled here (the caller uses the slow
+ * path; nothing has happened yet). */
+static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                       uint32_t size, uint32_t cmd)
+{
+    extern uint32_t g_spu_watchea_dyn, g_barrier_sync_watch;
+    R35C(R35_XFER);
+    if (g_spu_watchea_dyn || g_barrier_sync_watch) return MFC_FAST_NA;
+    if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) return MFC_FAST_NA;
+    const int is_get = (cmd & 0x40) != 0;
+    const int is_put = !is_get && (cmd & 0x20) != 0;
+    /* malformed (rejected + logged by the slow path), or out of range */
+    if (size == 0 || size > 0x4000 || (size >= 16 && (size & 15)) ||
+        (((lsa ^ (uint32_t)ea) & 15) != 0) || (is_put && (uint32_t)ea < 0x10000u) ||
+        (ea >> 32) || (uint64_t)(lsa & SPU_LS_MASK) + size > (uint64_t)SPU_LS_SIZE ||
+        size > MFC_MAX_DMA_SIZE)
+        return MFC_FAST_NA;
+    lsa &= SPU_LS_MASK;
+    if (!mfc_ea_range_committed(ea, size)) return MFC_FAST_NA;
+    if (is_get) __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* GET*  */
+    else        __atomic_thread_fence(__ATOMIC_RELEASE);   /* PUT*  */
+    uint8_t* ls_ptr = &spu->ls[lsa];
+    uint8_t* ea_ptr = vm_base + (uint32_t)ea;
+    if (mfc_stats_on()) {   /* instrumented run: time the transfer through the plain (non-FAST2) body */
+        { extern int g_cri_video_dma; if (is_get && size > 0x100 && spu->image_id == spu_cri_image()) g_cri_video_dma = 1; }
+        uint64_t t0 = __rdtsc();
+        if (is_get) memcpy(ls_ptr, ea_ptr, size); else if (is_put) memcpy(ea_ptr, ls_ptr, size);
+        mfc_stats_add(spu, !is_get, size, __rdtsc() - t0);
+        if (is_get) { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+                      spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); return 0; }
+        if (!is_put) return MFC_FAST_NA;
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          extern void spu_coh_notify_write_except(uint32_t, const void*);
+          extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+          for (uint32_t a = (uint32_t)ea & ~127u, a1 = ((uint32_t)ea + size - 1u) & ~127u; ; a += 128u) {
+              if (mfc_coh_reserved(a)) { spu_lockline_lock(); spu_coh_notify_write_except(a, spu); spu_lockline_unlock(); }
+              if (a == a1) break; }
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        return 0;
+    }
+    if (is_get) {
+        { extern int g_cri_video_dma;
+          if (spu->image_id == spu_cri_image() && size > 0x100) g_cri_video_dma = 1; }
+        if (mfc_fast2()) {
+            mfc_copy_sz(ls_ptr, ea_ptr, size);
+            if (mfc_get_note_needed(spu, (uint32_t)ea, lsa, size, ls_ptr)) {
+                extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+                spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size);
+            }
+            return 0;
+        }
+        memcpy(ls_ptr, ea_ptr, size);
+        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+    } else if (is_put && mfc_fast2()) {
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern void spu_lockline_lock(void);
+        extern void spu_lockline_unlock(void);
+        const uint32_t a0 = (uint32_t)ea & ~127u;
+        const uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+        int span_reserved = 0;
+        for (uint32_t a = a0; ; a += 128u) {
+            if (mfc_coh_reserved(a)) { span_reserved = 1; break; }
+            if (a == a1) break;
+        }
+        if (span_reserved) {
+            spu_lockline_lock();
+            memcpy(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (mfc_coh_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (a == a1) break;
+            }
+            spu_lockline_unlock();
+        } else {
+            mfc_copy_sz(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {      /* a reservation may have appeared during the copy */
+                if (mfc_coh_reserved(a)) {
+                    spu_lockline_lock();
+                    spu_coh_notify_write_except(a, spu);
+                    spu_lockline_unlock();
+                }
+                if (a == a1) break;
+            }
+        }
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+    } else if (is_put) {
+        extern int  spu_coh_is_reserved(uint32_t);
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern void spu_lockline_lock(void);
+        extern void spu_lockline_unlock(void);
+        uint32_t a0 = (uint32_t)ea & ~127u;
+        uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+        int span_reserved = 0;
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (a == a1) break;
+        }
+        if (span_reserved) {
+            spu_lockline_lock();
+            memcpy(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (a == a1) break;
+            }
+            spu_lockline_unlock();
+        } else {
+            memcpy(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) {
+                    spu_lockline_lock();
+                    spu_coh_notify_write_except(a, spu);
+                    spu_lockline_unlock();
+                }
+                if (a == a1) break;
+            }
+        }
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+    } else {
+        return MFC_FAST_NA;   /* neither GET nor PUT family */
+    }
+    return 0;
+}
+
+/* Raw collision SPUs (110 igCollBroadSpu, 111 igcollspu) -- GET post-pass (SPU_COLL_GET_STABLE, default on, =0 off).
+ * They GET small control records (160 B job records, 16 B rows) that the PPU and the OTHER collision SPU rewrite
+ * in place. On the PS3 each 128-byte line of a DMA lands atomically w.r.t. other DMAs and the PPU; the host copy is a
+ * plain memcpy, so a record can arrive half old / half new. Same remedy as GETLLAR (SPU_GETLLAR_STABLE): once the
+ * copy is done, compare LS with the source and copy again until the two agree (a settled instant of the source).
+ * Healthy cost: one memcmp of <= 512 bytes. Also remembers the EA of the 160-byte record GET into LS 0x23000 of
+ * image 110 (the broad-phase job record) so the dispatch guard in spu_channels.c can re-read it. */
+extern SPU_THREAD_LOCAL uint32_t g_collnet_rec_ea;
+extern volatile long g_coll_get_retry, g_coll_get_calls;
+static int s_coll_get_stable = -1;
+static inline void mfc_coll_get_post(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size)
+{
+    lsa &= SPU_LS_MASK;
+    if (spu->image_id == 110 && lsa == 0x23000u && size == 160u) g_collnet_rec_ea = (uint32_t)ea;
+    if (size > 512u) return;
+    if (__builtin_expect(s_coll_get_stable < 0, 0)) { const char* e = getenv("SPU_COLL_GET_STABLE"); s_coll_get_stable = !(e && e[0] == '0'); }
+    if (!s_coll_get_stable) return;
+    uint8_t* l = &spu->ls[lsa];
+    const uint8_t* s = vm_base + (uint32_t)ea;
+    int it = 0;
+    while (it < 8 && memcmp(l, s, size) != 0) { memcpy(l, s, size); it++; }
+    if (__builtin_expect(it != 0, 0)) {
+        long k = __atomic_add_fetch(&g_coll_get_retry, 1, __ATOMIC_RELAXED);
+        if (k <= 16 || (k & (k - 1)) == 0)
+            fprintf(stderr, "[coll-get] img=%d GET ea=0x%08X lsa=0x%05X size=%u changed during the copy: re-read x%d (#%ld)\n",
+                    spu->image_id, (uint32_t)ea, lsa, size, it, k);
+    }
+}
+
+static inline int mfc_do_transfer_c(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd);
+/* coll37 tracer (SPU_C37=1): log the DMAs that touch the watched window / the raw collision SPUs, with the LS data. */
+static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                  uint32_t size, uint32_t cmd)
+{
+    if (__builtin_expect(g_c37_on != 0, 0)) {
+        c37_dma(spu, lsa, ea, size, cmd, 0);
+        const int rc = mfc_do_transfer_c(spu, lsa, ea, size, cmd);
+        if (cmd & 0x40) c37_dma(spu, lsa, ea, size, cmd, 1);
+        return rc;
+    }
+    return mfc_do_transfer_c(spu, lsa, ea, size, cmd);
+}
+static inline int mfc_do_transfer_c(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                    uint32_t size, uint32_t cmd)
+{
+    const int mode = mfc_fast_mode();
+    { extern volatile int g_tl_on; if (g_tl_on && (cmd & 0x20) && !(cmd & 0x40)) { extern void tl_put(uint32_t, uint32_t); tl_put((uint32_t)ea, size); } }   /* TOD_TIMELINE */
+    if (mode == 0) return mfc_do_transfer_slow(spu, lsa, ea, size, cmd);
+    if (mode == 1) {
+        int rc = mfc_do_transfer_fast(spu, lsa, ea, size, cmd);
+        if (rc == 0 && (cmd & 0x40) && (unsigned)(spu->image_id - 110) <= 1u) mfc_coll_get_post(spu, lsa, ea, size);
+        return rc != MFC_FAST_NA ? rc : mfc_do_transfer_slow(spu, lsa, ea, size, cmd);
+    }
+    /* mode 2: fast then slow on the same transfer, compare */
+    {
+        static SPU_THREAD_LOCAL uint8_t save[0x4000], got[0x4000], pre[0x4000];
+        static volatile long s_n, s_bad;
+        const int is_get = (cmd & 0x40) != 0;
+        const uint32_t l = lsa & SPU_LS_MASK;
+        if (size == 0 || size > 0x4000 || l + size > SPU_LS_SIZE || (ea >> 32) ||
+            (!is_get && (uint32_t)ea < 0x10000u) || !mfc_ea_range_committed(ea, size))
+            return mfc_do_transfer_slow(spu, lsa, ea, size, cmd);
+        uint8_t* dst = is_get ? &spu->ls[l] : vm_base + (uint32_t)ea;
+        if (is_get) { memcpy(save, dst, size); memcpy(pre, vm_base + (uint32_t)ea, size); }
+        int res_before = 0;
+        if (!is_get) { extern int spu_coh_is_reserved(uint32_t);
+            for (uint32_t a = (uint32_t)ea & ~127u; a < (uint32_t)ea + size; a += 128u)
+                if (spu_coh_is_reserved(a)) { res_before = 1; break; } }
+        int rc1 = mfc_do_transfer_fast(spu, lsa, ea, size, cmd);
+        if (rc1 == MFC_FAST_NA) return mfc_do_transfer_slow(spu, lsa, ea, size, cmd);
+        memcpy(got, dst, size);
+        if (is_get) memcpy(dst, save, size);
+        int rc2 = mfc_do_transfer_slow(spu, lsa, ea, size, cmd);
+        int bad;
+        if (is_get) bad = (rc1 != rc2) || memcmp(got, dst, size) != 0;
+        else /* PUT: peers also write shared job words, so judge fast against the slow reference: slow left the LS bytes in
+              * memory (no interference) while fast did not */
+            bad = (rc1 != rc2) || (memcmp(dst, &spu->ls[l], size) == 0 && memcmp(got, &spu->ls[l], size) != 0);
+        long n = __atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED);
+        /* a GET whose source changed while we compared (another thread publishing) is not a mismatch */
+        if (bad && is_get && memcmp(pre, vm_base + (uint32_t)ea, size) != 0) {
+            static volatile long s_unst; __atomic_add_fetch(&s_unst, 1, __ATOMIC_RELAXED); bad = 0; }
+        if (bad) { long b = __atomic_add_fetch(&s_bad, 1, __ATOMIC_RELAXED);
+            if (b <= 16) {
+                fprintf(stderr, "[mfc-check] MISMATCH #%ld %s cmd=0x%X lsa=0x%05X ea=0x%08X size=%u rc fast=%d slow=%d img=%d\n",
+                        b, is_get ? "GET" : "PUT", cmd, l, (uint32_t)ea, size, rc1, rc2, spu->image_id);
+                fprintf(stderr, "   first8 fast-dst=");
+                for (uint32_t q = 0; q < 8 && q < size; q++) fprintf(stderr, "%02X", got[q]);
+                fprintf(stderr, " slow-dst=");
+                for (uint32_t q = 0; q < 8 && q < size; q++) fprintf(stderr, "%02X", dst[q]);
+                fprintf(stderr, " ls=");
+                for (uint32_t q = 0; q < 8 && q < size; q++) fprintf(stderr, "%02X", spu->ls[l + q]);
+                fprintf(stderr, " now-dst=");
+                for (uint32_t q = 0; q < 8 && q < size; q++) fprintf(stderr, "%02X", (vm_base + (uint32_t)ea)[q]);
+                fprintf(stderr, "\n"); } }
+        if ((n & 0xFFFFF) == 0)
+            fprintf(stderr, "[mfc-check] %ld transfers compared, %ld mismatches\n", n, s_bad);
+        return rc2;
+    }
 }
 
 /*
@@ -908,6 +1268,26 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
 /* ---------------------------------------------------------------------------
  * Enqueue an MFC command (called when SPU writes to MFC_Cmd channel)
  * -----------------------------------------------------------------------*/
+#define SPU_GET_RING 32
+typedef struct { unsigned n; uint32_t lsa[SPU_GET_RING], ea[SPU_GET_RING],
+                 size[SPU_GET_RING], pc[SPU_GET_RING]; } spu_get_ring_t;
+static spu_get_ring_t g_spu_get_ring[16];
+static const void* volatile g_spu_get_ring_ctx[16];
+static int g_spu_get_ring_on = -1;
+/* One ring per context: raw SPU ids and SPURS SPU ids overlap. */
+static inline spu_get_ring_t* spu_get_ring_for(const void* ctx)
+{
+    for (int i = 0; i < 16; i++) {
+        if (g_spu_get_ring_ctx[i] == ctx) return &g_spu_get_ring[i];
+        if (!g_spu_get_ring_ctx[i]) {
+            if (_InterlockedCompareExchangePointer((void* volatile*)&g_spu_get_ring_ctx[i], (void*)ctx, NULL) == NULL ||
+                g_spu_get_ring_ctx[i] == ctx)
+                return &g_spu_get_ring[i];
+        }
+    }
+    return &g_spu_get_ring[15];
+}
+
 static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
 {
     if (mfc->queue_count >= MFC_QUEUE_DEPTH)
@@ -926,11 +1306,81 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
     return 0;
 }
 
+/* Repeated-identical-DMA detector (shared by the slow and fast submit paths). */
+static inline void mfc_repeat_check(spu_context* spu, uint32_t cmd, uint32_t lsa, uint64_t ea)
+{
+    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
+     * about its state can change if the DMA is all it is doing. This used to
+     * count only REJECTED transfers, so once the EA check started committing
+     * pages on demand the counter never advanced and a spinning job simply hung
+     * the chain walker instead. Count repeats whether or not the transfer
+     * succeeds, and halt at a known pc rather than hanging silently. */
+    /* Per thread: the repeat count is a property of one SPU's command stream;
+     * shared, the threads interleaved it and rewrote one cache line per DMA. */
+    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep, s_rep_gets;
+      static uint32_t s_limit = 0;
+      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+                      /* Off by default (2^30): counted per thread, a poll loop
+                       * reached 256 quickly and the Sleep(0) yields slowed the
+                       * jobs it waits on (metropolis 36 -> 32 fps). Counted
+                       * globally it hardly ever fired. SPU_DMA_REPEAT_LIMIT=256: on. */
+                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : (1u << 30); }
+      /* A repeated GET is a poll, not a wedge, when another SPU or the PPU owns
+       * the word: ToD's geomcullclip jobs spin on a GET of their shared table
+       * (0x10690740) until the sibling job publishes; halting one of them strands
+       * its claimed job and the PPU waits forever ("igGeomCullClip SPU Timeout!").
+       * Yield instead; SPU_DMA_REPEAT_HALT_GETS=1 restores the old halt. */
+      static int s_halt_gets = -1;
+      if (s_halt_gets < 0) s_halt_gets = getenv("SPU_DMA_REPEAT_HALT_GETS") ? 1 : 0;
+      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+          if (mfc_is_get(cmd)) s_rep_gets++;
+          /* A run with GETs in it is the poll however it ends: ToD's loop
+           * GETs at 0x044FC and puts back at 0x045F4, and the run reaching
+           * the limit on the PUT halts the job. That loop is the geomcull job's
+           * "take command" routine (jobmod d6470883, LS 0x44EC-0x4754): GET the
+           * box, and when it holds a command PUT it back cleared -- work, not a
+           * spin. Halted, metropolis's PPU waits forever on the command box.
+           * Default since 20/10/2026 (cobalia 240 s with it, no timeouts; the
+           * StaticDb / WwsJobDelay timeouts once blamed on it came from an
+           * older build). SPU_DMA_POLL_MIXED=0: the old halt on a PUT. */
+          static int s_mixed = -1;   /* a run with GETs in it yields too */
+          if (s_mixed < 0) { const char* e = getenv("SPU_DMA_POLL_MIXED"); s_mixed = e ? atoi(e) != 0 : 1; }
+          /* Mixed mode never halts: after the yield resets the counters, the
+           * same geomcull loop (fast now that job modules run lifted) reached
+           * the limit again in a GET-less stretch and was halted -> metropolis
+           * stalled at ~45 s. Halting a working job is never right. */
+          if (++s_rep >= s_limit && (s_mixed || mfc_is_get(cmd)) && !s_halt_gets) {
+              s_rep = 0; s_rep_gets = 0;
+              static int _ny = 0;
+              if (_ny < 4 && ++_ny)
+                  fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical GETs from ea=0x%08X"
+                          " -- polling, yielding (not halting)\n",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit, (uint32_t)ea);
+              /* SPU_POLL_LSDUMP=<file>: write the poller's local store once (find what it waits on). */
+              { static int s_pd = 0; const char* pd = getenv("SPU_POLL_LSDUMP");
+                if (pd && !s_pd && spu->ls) { s_pd = 1; FILE* f = fopen(pd, "wb");
+                    if (f) { fwrite(spu->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+                    fprintf(stderr, "[spu-dma] poller LS -> %s (lsa=0x%05X r3..r6=%08X %08X %08X %08X)\n", pd, lsa,
+                            spu->gpr[3]._u32[0], spu->gpr[4]._u32[0], spu->gpr[5]._u32[0], spu->gpr[6]._u32[0]); } }
+              Sleep(0);
+          } else if (s_rep >= s_limit) {
+              s_rep = 0; s_rep_gets = 0;   /* re-arm: the chain may run this job again */
+              extern void spu_halt(spu_context*);
+              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                      "transfers to ea=0x%08X -- halting the SPU\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                      (uint32_t)ea);
+              fflush(stderr);
+              spu_halt(spu);
+          }
+      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_rep_gets = mfc_is_get(cmd) ? 1u : 0u; } }
+}
+
 /*
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  */
-static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+static inline int mfc_submit_slow(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
@@ -949,6 +1399,39 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
+
+    /* SPU_STOP_DUMP=1: remember each SPU's last plain GETs (0x40-0x42) so the
+     * synthesised-stop report can show what the image had just read and what
+     * that memory holds now. Raw collision SPUs branch to LS 0 through a
+     * handler table indexed by a field of a DMA'd command: the question is
+     * whether the command was already bad in memory or read mid-write. */
+    if (g_spu_get_ring_on < 0) g_spu_get_ring_on = getenv("SPU_STOP_DUMP") ? 1 : 0;
+    if (g_spu_get_ring_on && (cmd & 0xFCu) == 0x40u && (cmd & 3u) != 3u) {
+        spu_get_ring_t* r = spu_get_ring_for(spu);
+        unsigned i = r->n++ & (SPU_GET_RING - 1);
+        r->lsa[i] = lsa; r->ea[i] = (uint32_t)ea; r->size[i] = size;
+        r->pc[i] = (uint32_t)spu->pc & SPU_LS_MASK;
+    }
+    /* ...and every distinct (image, pc, cmd) that writes into a raw SPU's
+     * local-store window by DMA, once: the collision SPUs' LS is corrupted
+     * from outside at the moment they crash. */
+    if (g_spu_get_ring_on && (uint32_t)ea >= 0xE0000000u && (uint32_t)ea < 0xE0200000u &&
+        (cmd & 0xF0u) == 0x20u) {
+        static uint64_t seen[128]; static volatile LONG nseen;
+        uint64_t key = ((uint64_t)(uint32_t)spu->image_id << 40) | ((uint64_t)(cmd & 0xFFu) << 32) |
+                       ((uint32_t)spu->pc & SPU_LS_MASK);
+        int found = 0; LONG n = nseen; if (n > 128) n = 128;
+        for (LONG k = 0; k < n; k++) if (seen[k] == key) { found = 1; break; }
+        if (!found) {
+            LONG k = InterlockedIncrement(&nseen) - 1;
+            if (k < 128) {
+                seen[k] = key;
+                fprintf(stderr, "[raw-ls-put] img=%d spu%u pc=0x%05X cmd=0x%02X ea=0x%08X lsa=0x%05X size=%u\n",
+                        spu->image_id, spu->spu_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd & 0xFFu,
+                        (uint32_t)ea, lsa, size);
+            }
+        }
+    }
 
     /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
      * covers one word, with the SPU id, its pc and the value the word holds
@@ -1270,28 +1753,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
-     * about its state can change if the DMA is all it is doing. This used to
-     * count only REJECTED transfers, so once the EA check started committing
-     * pages on demand the counter never advanced and a spinning job simply hung
-     * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently. */
-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
-      static uint32_t s_limit = 0;
-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit) {
-              s_rep = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
-              fflush(stderr);
-              spu_halt(spu);
-          }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+    mfc_repeat_check(spu, cmd, lsa, ea);
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
@@ -1460,7 +1922,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
-        static int _pn = 0;
+        int _pn = s_mfc_pm_pn;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
          * sequence is exactly what the pipeline diagnosis needs. */
@@ -1473,7 +1935,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     cmd, lsa, (unsigned long long)ea, size, tag);
         } else if (_pn == 96)
             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-        if (_pn <= 96) _pn++;
+        if (_pn <= 96) s_mfc_pm_pn = _pn + 1;
     }
 
     /* Execute the transfer.
@@ -1558,6 +2020,39 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
 
+    return rc;
+}
+
+/* Fast submit: the behavioural part of mfc_submit_slow when no diagnostic is armed. */
+static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    extern uint32_t g_barrier_sync_watch;
+    const uint32_t lsa = spu->mfc_lsa;
+    /* SPU_MFC_FAST2: lists skip the slow submit once the first 32 (which log) are past. */
+    int list_slow = mfc_is_list(cmd);
+    if (list_slow && mfc_fast2() && mfc_fast_mode() == 1) {
+        static volatile LONG s_nlist;
+        if (s_nlist >= 32 || InterlockedIncrement(&s_nlist) > 32) list_slow = 0;
+    }
+    if (mfc_fast_mode() == 0 || list_slow ||
+        (spu->policy_mode && (s_mfc_pm_pn <= 96 || g_barrier_sync_watch)) ||
+        (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40))
+        return mfc_submit_slow(mfc, spu, cmd);
+    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    const uint32_t size = spu->mfc_size;
+    const uint32_t tag = spu->mfc_tag & 0x1F;
+    mfc_repeat_check(spu, cmd, lsa, ea);
+    mfc->tag_completed &= ~(1u << tag);
+    if (cmd == MFC_BARRIER_CMD || cmd == MFC_EIEIO_CMD || cmd == MFC_SYNC_CMD) {
+        mfc->tag_completed |= (1u << tag);
+        return 0;
+    }
+    int rc = mfc_is_list(cmd)
+        ? mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK, ea & 0xFFFFFFFF00000000ull, size, cmd)
+        : mfc_do_transfer(spu, lsa, ea, size, cmd);
+    if (!(spu->list_stall_mask & (1u << tag)) &&
+        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
+        mfc->tag_completed |= (1u << tag);
     return rc;
 }
 

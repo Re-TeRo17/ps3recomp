@@ -1,3 +1,4 @@
+#define SPU_IMPL_TU 1
 /* spu_interp.c — SPU interpreter core. See spu_interp.h.
  *
  * Decode tables are generated from the validated Python decoder

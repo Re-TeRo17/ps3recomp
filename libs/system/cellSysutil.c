@@ -263,6 +263,71 @@ s32 cellSysutilCheckCallback(void)
  * near the guest's variable, and nothing on the way says a word.
  *
  * A u32 cannot be passed a host pointer by accident. */
+/* PS3_LANG: the console's system language the game sees -- a CELL_SYSUTIL_LANG_*
+ * number or a name (italian, english, english_gb, french, german, spanish, ...).
+ * Default english (US). Read once. */
+static int sysutil_ieq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++)
+        if ((*a | 0x20) != (*b | 0x20)) return 0;
+    return *a == *b;
+}
+static s32 sysutil_system_lang(void)
+{
+    static s32 lang = -1;
+    if (lang >= 0) return lang;
+    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    const char* e = getenv("PS3_LANG");
+    if (e && *e) {
+        static const struct { const char* name; s32 v; } k[] = {
+            { "japanese", 0 }, { "english", 1 }, { "english_us", 1 }, { "french", 2 },
+            { "spanish", 3 }, { "german", 4 }, { "italian", 5 }, { "dutch", 6 },
+            { "portuguese", 7 }, { "russian", 8 }, { "korean", 9 }, { "chinese_t", 10 },
+            { "chinese_s", 11 }, { "finnish", 12 }, { "swedish", 13 }, { "danish", 14 },
+            { "norwegian", 15 }, { "polish", 16 }, { "portuguese_br", 17 },
+            { "english_gb", 18 }, { "turkish", 19 },
+        };
+        char* end = NULL;
+        long n = strtol(e, &end, 10);
+        if (end && *end == 0 && n >= 0 && n <= 19) lang = (s32)n;
+        else for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            if (sysutil_ieq(e, k[i].name)) { lang = k[i].v; break; }
+        fprintf(stderr, "[sysutil] system language %d (PS3_LANG=%s)\n", lang, e);
+    }
+    return lang;
+}
+
+/* PS3_LICENSE_AREA: the console's licence area (SYSTEMPARAM 0x0122) -- j, a, e,
+ * h, k, c or the CELL_SYSUTIL_LICENSE_AREA_* number. Default: the title ID's
+ * region (BCES/BLES Europe, BCUS/BLUS America, BCJS/BLJM/BCJM Japan, BCAS/BLAS
+ * Asia, BCKS/BLKS Korea). It used to be 0 = Japan: Ratchet & Clank ToD then
+ * plays its Japanese FMV cut (l01_s01_ntro_fmv.jp.bik, a different Ratchet). */
+static s32 sysutil_license_area(void)
+{
+    static s32 area = -1;
+    if (area >= 0) return area;
+    area = 2;   /* Europe */
+    extern const char* cellGame_get_title_id(void);
+    const char* t = cellGame_get_title_id();
+    if (t && strlen(t) >= 4) {
+        const char r = t[2];
+        if (r == 'U') area = 1;
+        else if (r == 'J') area = 0;
+        else if (r == 'A') area = 3;
+        else if (r == 'K') area = 4;
+        else if (r == 'E') area = 2;
+    }
+    const char* e = getenv("PS3_LICENSE_AREA");
+    if (e && *e) {
+        static const char k[] = "jaehkc";
+        const char* f = strchr(k, *e | 0x20);
+        if (f && e[1] == 0) area = (s32)(f - k);
+        else area = (s32)strtol(e, NULL, 10);
+    }
+    fprintf(stderr, "[sysutil] licence area %d (title %s)\n", area, t ? t : "?");
+    return area;
+}
+
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
     if (!value_ea)
@@ -271,7 +336,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = sysutil_system_lang();
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
@@ -281,6 +346,9 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
+    case 0x0122: /* CELL_SYSUTIL_SYSTEMPARAM_ID_LICENSE_AREA */
+        v = sysutil_license_area();
+        break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */

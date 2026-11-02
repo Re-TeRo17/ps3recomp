@@ -24,6 +24,7 @@ void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); me
 void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
 void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
 void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
+int ps3_mods_resolve(const char* guest, char* host_path, size_t cap) { (void)guest; (void)host_path; (void)cap; return 0; }
 void ydkj_host_bt(const char* tag) { (void)tag; }
 /* the fork's runtime: no page is watched, read timing off */
 void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }

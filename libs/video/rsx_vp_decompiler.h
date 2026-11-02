@@ -74,6 +74,9 @@ int rsx_vp_decompile_compact_ex(
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);
+/* BRB/CLB: the 0x1FF8 bits the next decompile bakes in; whether a program has such branches. */
+void rsx_vp_set_branch_bits(u32 bits);
+int  rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
 
 #ifdef __cplusplus
 }

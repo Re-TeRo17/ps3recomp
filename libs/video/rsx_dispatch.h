@@ -124,6 +124,8 @@ struct rsx_dispatch {
     int in_begin_end;                 /* between BEGIN_END(prim) and (0)    */
     u32 current_primitive;
     u32 const_gen;                    /* bumped on every constants[] write  */
+    u32 const_lo, const_hi;           /* constant slots written since the engine
+                                         last consumed them; lo > hi = none */
     u32 vp_gen;                       /* bumped on every vp[] write         */
     u32 canvas_mark_at;               /* where g_rsx_canvas_mark sits in constants[]:
                                          slot * 4 + component + 1; 0 nowhere */
@@ -164,12 +166,22 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
  * upload window: rsx_dispatch_method on each, at once. 0 (nothing done) for
  * a run it does not take. */
 int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be);
+int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be);   /* RSX_FIFO_FAST */
+u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, const u8* be);   /* RSX_FIFO_RUN */
 
 /* ---- decoded state getters -------------------------------------------- */
 
+/* 27/10 walkF2: register-read tracing for the draw/dispatch split (rsx_draw_snap.c). g_rsx_dsp_trace != 0 (set only
+ * by RSX_DSP_READ_LOG / RSX_SNAP_CHECK / the snapshot whitelist builder) sends every read through
+ * rsx_dsp_trace_read(): it records which register was read and, when a live twin is set, flags a read whose
+ * value differs from the live file. 0 = the plain load below (one predictable branch). */
+extern volatile u32 g_rsx_dsp_trace;
+void rsx_dsp_trace_read(const rsx_dispatch* rsx, u32 idx);
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
 {
-    return rsx->regs[(method & 0xFFFFC) >> 2];
+    const u32 idx = (method & 0xFFFFC) >> 2;
+    if (g_rsx_dsp_trace) rsx_dsp_trace_read(rsx, idx);
+    return rsx->regs[idx];
 }
 
 /* CLEAR_COLOR_VALUE: A8R8G8B8 */

@@ -18,6 +18,7 @@
 extern u8* vm_base;
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -30,7 +31,37 @@ static float s_gamma = 1.0f;
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* AUDIO_OUT_STEREO=1: advertise stereo only, so the game mixes to 2 ch itself. */
+static int avconf_stereo_only(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("AUDIO_OUT_STEREO"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
+/* [audio-out] diagnostics go to stderr (the .err log): the title's audio-out
+ * conversation (what it asked, what it was told) must be in every run's log, so a
+ * run with a different speaker layout can be told apart from one without. All answers
+ * below are pure functions of the arguments and of AUDIO_OUT_STEREO: nothing here
+ * depends on the host audio device, on WASAPI, or on timing. */
+static void avconf_log(const char* what, u32 a, u32 b, u32 c, s32 ret)
+{
+    static int n = 0;
+    if (n < 24) {
+        n++;
+        fprintf(stderr, "[audio-out] %s a=%u b=%u c=%u -> %d\n", what, a, b, c, (int)ret);
+    }
+}
+
+static s32 avconf_sound_availability(u32 audioOut, u32 type, u32 fs, u32 option);
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
+{
+    s32 r = avconf_sound_availability(audioOut, type, fs, option);
+    avconf_log("GetSoundAvailability(out,type,fs)", audioOut, type, fs, r);
+    return r;
+}
+
+static s32 avconf_sound_availability(u32 audioOut, u32 type, u32 fs, u32 option)
 {
     (void)audioOut;
     (void)option;
@@ -43,6 +74,10 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
      * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
      * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
      * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
+    if (avconf_stereo_only()) {
+        if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) return CELL_AUDIO_OUT_CHNUM_2;
+        return 0;
+    }
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
         if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
         return CELL_AUDIO_OUT_CHNUM_2;
@@ -62,7 +97,8 @@ s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u3
 
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM &&
         (fs & CELL_AUDIO_OUT_FS_48KHZ) &&
-        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))
+        (ch == CELL_AUDIO_OUT_CHNUM_2 ||
+         (!avconf_stereo_only() && (ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))))
         return 1; /* available */
 
     return 0;
@@ -76,6 +112,7 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 
     printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n",
            audioOut, deviceIndex);
+    avconf_log("GetDeviceInfo(out,dev)", audioOut, deviceIndex, 0, 0);
 
     if (!info)
         return CELL_EINVAL;
@@ -90,7 +127,7 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
      * self-inconsistent, and middleware (FMOD) validates these against each other. */
     info->portType = 0; /* HDMI */
     info->state = 2;    /* connected */
-    info->availableModeCount = 3;
+    info->availableModeCount = avconf_stereo_only() ? 1 : 3;
     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
     info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
@@ -136,9 +173,9 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
  * a byte at a time, which needs no struct definition to get right. */
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
 {
-    (void)deviceIndex;
     uint32_t ea = (uint32_t)(uintptr_t)state;
     printf("[cellAvconfExt] AudioOutGetState(audioOut=%u)\n", audioOut);
+    avconf_log("GetState(out,dev)", audioOut, deviceIndex, 0, 0);
     if (!ea)
         return CELL_EINVAL;
 
@@ -192,5 +229,9 @@ s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForE
 {
     (void)config; (void)option; (void)waitForEvent;
     printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    {   /* CellAudioOutConfiguration { u8 channel; u8 encoder; u8 reserved[10]; u32 downMixer; } */
+        const uint32_t ea = (uint32_t)(uintptr_t)config;
+        avconf_log("Configure(out,channel,encoder)", audioOut, ea ? vm_read8(ea + 0) : 0xFFu, ea ? vm_read8(ea + 1) : 0xFFu, 0);
+    }
     return 0;
 }

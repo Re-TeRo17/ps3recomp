@@ -98,7 +98,7 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    *inside the game build* by clang so the tail call is guaranteed -- a plain
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$|/spu_coll_sync\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -107,6 +107,11 @@ add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+# wid0 (job di animazione 0x6248): cattura in gioco (ANIM_CAPTURE) e riferimento nativo (anim_ref.c). anim_ref.c
+# con SPU_RZ_FP_TLS: gli helper float sono le operazioni host quando g_spu_rz e' attivo (MXCSR RZ|DAZ|FTZ).
+set_source_files_properties(runtime/spu/capture_patch.c PROPERTIES COMPILE_DEFINITIONS "ANIM_CAP_GAME")
+set_source_files_properties(runtime/spu/anim_ref.c PROPERTIES COMPILE_DEFINITIONS "SPU_RZ_FP_TLS")
+
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -386,7 +391,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     # '-msse4.1'"), which stops the whole runtime from building there.
     include(CheckCCompilerFlag)
     check_c_compiler_flag(-msse4.1 PS3RECOMP_HAS_MSSE41)
-    if(PS3RECOMP_HAS_MSSE41)
+    # PS3RECOMP_X86_LEVEL (e.g. x86-64-v3): a title that already requires that
+    # CPU level for its lifted code can build the runtime at it too.
+    set(PS3RECOMP_X86_LEVEL "" CACHE STRING "-march for the runtime on x86-64 (empty: SSE4.1)")
+    if(PS3RECOMP_X86_LEVEL)
+        target_compile_options(ps3recomp_runtime PRIVATE -march=${PS3RECOMP_X86_LEVEL})
+    elseif(PS3RECOMP_HAS_MSSE41)
         target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
     endif()
 elseif(MSVC)
@@ -528,6 +538,27 @@ if(UNIX)
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# 31/10 (pre52): RSX_CODEGEN_ID = hash of the sources that decide what HLSL a guest program becomes. The pipeline
+# manifest (cache/pipes.bin) and the PSO library (cache/pso_*.lib) carry it instead of the exe's size/time, so a rebuild
+# that does not touch the decompilers keeps the cache of the previous build (before: every build started cold).
+# CMAKE_CONFIGURE_DEPENDS: CMake runs again when one of them changes.
+if(WIN32)
+    set(_cg_all "")
+    foreach(_f libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+               libs/video/rsx_vp_decompiler.h libs/video/rsx_fp_decompiler.h)
+        file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${_f}" _fh)
+        string(APPEND _cg_all "${_fh}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_f}")
+    endforeach()
+    string(SHA256 _cg_hash "${_cg_all}")
+    string(SUBSTRING "${_cg_hash}" 0 16 _cg16)
+    message(STATUS "ps3recomp: RSX_CODEGEN_ID=0x${_cg16}")
+    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_draw_engine.c"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_d3d12_engine.c"
+                 APPEND PROPERTY COMPILE_DEFINITIONS "RSX_CODEGEN_ID=0x${_cg16}ULL")
 endif()
 
 # ---------------------------------------------------------------------------

@@ -74,6 +74,18 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self);
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;
 
+/* coll37 tracer (SPU_C37=1, spu_c37.inc): g_c37_on -1 = undecided, 0 off, 1 on. */
+extern volatile int g_c37_on;
+void c37_dma(const spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd, int post);
+void c37_atomic(const spu_context* ctx, uint32_t cmd, int handled);
+void c37_atomic_pre(const spu_context* ctx);
+void c37_atomic_post(void);
+void c37_ppu_w(uint32_t a, uint64_t v, int width, uint32_t fn, uint32_t lr, unsigned tid);
+void c37_wait(const spu_context* ctx, uint32_t channel, int end, double us);
+void c37_notify(uint32_t ea, int writer_img, uint32_t wm, uintptr_t ra);
+long long c37_stale(const spu_context* ctx, uint32_t rec_ea);
+void c37_stale_done(long long mark, uint32_t rereads, const uint8_t* mem);
+
 #ifdef __cplusplus
 }
 #endif

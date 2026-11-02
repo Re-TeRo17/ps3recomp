@@ -322,6 +322,10 @@ typedef struct spu_context {
      * persistent workload-module image adopted at LS 0xA00, re-applied at
      * dispatch after a call-bracket image restore. */
     uint32_t host_depth;
+    /* MFC engine lookup cache (spu_channels.c mfc_for): owner context, registry generation, engine. */
+    void*    mfc_c_owner;
+    void*    mfc_c_eng;
+    uint32_t mfc_c_gen;
 
     /* Trampoline steps taken since this context started running. Only needed
      * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
@@ -347,6 +351,7 @@ typedef struct spu_context {
      * spu_channels.c casts to the real types. */
     void* ch_wait_cv;
     void* ch_wait_lock;
+    volatile long ch_waiters;   /* threads inside spu_ch_wait/evwait park section; spu_ch_wake skips the lock when 0 */
 
     /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
      * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while
@@ -563,7 +568,11 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
+    /* The WWS bufferSetArray probe only logs 48 reads in [0xDF0, 0xEB0): test that
+     * range inline. Calling out for every image-2 policy read made each LS load
+     * of every ToD job (they run as image 2) an out-of-line call. */
+    if (__builtin_expect(g_spu_ls_probe != 0, 0) ||
+        (lsa - 0xDF0u < 0xC0u && ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
@@ -619,7 +628,9 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
 extern int g_spu_smc_watch;
 static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
-    if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+    if (g_spu_smc_watch < 0) g_spu_smc_watch = (getenv("SPU_SMC_WATCH") || getenv("SPU_COLLTAB_WATCH")) ? 1 : 0;
+    /* SPU_COLLTAB_WATCH=1: any lifted store into the img-110 dispatch table LS 0x6D20..0x6D4F (spu_channels.c). */
+    if (ctx->image_id == 110 && lsa - 0x60u < 0x6CF0u) { extern void spu_colltab_wr(spu_context*, uint32_t, const uint8_t*); spu_colltab_wr(ctx, lsa, p); }
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
      * target LS line falls inside that image's CODE segment (the segment
      * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
@@ -789,6 +800,15 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 #  define SPU_THREAD_LOCAL __thread
 #endif
 
+/* SPU_R35_COUNT=1 (diagnostic): per-thread call counters of the runtime entry points, summed per run by the
+ * lane-0 worker ([lcall] line in cellSpurs.c). One predictable branch per call when off. */
+extern int g_r35_on;
+extern SPU_THREAD_LOCAL unsigned long long g_r35c[32];
+enum { R35_WRCH, R35_WRCH_CMD, R35_WRCH_TAGM, R35_WRCH_TAGU, R35_WRCH_OTH, R35_RDCH, R35_RCHCNT, R35_IB, R35_IB_COLD,
+       R35_DRAIN_FULL, R35_NOTE_GET, R35_NOTE_GET_SCAN, R35_XFER, R35_GETLLAR, R35_PUTLLC, R35_PUTOTH, R35_ABORT_TAKE,
+       R35_HOP_LS0, R35_HOPSLOW, R35_IBFULL, R35_EVW_TSC, R35_EVW_SLP, R35_EVW_N, R35_NSLOT };
+#define R35C(i) do { if (__builtin_expect(g_r35_on, 0)) g_r35c[i]++; } while (0)
+
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
@@ -796,6 +816,11 @@ void spu_indirect_branch(spu_context* ctx);
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+
+/* LS delta of the instance of a relocated blob that is running: lqr/stqr of a
+ * blob lifted with spu_lifter.py --pic-reloc address `imm + g_spu_reloc`. Set by
+ * the dynovl reloc hook (spu_dynovl_reloc_enter), 0 outside it. */
+extern SPU_THREAD_LOCAL uint32_t g_spu_reloc;
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
@@ -811,6 +836,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* Cooperative abort of a SPU host thread (raw SPU RunCntl=0 / restart). The
+ * lifted code only gives the runtime control at channel operations, so the
+ * request is honoured at the target's next rdch/wrch (or inside a parked
+ * channel wait): spu_halt() then unwinds to spu_run_with_halt(). Idempotent.
+ * spu_abort_cancel drops a request that was never consumed. */
+void spu_abort_request(spu_context* ctx);
+void spu_abort_cancel(spu_context* ctx);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
  * call frame, so an SPU loop the lifter lowered as a CALL rather than a
  * transfer recurses until the host stack dies -- surfacing as a bare
@@ -828,6 +860,24 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+/* Inline fast path of spu_drain_call: the callee already returned to the call site (nothing pending,
+ * or a plain indirect-branch hand-off whose target is return_pc). Same effect as the loop in
+ * spu_drain.c for that input without the call, the depth-guard ring or the irq-frame setup.
+ * SPU_DRAIN_FAST=0 turns it off (g_spu_drain_fast). Lifted code calls it by the old name. */
+extern int g_spu_drain_fast;
+static inline void spu_drain_call_fast(spu_context* ctx, uint32_t return_pc)
+{
+    if (__builtin_expect(g_spu_drain_fast != 0, 1) && ctx->host_depth < 1500u) {
+        void (*tf)(spu_context*) = g_spu_trampoline_fn;
+        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK) && (tf == 0 || tf == spu_indirect_branch)) {
+            g_spu_trampoline_fn = 0;
+            ctx->drain_ret_pc = 0;
+            return;
+        }
+    }
+    (spu_drain_call)(ctx, return_pc);
+}
+#define spu_drain_call(ctx, rpc) spu_drain_call_fast((ctx), (rpc))
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
@@ -913,6 +963,56 @@ static inline void spu_hop(spu_context* ctx, void (*tf)(spu_context*))
     if (__builtin_expect(g_pm_flow_ctx == (void*)ctx, 0) && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 }
+
+/* Guarded tail calls for the lifted functions' static transfers (tools/tail_spu_c.py rewrites
+ * `ctx->pc = X; g_spu_trampoline_fn = F; return;` into SPU_TAIL). When nothing that spu_hop /
+ * the drain loop would act on is armed, jump straight into the target (clang musttail: the host
+ * stack does not grow, the callee returns to this function's caller). Otherwise keep the old
+ * hand-off through the trampoline. g_spu_tail_on: SPU_TAIL=1 enables it (default off: measured slower), SPU_PROMOTE_CHECK / job trace
+ * switches turn it off (spu_hop_init). */
+extern int g_spu_tail_on;
+#define SPU_TAIL_OK(ctx) (__builtin_expect(g_spu_tail_on != 0 && g_spu_hop_slow == 0 && g_yz_lockstep_on == 0 && \
+        g_spu_stack_reset_count == 0 && g_pm_flow_ctx != (void*)(ctx) && \
+        !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)), 1))
+#if defined(__clang__)
+#define SPU_TAIL(ctx, tpc, fn) do { (ctx)->pc = (tpc); \
+        if (SPU_TAIL_OK(ctx)) { \
+            (ctx)->dbg_recent[(ctx)->dbg_recent_n++ & 31] = (uint32_t)(tpc) & SPU_LS_MASK; \
+            (ctx)->steps++; \
+            __attribute__((musttail)) return fn(ctx); \
+        } \
+        g_spu_trampoline_fn = fn; return; } while (0)
+#define SPU_TAIL_IB(ctx, tgt) do { (ctx)->pc = (tgt); \
+        if (SPU_TAIL_OK(ctx) && ((ctx)->pc & SPU_LS_MASK) != 0) { \
+            (ctx)->dbg_recent[(ctx)->dbg_recent_n++ & 31] = (uint32_t)(ctx)->pc & SPU_LS_MASK; \
+            (ctx)->steps++; \
+            __attribute__((musttail)) return spu_indirect_branch(ctx); \
+        } \
+        g_spu_trampoline_fn = spu_indirect_branch; return; } while (0)
+#else
+#define SPU_TAIL(ctx, tpc, fn)    do { (ctx)->pc = (tpc); g_spu_trampoline_fn = fn; return; } while (0)
+#define SPU_TAIL_IB(ctx, tgt)     do { (ctx)->pc = (tgt); g_spu_trampoline_fn = spu_indirect_branch; return; } while (0)
+#endif
+
+/* ---- SPU_PN: promoted twins with the preserve_none calling convention (tools/pn_spu_c.py) -----------
+ * Win64 makes xmm6-15 and rbx/rbp/rdi/rsi/r12-r15 callee-saved, so every promoted function paid a prologue
+ * and epilogue of ~18 saves/restores and a tail call out of it still paid the epilogue (SPU_TAIL: +8%).
+ * With preserve_none a function saves nothing and a musttail transfer is a plain jmp. The runtime calls
+ * lifted code through normal-convention pointers: every NAME_p has a wrapper NAME_p_w (registry, trampoline,
+ * pcheck). SPU_TAILP jumps straight into the target when nothing that spu_hop / the drain loop would act on
+ * is armed (same conditions as SPU_TAIL_OK) and g_spu_tailp_on (SPU_TAILP=0 off); otherwise it queues the
+ * wrapper for the drain loop. Indirect-branch exits keep the trampoline (spu_indirect_branch is a normal
+ * convention function). */
+extern int g_spu_tailp_on;
+#define SPU_TAILP_OK(ctx) (__builtin_expect(g_spu_tailp_on != 0 && g_spu_hop_slow == 0 && g_yz_lockstep_on == 0 &&         g_spu_stack_reset_count == 0 && g_pm_flow_ctx != (void*)(ctx) &&         !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)), 1))
+#if defined(__clang__)
+#define SPU_PN __attribute__((preserve_none))
+#define SPU_TAILP(ctx, tpc, fn) do { (ctx)->pc = (tpc);         if (SPU_TAILP_OK(ctx)) {             (ctx)->dbg_recent[(ctx)->dbg_recent_n++ & 31] = (uint32_t)(tpc) & SPU_LS_MASK;             (ctx)->steps++;             __attribute__((musttail)) return fn(ctx);         }         g_spu_trampoline_fn = fn##_w; return; } while (0)
+#else
+#define SPU_PN
+#define SPU_TAILP(ctx, tpc, fn) do { (ctx)->pc = (tpc); g_spu_trampoline_fn = fn##_w; return; } while (0)
+#endif
+#define SPU_TAIL_IBP(ctx, tgt)   do { (ctx)->pc = (tgt); g_spu_trampoline_fn = spu_indirect_branch; return; } while (0)
 
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */

@@ -62,6 +62,13 @@ typedef struct sys_mutex_info {
     int      recursive;
     uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
     int      lock_count;  /* recursive lock count */
+    /* Number of cond waiters that were signalled but have not yet re-acquired
+     * this mutex. Real LV2 hands the mutex to the woken waiter at signal time
+     * (it is queued on / owns the mutex before the signaller returns), so no
+     * other thread can sneak in between "signal" and "waiter runs". The host
+     * waiter re-locks asynchronously, so sys_cond.c counts that window here and
+     * sys_mutex.c makes other threads' lock/trylock respect it. */
+    volatile int pending_reacquire;
 
 #ifdef _WIN32
     CRITICAL_SECTION cs;

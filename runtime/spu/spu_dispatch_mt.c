@@ -20,6 +20,7 @@
 typedef void (*spu_dispatch_fn)(spu_context*);
 spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
+extern unsigned char g_spu_dyn_page[];                    /* registered run-time overlays (spu_channels.c) */
 
 void spu_indirect_branch_mt(spu_context* ctx)
 {
@@ -58,7 +59,13 @@ void spu_indirect_branch_mt(spu_context* ctx)
         /* Resident overlay first (mirrors the full resolver): streamed plugin
          * code owns its LS range; base-image entries at the same address are
          * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+        spu_dispatch_fn fn = 0;
+        if (g_spu_dyn_page[pc >> 8]) {   /* a hash-verified run-time overlay owns its LS range */
+            extern int spu_dynovl_find(const spu_context*, uint32_t);
+            int di = spu_dynovl_find(ctx, pc);
+            if (di) fn = spu_lookup(pc, di);
+        }
+        if (!fn) fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
         if (!fn) fn = spu_lookup(pc, ctx->image_id);
         if (fn) {
             ctx->pc = pc;

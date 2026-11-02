@@ -8,6 +8,9 @@
  * Actual rendering is handled elsewhere -- this module just tracks state.
  */
 
+#ifdef _WIN32
+#include <intrin.h>
+#endif
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
@@ -30,6 +33,7 @@ static u32 s_gcm_context_ea = 0;
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
 #include "ps3emu/env_cache.h"
+#include "ps3emu/beacon.h"
 #define getenv(name) ps3_env(name)
 
 #ifdef _WIN32
@@ -107,6 +111,8 @@ static u32 s_current_display_buffer_id = 0;
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+volatile unsigned g_pipe_ppu_flips; volatile long long g_pipe_ppu_flip_us, g_pipe_ring_us;   /* TOD_PIPE_DIAG */
+extern volatile int g_tl_on; extern void tl_rsx(int, int, uint64_t, uint64_t);   /* TOD_TIMELINE (runtime/syscalls/timeline.c) */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Queued by cellGcmSetPrepareFlip: the drain flips when it reaches it. */
 #define GCM_PREPARE_MARKER 0xFEAD0200u
@@ -683,8 +689,15 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
+    /* Returns at once (GCM_WAITFLIP_BLOCK=1: the old 1 ms-sleep wait). On the console this call only
+     * queues a wait for the RSX; the PPU goes on building the next frame.
+     * Blocking here in 1 ms sleeps cost Ratchet ToD's main thread ~20% of
+     * a metropolis frame. */
+    static int block = -1;
+    if (block < 0) { const char* e = getenv("GCM_WAITFLIP_BLOCK"); block = (e && *e && *e != '0') ? 1 : 0; }
+    if (block)
+        for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+            Sleep(1);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
@@ -705,6 +718,7 @@ void cellGcmResetFlipStatus(void)
 /* NID: 0xE315A0B2 */
 u32 cellGcmGetFlipStatus(void)
 {
+    { extern volatile long long g_dt_cnt[4]; extern int g_dt_on; if (g_dt_on > 0) g_dt_cnt[3]++; }
     /* Avoid host-calling the guest OPDs directly (they're not valid host
      * function pointers). Use cellGcmTickVBlank() / TickFlip() instead,
      * which dispatch via g_ps3_guest_caller — see below. */
@@ -1033,6 +1047,26 @@ static void nv3089_blit(void)
                                         dst_pitch, out_x, out_y, out_w, out_h);
         if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
             rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
+    } else if (rsx_draw_engine_enabled()) {
+        /* The same for the draw engine: copies out of its targets, 1:1 or
+         * scaled (ToD's smoke samples the scene patch behind each puff, copied
+         * 4x2 smaller: 128x38 samples into 32x19). Not the
+         * NV309E swizzled pyramid below (its flag stays set once used, so
+         * test its whole condition). */
+        const u32 f0 = s_nv3089.fmt & 0xFF;
+        const u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
+        const int swz = f0 == 3 && s_nv309e.active && s_nv309e.offset &&
+                        (1u << l2w) == out_w && (1u << l2h) == out_h;
+        if (!swz && (f0 == 3 || f0 == 7 || f0 == 8 || f0 == 0xD)) {
+            const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+            const int sl = (s_nv3089.src_dma != 0xFEED0001u);
+            const int dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
+            const u32 sw = (u32)(((u64)out_w * s_nv3089.ds_dx) >> 20);
+            const u32 sh = (u32)(((u64)out_h * s_nv3089.dt_dy) >> 20);
+            rsx_draw_engine_blit(sl ? 0u : 1u, s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch, sw, sh,
+                                 dl ? 0u : 1u, s_gcm2d.dst_offset + out_y * dst_pitch + out_x * 4u,
+                                 dst_pitch, out_w, out_h);
+        }
     }
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
@@ -1200,10 +1234,14 @@ typedef struct { u32 src, dst, len, lines, in_pitch, out_pitch; } gcm_report_cop
 static gcm_report_copy s_rcopy[1024];
 static u32 s_rcopy_n;
 static void nv0039_report_bytes(u32 report_off, u8* out);
+static int s_f38_site;   /* fence38 (TOD_TIMELINE only): which walker path called the flush */
+extern volatile int g_tl_on; extern void tl_f38(int, uint32_t, uint64_t, uint64_t);
 static void gcm_report_copies_flush(void)
 {
     if (!s_rcopy_n) return;
+    if (g_tl_on) tl_f38(7, (uint32_t)s_f38_site, s_rcopy_n, 0);          /* flush begin: n queued copies */
     rsx_draw_engine_sync_queries();
+    if (g_tl_on) tl_f38(11, (uint32_t)s_f38_site, s_rcopy_n, 0);         /* queries synced, copying now */
     for (u32 k = 0; k < s_rcopy_n; k++) {
         const gcm_report_copy* c = &s_rcopy[k];
         for (u32 l = 0; l < c->lines; l++) {
@@ -1270,23 +1308,83 @@ static void nv0039_copy(void)
     if (from_report && rsx_draw_engine_enabled()) {
         static int now = -1; if (now < 0) now = getenv("GCM_REPORT_COPY_NOW") ? 1 : 0;
         if (!now) {
-            if (s_rcopy_n >= sizeof s_rcopy / sizeof s_rcopy[0]) gcm_report_copies_flush();
+            if (s_rcopy_n >= sizeof s_rcopy / sizeof s_rcopy[0]) { s_f38_site = 5; gcm_report_copies_flush(); }
             s_rcopy[s_rcopy_n++] = (gcm_report_copy){ src, dst, len, lines, in_pitch, out_pitch };
+            if (g_tl_on) tl_f38(10, 0, dst, src);                           /* fence38: report copy queued (dst ea, src report off) */
             return;
         }
     }
+    /* GCM_M2MF_STATS=1: copies / bytes / time per 5 s. */
+    static int st = -1; static u64 st_n, st_b, st_ns, st_t0; static u32 st_big;
+    if (st < 0) st = getenv("GCM_M2MF_STATS") ? 1 : 0;
+    const u64 t_a = st ? get_timestamp_ns() : 0;
     for (u32 l = 0; l < lines; l++) {
         const u32 s0 = src + l * in_pitch, d0 = dst + l * out_pitch;
         if (from_report) {
             for (u32 i = 0; i < len; i++) { u8 b; nv0039_report_bytes(s0 + i, &b); vm_write8(d0 + i, b); }
+        } else if (d0 + len <= s0 || s0 + len <= d0) {
+            memcpy(vm_ptr8(d0), vm_ptr8(s0), len);
         } else {
             for (u32 i = 0; i < len; i++) vm_write8(d0 + i, vm_read8(s0 + i));
+        }
+    }
+    if (st) {
+        const u64 t_b = get_timestamp_ns();
+        st_n++; st_b += (u64)len * lines; st_ns += t_b - t_a; if ((u64)len * lines >= 65536) st_big++;
+        if (!st_t0) st_t0 = t_b;
+        if (t_b - st_t0 > 5000000000ull) {
+            fprintf(stderr, "[m2mf-stats] 5s: %llu copies (%u >=64K), %llu KB, %llu us in copy\n",
+                    (unsigned long long)st_n, st_big, (unsigned long long)(st_b >> 10), (unsigned long long)(st_ns / 1000));
+            st_n = st_b = st_ns = 0; st_big = 0; st_t0 = t_b;
+        }
+    }
+}
+
+/* Which engine a subchannel-1 command belongs to.
+ *
+ * On the RSX a subchannel is a binding slot: SET_OBJECT (method 0) binds an
+ * object handle to it and the object's class decides what the following
+ * methods mean. libgcm's own layout (Drakengard 3, Ratchet ToD: the title
+ * never sends SET_OBJECT -- this runtime's cellGcmInit emits no binds) puts
+ * NV0039 memory-to-memory on subchannel 1; titles with their own layout
+ * (Twisted Metal, Yakuza Dead Souls) bind NV4097 there. So subchannel 1 is
+ * the copy engine until the stream proves otherwise:
+ *   - SET_OBJECT with the NV4097 handle (0x3137AF00), or
+ *   - any method NV0039 does not have (state, draws, uploads: they come in
+ *     the thousands, the copy engine has a dozen registers),
+ * after which it is 3D for good. GCM_SUBCH1_2D=1 pins it to NV0039, =0 pins
+ * it to NV4097 (the old split). */
+static int s_sub1_mode = -1;       /* 0 = pinned 3D, 1 = pinned NV0039, 2 = learn */
+static int s_sub1_is3d;            /* mode 2: stream has shown NV4097 here */
+
+static int gcm_sub1_is3d(void)
+{
+    if (s_sub1_mode < 0) {
+        const char* e = getenv("GCM_SUBCH1_2D");
+        s_sub1_mode = e && *e ? (atoi(e) ? 1 : 0) : 2;
+    }
+    return s_sub1_mode == 0 || (s_sub1_mode == 2 && s_sub1_is3d);
+}
+
+static void gcm_sub1_observe(u32 method, u32 data)
+{
+    if (!gcm_sub1_is3d() && s_sub1_mode == 2) {
+        int is_m2mf = 0;
+        switch (method) {
+        case 0x0180: case 0x0184: case 0x0188: case 0x030C: case 0x0310: case 0x0314:
+        case 0x0318: case 0x031C: case 0x0320: case 0x0324: case 0x0328: is_m2mf = 1; break;
+        case 0x0000: is_m2mf = data != 0x3137AF00u; break;   /* SET_OBJECT: NV4097 handle */
+        }
+        if (!is_m2mf) {
+            s_sub1_is3d = 1;
+            printf("[GCM] subchannel 1 carries NV4097 (method 0x%04X = 0x%08X): routed to 3D%c", method, data, 10);
         }
     }
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    rsx_draw_engine_b2_drain();   /* RSX_DRAW_SPLIT=2: 2D copies read/write guest memory the queued draws may not have consumed yet */
     if (subch == 1) {                       /* NV0039 memory to memory */
         /* libgcm's own bindings put NV0039 on subchannel 1 (Drakengard 3's
          * cellGcmSetTransferReportData writes 0x00082184/0x0020230C headers)
@@ -1456,6 +1554,7 @@ int cellGcm_take_flip_pending_synced(void)
  * instead starved wrap recycles and wedged the backend -- don't.) */
 #define GCM_REF_QLEN 4096
 static u32 s_ref_q[GCM_REF_QLEN];
+static unsigned long long s_ref_qseq[GCM_REF_QLEN];   /* RSX_DRAW_SPLIT=2: draws queued when the fence was read; published only after B2 ran them */
 static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consumer: the ticker */
 
 /* A JUMP/CALL whose target has no IO mapping must not be taken. Taking one
@@ -1656,6 +1755,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
         if (_o < 4 && ++_o) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
+    s_ref_qseq[t % GCM_REF_QLEN] = rsx_draw_engine_b2_seq();
     s_ref_qtail = t + 1;
 }
 
@@ -1678,6 +1778,7 @@ static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
+    rsx_draw_engine_b2_wait(s_ref_qseq[h % GCM_REF_QLEN]);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
@@ -1765,10 +1866,23 @@ void cellGcm_ref_on_poll(void)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
+extern int g_wp_fl; extern unsigned long long g_wp_c[6], g_wp_meths, g_wp_runs, g_wp_runw, g_wp_cmds;
+static int g_fifo_run = -1;
+static int g_fifo_block = -1;   /* RSX_FIFO_BLOCK */
 void cellGcm_rsx_process_fifo(void)
 {
-    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
-    gcm_rsx_process_fifo_unlocked();
+    if (!TryAcquireSRWLockExclusive(&s_gcm_fifo_lock)) {
+        BEACON_WAIT("fifo_lock");
+        AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+        BEACON_POP();
+    }
+    BEACON_PUSH("process_fifo");
+    { extern unsigned long long g_wp_fifo_cyc, g_wp_fifo_calls; static int wp = -1;   /* RSX_WPROF (rsx_draw_engine.c) */
+      if (wp < 0) { const char* e = getenv("RSX_WPROF"); wp = (e && e[0] && e[0] != '0') ? 1 : 0;
+                    const char* h = getenv("RSX_HITCH_LOG"); if (h && atof(h) > 0.0) wp = 1; }   /* surf54: the [hitch] line prints the fifo pass too */
+      if (wp) { const unsigned long long a = __rdtsc(); gcm_rsx_process_fifo_unlocked(); g_wp_fifo_cyc += __rdtsc() - a; g_wp_fifo_calls++; }
+      else gcm_rsx_process_fifo_unlocked(); }
+    BEACON_POP();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
@@ -1822,13 +1936,33 @@ static void gcm_fire_pos_flip(void)
         s_last_flip_time = get_timestamp_ns();
         s_prepared_id = (int)(id & 7u);
     }
-    gcm_report_copies_flush();
+    s_f38_site = 1; gcm_report_copies_flush();
     rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
 }
 
 /* DOD3_AB=fifofast: 0 walks every method word by word through the old
  * processor too, as before the walker's fast paths. */
 int g_gcm_fifo_fast = 1;
+
+/* Publish `get` before the walker writes a label. The guest-visible `get` used
+ * to move only at the end of a drain pass, while a semaphore release lands
+ * (and wakes its waiter) in the middle of one. The RSX has fetched past a
+ * release by the time it executes it, so a title may read `get` right after
+ * its label and treat it as final: ToD (func_00505558, 0x5056E8) reads `get`
+ * once after label 0x41 and spins until `put` equals it -- with the pass's old
+ * `get` that never happens and the render thread hangs (metropolis, ~270 s).
+ * `next` is the offset just past the releasing method: everything before it
+ * has been consumed. GCM_EARLY_GET=0 restores the end-of-pass-only update. */
+static void gcm_publish_get_early(u32 next)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_EARLY_GET"); on = e ? atoi(e) : 1;
+                  if (getenv("GCM_GET_EQ_PUT")) on = 0; }
+    /* RSX_DRAW_SPLIT=2: `get` tells the PPU the earlier draws' guest data was consumed, so it is published by B2 (control job, in
+     * order behind the queued draws) instead of making the walker wait. Without B2: plain write. */
+    if (on) rsx_draw_engine_b2_ordered_write32(GCM_CONTROL_GUEST_ADDR + 4, next);
+    else rsx_draw_engine_b2_drain();
+}
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
@@ -1896,6 +2030,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     u32 start_off = s_fifo_getoff;
+    if (g_wp_fl < 0) { const char* e_ = getenv("RSX_WPROF"); g_wp_fl = (e_ && e_[0] && e_[0] != '0') ? 1 : 0; }
+    if (g_fifo_run < 0) { const char* e2_ = getenv("RSX_FIFO_RUN"); g_fifo_run = (!e2_ || !e2_[0] || e2_[0] != '0') ? 1 : 0;   /* default ON (28/10); RSX_FIFO_RUN=0 disables */ }
+    if (g_fifo_block < 0) { const char* e3_ = getenv("RSX_FIFO_BLOCK"); g_fifo_block = (!e3_ || !e3_[0] || e3_[0] != '0') ? 1 : 0;   /* default ON (28/10); RSX_FIFO_BLOCK=0 disables */ }
     static int draindbg = -1;
     if (draindbg < 0) draindbg = getenv("GCM_DRAINDBG") ? 1 : 0;
     if (draindbg) {
@@ -1974,8 +2111,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           !rsx_live_draw_enabled() && rsx_get_backend() == NULL;
     /* GCM_SUBCH1_2D, as the word loop reads it: subchannel 1 is 3D unless set
      * (Drakengard 3 sets it). */
-    static int sub1_2d = -1;
-    if (sub1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); sub1_2d = e ? atoi(e) : 0; }
     if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
     while (s_fifo_getoff != put && budget-- > 0) {
         if (s_fifo_getoff == s_pos_flip_io) {
@@ -2005,6 +2140,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
             why = "no-io-mapping";
             break;
         }
+        /* RSX_FIFO_BLOCK=1: a stretch of ordinary subchannel-0 commands inside one IO page is decoded straight from
+         * the ring memory in a tight loop -- no per-word trace, statics or diagnostics -- and handed to the engine
+         * (upload runs / state runs). Anything else (flip, jump, call, semaphores, report and label methods,
+         * other subchannels, an odd command) stops the stretch and goes through the full decoder below. */
+        if (g_fifo_block > 0 && fifo_fast && !ring_watch && s_fifo_getoff != put) {
+            const u64 pg_end = ((u64)s_fifo_getoff | 0xFFFFFull) + 1ull;
+            const u8* base = vm_ptr8(ea);
+            const u32 off0 = s_fifo_getoff;
+            u32 off = off0, last = off0;
+            while (off != put && off != s_pos_flip_io && budget > 0 && (u64)off + 4ull <= pg_end) {
+                const u8* hp = base + (off - off0);
+                const u32 w_ = ((u32)hp[0] << 24) | ((u32)hp[1] << 16) | ((u32)hp[2] << 8) | (u32)hp[3];
+                if (w_ & 0xE0000003u) break;
+                const u32 count_ = (w_ >> 18) & 0x7FF;
+                if (!count_ || ((w_ >> 13) & 7u)) break;
+                const u32 method_ = w_ & 0x1FFCu;
+                const u32 nxt = off + 4u + count_ * 4u;
+                if ((u64)nxt > pg_end || (off < put && nxt > put)) break;
+                if (rsx_draw_engine_upload_window(method_, count_)) {
+                    if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_upload_run(method_, count_, hp + 4); g_wp_c[1] += __rdtsc() - a_; g_wp_runs++; g_wp_runw += count_; }
+                    else rsx_draw_engine_upload_run(method_, count_, hp + 4);
+                } else {
+                    const u32 mend_ = method_ + count_ * 4u;
+                    if (mend_ > 0x2000u || (method_ < 0x70u && mend_ > 0x50u) || (method_ < 0x1A8u + 4u && mend_ > 0x1A8u) ||
+                        (method_ < 0x17CCu && mend_ > 0x17C8u) || (method_ < 0x1804u && mend_ > 0x1800u) ||
+                        (method_ < 0x1D78u && mend_ > 0x1D6Cu)) break;
+                    if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_method_run(method_, count_, 1, hp + 4); g_wp_c[4] += __rdtsc() - a_; g_wp_meths += count_; }
+                    else rsx_draw_engine_method_run(method_, count_, 1, hp + 4);
+                }
+                if (g_wp_fl > 0) g_wp_cmds++;
+                last = off; off = nxt; budget--;
+            }
+            if (off != off0) {
+                if (last < put) s_last_ring_off = last + 4;
+                s_fifo_getoff = off;
+                continue;
+            }
+        }
         if (ring_watch && s_fifo_getoff >= ring_end && s_fifo_calloff == 0) {
             static u32 last = 0; static int n = 0;
             if ((s_fifo_getoff & ~0xFFFFu) != last && n < 24 && ++n) { last = s_fifo_getoff & ~0xFFFFu;
@@ -2018,6 +2191,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
         u32 type = w >> 29;
+        if (g_wp_fl > 0) g_wp_cmds++;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -2076,7 +2250,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * up. The ticker's present comes later, and by then this drain
              * may have run through several more frames (the catch-up below),
              * so the buffer it names already holds a later frame's clear. */
-            gcm_report_copies_flush();
+            s_f38_site = 2; gcm_report_copies_flush();
             rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -2186,6 +2360,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            /* GCM_SUB1_STATS=1: commands and words seen on subchannel 1, per method, every 5 s. */
+            { static int s1st = -1; static u64 t0; static u32 nb, nw; static u32 mc[2048];
+              if (s1st < 0) s1st = getenv("GCM_SUB1_STATS") ? 1 : 0;
+              if (s1st) {
+                  if (subch == 1) { nb++; nw += count; mc[(method >> 2) & 2047] += count; }
+                  const u64 tn = get_timestamp_ns();
+                  if (!t0) t0 = tn;
+                  if (tn - t0 > 5000000000ull) {
+                      t0 = tn;
+                      fprintf(stderr, "[sub1-stats] 5s: %u cmds %u words; top:", nb, nw);
+                      for (int top = 0; top < 8; top++) { u32 b = 0, bv = 0; for (u32 k = 0; k < 2048; k++) if (mc[k] > bv) { bv = mc[k]; b = k; }
+                          if (!bv) break; fprintf(stderr, " %03X=%u", b << 2, bv); mc[b] = 0; }
+                      fprintf(stderr, "\n"); nb = nw = 0; memset(mc, 0, sizeof mc);
+                  }
+              } }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
              * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
              * arrives NON-INCREMENTING then every dword carries the same method
@@ -2228,7 +2417,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && (sn < 12 && ++sn))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) { gcm_report_copies_flush(); vm_write32(la, v);
+                    else if (m == 0x6Cu) { s_f38_site = 3; gcm_report_copies_flush(); gcm_publish_get_early(s_fifo_getoff + 4 + count * 4);
+                                           rsx_draw_engine_b2_ordered_write32(la, v);
+                                           { extern volatile int g_tl_on; extern void tl_rsx(int, int, uint64_t, uint64_t); if (g_tl_on) tl_rsx(4, 'i', la, v); }   /* TOD_TIMELINE */
                                            if (g_gcm_label_write_hook) g_gcm_label_write_hook(); }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
@@ -2247,14 +2438,34 @@ static void gcm_rsx_process_fifo_unlocked(void)
             /* Transform constants and program words, the bulk of a frame (58-70%
              * of Drakengard 3's): nothing but the engine's register file reads
              * them, so a run inside one IO page goes over whole. */
-            if (fifo_fast && type == 0 && (subch == 0 || (subch == 1 && !sub1_2d)) &&
+            if (fifo_fast && type == 0 && (subch == 0 || (subch == 1 && gcm_sub1_is3d())) &&
                 rsx_draw_engine_upload_window(method, count)) {
                 const u32 io0 = s_fifo_getoff + 4;
                 const u32 dea0 = gcm_io2ea(io0);
                 if (dea0 && (io0 & 0xFFFFFu) + count * 4u <= 0x100000u) {
-                    rsx_draw_engine_upload_run((subch << 13) | method, count, vm_ptr8(dea0));
+                    if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_upload_run((subch << 13) | method, count, vm_ptr8(dea0)); g_wp_c[1] += __rdtsc() - a_; g_wp_runs++; g_wp_runw += count; } else rsx_draw_engine_upload_run((subch << 13) | method, count, vm_ptr8(dea0));
                     s_fifo_getoff += 4 + count * 4;
                     continue;
+                }
+            }
+            /* RSX_FIFO_RUN=1: the ordinary state methods of subchannel 0 (everything except the words the loop below
+             * treats specially: semaphores/reference 0x50-0x6C, report 0x17C8/0x1800/0x1A8, labels 0x1D6C-0x1D74) go to
+             * the engine in one call without the per-word diagnostics and re-decoding. fifo_fast already excludes every
+             * diagnostic that would want to see those words. */
+            if (g_fifo_run && fifo_fast && subch == 0 && count) {
+                const u32 mend = (type == 0) ? method + count * 4u : method + 4u;
+                if (mend <= 0x2000u &&
+                    !(method < 0x70u && mend > 0x50u) && !(method < 0x1A8u + 4u && mend > 0x1A8u) &&
+                    !(method < 0x17CCu && mend > 0x17C8u) && !(method < 0x1804u && mend > 0x1800u) &&
+                    !(method < 0x1D78u && mend > 0x1D6Cu)) {
+                    const u32 io0 = s_fifo_getoff + 4;
+                    const u32 dea0 = gcm_io2ea(io0);
+                    if (dea0 && (io0 & 0xFFFFFu) + count * 4u <= 0x100000u) {
+                        if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_method_run(method, count, type == 0, vm_ptr8(dea0)); g_wp_c[4] += __rdtsc() - a_; g_wp_meths += count; }
+                        else rsx_draw_engine_method_run(method, count, type == 0, vm_ptr8(dea0));
+                        s_fifo_getoff += 4 + count * 4;
+                        continue;
+                    }
                 }
             }
             for (u32 i = 0; i < count; i++) {
@@ -2324,8 +2535,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * for every draw in the game. Treat the subchannels the 2D path
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                if (subch == 1) gcm_sub1_observe(m, vm_read32(dea));
+                const int s1_3d = subch == 1 && gcm_sub1_is3d();
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -2401,8 +2612,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { static int eng = -1, all = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
                   if (all < 0) all = getenv("GCM_ENGINE_ALL_SUBCH") ? 1 : 0;
-                  const int to_3d = subch == 0 || (subch == 1 && !s1_2d) || subch == 7;
-                  if (eng && (to_3d || all)) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  const int to_3d = subch == 0 || (subch == 1 && s1_3d) || subch == 7;
+                  if (eng && (to_3d || all)) { if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); g_wp_c[0] += __rdtsc() - a_; g_wp_meths++; } else rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); } }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -2429,13 +2640,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
+                } else if (subch == 0 || (subch == 1 && s1_3d)) {
+                    if (m == 0x1D70u || m == 0x1D74u) { s_f38_site = 4; gcm_report_copies_flush();
+                                                        gcm_publish_get_early(s_fifo_getoff + 4 + count * 4); }
                     /* With the draw engine drawing, the old processor has no
                      * backend: of what it does, only the labels and the
                      * reference are still read. */
                     if (!fifo_fast || m == 0x50u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u)
-                        rsx_process_method(&s_state, m, vm_read32(dea));
+                        { const unsigned long long a_ = g_wp_fl ? __rdtsc() : 0; rsx_process_method(&s_state, m, vm_read32(dea)); if (g_wp_fl) g_wp_c[2] += __rdtsc() - a_; }
+                    if ((m == 0x1D70u || m == 0x1D74u) && g_tl_on) tl_rsx(4, 'i', m, vm_read32(dea));   /* TOD_TIMELINE */
                     if ((m == 0x1D70u || m == 0x1D74u) && g_gcm_label_write_hook) g_gcm_label_write_hook();
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -2463,6 +2676,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             const u64 ts = gcm_report_timestamp();
                             const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
                             const u32 rea = gcm_io2ea(off);
+                            if (g_tl_on) tl_f38(12, (v >> 24) | 0x100u, rea, ts);   /* fence38: GET_REPORT written to main memory */
                             if (rea) {
                                 vm_write32(rea, (u32)(ts >> 32));
                                 vm_write32(rea + 4u, (u32)ts);
@@ -2506,6 +2720,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  * a title that uses more is reported once. */
                                 if (off + 16u <= 0x1000u) {
                                     const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
+                                    if (g_tl_on) tl_f38(12, (v >> 24), rea, ts);   /* fence38: GET_REPORT into the local window */
                                     vm_write32(rea + 0, (u32)(ts >> 32));
                                     vm_write32(rea + 4, (u32)ts);
                                     vm_write32(rea + 8, val);
@@ -2716,7 +2931,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * If the overflow survives this, `get` is not what it consults. */
     { static int eq = -1;
       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+      rsx_draw_engine_b2_ordered_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }   /* RSX_DRAW_SPLIT=2: published by B2 behind the queued draws */
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2806,6 +3021,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * milliseconds. */
     {
         ULONGLONG t_progress = GetTickCount64(), t_start = t_progress;
+        extern unsigned long long ps3_qpc_us(void); const unsigned long long q0 = ps3_qpc_us();
+        g_ps3_recycle_wait_since = (unsigned long long)t_start;   /* the stall monitor's */
         while (g_gcm_fifo_drained_ea != begin) {
             const ULONGLONG now = GetTickCount64();
             if (now - t_progress >= 20000 || now - t_start >= 120000) break;
@@ -2815,6 +3032,11 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
             WaitOnAddress((volatile VOID*)&g_gcm_fifo_drained_ea, &cur, sizeof cur, 2);
         }
         spins = (int)(GetTickCount64() - t_start); total = spins;
+        g_ps3_recycle_wait_since = 0;
+        if ((unsigned)spins >= 500u)
+            fprintf(stderr, "[beacon] fifo recycle wait took %d ms (drained=0x%08X begin=0x%08X)\n",
+                    spins, g_gcm_fifo_drained_ea, begin);
+        g_pipe_ring_us += (long long)(ps3_qpc_us() - q0);
     }
 #else
     while (g_gcm_fifo_drained_ea != begin && spins < 20000 && total < 120000) {
@@ -2914,6 +3136,8 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    { extern unsigned long long ps3_qpc_us(void); g_pipe_ppu_flips++; g_pipe_ppu_flip_us = (long long)ps3_qpc_us();
+      { extern volatile int g_tl_on; extern void tl_rsx(int, int, uint64_t, uint64_t); if (g_tl_on) tl_rsx(5, 'i', g_pipe_ppu_flips, 0); } }   /* TOD_TIMELINE */
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on
@@ -3059,6 +3283,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
  * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
+    { extern void ps3_cpu_note(void); ps3_cpu_note(); }
     (void)context;   /* command context — flip is immediate in HLE */
     return cellGcmSetFlipCommand(bufferId);
 }
@@ -3173,6 +3398,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
 /* NID: 0x21AC3697 */
 u64 cellGcmGetLastFlipTime(void)
 {
+    { extern volatile long long g_dt_cnt[4]; extern int g_dt_on; if (g_dt_on > 0) g_dt_cnt[2]++; }
     return s_last_flip_time;
 }
 
@@ -3550,6 +3776,13 @@ u32 cellGcmResolveOffset(u32 offset)
         if (ea_page != 0 && ea_page != 0xFFFF)
             return ((u32)ea_page << 20) | (offset & 0xFFFFF);
     }
+    if (offset >= s_config.localSize) {
+        static int on = -1; if (on < 0) on = getenv("GCM_LOCAL_OOB_LOG") ? 1 : 0;
+        if (on) { static volatile long n = 0; long k = ++n;
+                  if (k <= 32 || (k & (k - 1)) == 0)
+                      fprintf(stderr, "[gcm-local-oob] #%ld unmapped offset 0x%08X -> VRAM guess ea 0x%08X\n",
+                              k, offset, s_config.localAddress + offset); }
+    }
     return s_config.localAddress + offset;
 }
 
@@ -3590,8 +3823,18 @@ u32 cellGcmResolveIO(u32 offset)
  * guess. */
 u32 cellGcmResolveLocated(int local, u32 offset)
 {
-    if (local)
+    if (local) {
+        /* GCM_LOCAL_OOB_LOG=1: a LOCAL offset past VRAM. 0xC0000000 + 0x20000000
+         * is the raw SPU window (collision SPUs' local store). */
+        if (offset >= s_config.localSize) {
+            static int on = -1; if (on < 0) on = getenv("GCM_LOCAL_OOB_LOG") ? 1 : 0;
+            if (on) { static volatile long n = 0; long k = ++n;
+                      if (k <= 32 || (k & (k - 1)) == 0)
+                          fprintf(stderr, "[gcm-local-oob] #%ld local offset 0x%08X -> ea 0x%08X\n",
+                                  k, offset, s_config.localAddress + offset); }
+        }
         return s_config.localAddress + offset;
+    }
     /* An explicit MAIN location is the register saying "the IO context", so
      * ask the IO table first and let cellGcmResolveOffset's guess (which
      * prefers VRAM for any page the title once derived from a LOCAL EA) only
@@ -3599,6 +3842,12 @@ u32 cellGcmResolveLocated(int local, u32 offset)
      * and the Bink planes it maps per movie at the next free IO pages share
      * page numbers from 0x10 up: every movie after the first was sampled out
      * of VRAM and played as audio over a black picture. */
+    /* RSX offsets are 28 bits (256 MB of VRAM / a 256 MB IO window); the top
+     * nibble is ignored by the hardware. Ratchet & Clank: Tools of Destruction's
+     * Bink player binds its three YUV planes with the offset's bit 31 set
+     * (0x82B65080 for IO offset 0x02B65080), which missed the IO table, fell to
+     * the VRAM guess and sampled zeros -- an all-green movie. */
+    offset &= 0x0FFFFFFFu;
     u32 ea = cellGcmResolveIO(offset);
     return ea ? ea : cellGcmResolveOffset(offset);
 }
@@ -3981,8 +4230,10 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
 }
 
 /* Return incrementing VBlank counter */
+extern volatile long long g_dt_cnt[4]; extern int g_dt_on;
 u32 cellGcmGetVBlankCount(void)
 {
+    if (g_dt_on > 0) g_dt_cnt[1]++;
     /* Approximate: increment each time queried (games use this for timing) */
     return s_vblank_count++;
 }

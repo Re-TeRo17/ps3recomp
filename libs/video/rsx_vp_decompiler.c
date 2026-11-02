@@ -30,6 +30,7 @@
  */
 #include "rsx_vp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- little-endian word read (RPCS3-capture native order) --------------- */
@@ -146,6 +147,27 @@ static int vp_is_flow(u32 sca_op)
 
 /* Branch target (NV40 layout, RPCS3 as oracle): D0[23] << 9 | D2[0:5] << 3 |
  * D3[29:31], an absolute VP slot; made relative to the program start. */
+/* SET_TRANSFORM_BRANCH_BITS (0x1FF8) for the program being decompiled: BRB /
+ * CLB branch on bit D3[23:27] of it, taken when that bit equals D3[28]. The
+ * value is baked into the shader (it is part of the pipeline key while the
+ * program has such branches, see rsx_vp_uses_branch_bits). */
+static u32 s_vp_branch_bits;
+void rsx_vp_set_branch_bits(u32 bits) { s_vp_branch_bits = bits; }
+int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes)
+{
+    for (u32 o = 0; o + 16 <= max_bytes && o < RSX_VP_MAX_INSTR * 16u; o += 16) {
+        /* The words are in the decompiler's order (rd_le), not big-endian:
+         * read big-endian, no program ever "had" BRB and the branch bits
+         * were baked in as 0 -- every particle took the wrong branches. */
+        const u32 d1 = rd_le(ucode + o + 4);
+        const u32 d3 = rd_le(ucode + o + 12);
+        const u32 sca = (d1 >> 27) & 0x1F;
+        if (sca == 0x11 || sca == 0x12) return 1;
+        if (d3 & 1u) break;                       /* END */
+    }
+    return 0;
+}
+
 static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
 {
     const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
@@ -306,6 +328,9 @@ static int rsx_vp_decompile_impl(
     body[0] = '\0';
 
     int n_cond_skipped = 0, n_flow_skipped = 0;
+    /* Fog factors (shad83): see the TEXn.w saturation after the output map below. minw[r] = temp r's .w was last
+     * written by a MIN (the "cap" of a linear fog factor); outsatw[o] = output register o received such a value. */
+    unsigned char minw[32] = {0}, outsatw[16] = {0};
 
     /* Flow control (BRI/CAL/CLI/RET...). It carries no write mask, so it was
      * dropped and every block ran straight through: a lit shader that
@@ -462,6 +487,9 @@ static int rsx_vp_decompile_impl(
                 emit(&b, line);
                 if (vec_result && dst_out != 0x1F)
                     emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
+                if (vec_result && dst_out != 0x1F && vmw && vec_op == 0x01 && !cc.test) {
+                    unsigned k = 99; if (sscanf(A, "(r[%u]", &k) == 1 && k < 32 && minw[k]) outsatw[dst_out & 15] = 1; }
+                if (dst_tmp != 0x3F && vmw) { unsigned ka = 99; minw[dst_tmp & 31] = (vec_op == 0x09 && !cc.test && strstr(B, "vp_c[") && sscanf(A, "(r[%u]", &ka) == 1 && ka == (dst_tmp & 31u)) ? 1 : 0; }
                 if (dst_tmp != 0x3F)
                     emit_store_cc(&b, "r[%u]", dst_tmp & 31, m, &cc);
                 if (cc_update)
@@ -501,9 +529,20 @@ static int rsx_vp_decompile_impl(
                          "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
                          c, next);
             else {                                         /* BRB/CLB: boolean-register branches */
-                n_flow_skipped++;
-                snprintf(flow_term, sizeof flow_term,
-                         "        _pc = %d; /* TODO: %s not modelled */\n", next, rsx_vp_sca_name(sca_op));
+                const u32 bi = (d3 >> 23) & 0x1Fu, want = (d3 >> 28) & 1u;
+                const int taken = (((s_vp_branch_bits >> bi) & 1u) == want);
+                static int off = -1; if (off < 0) off = getenv("RSX_VP_NO_BRB") ? 1 : 0;
+                if (off) {
+                    n_flow_skipped++;
+                    snprintf(flow_term, sizeof flow_term,
+                             "        _pc = %d; /* TODO: %s not modelled */\n", next, rsx_vp_sca_name(sca_op));
+                } else if (sca_op == 0x11)                 /* BRB */
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %d; /* BRB b%u==%u (bits 0x%08X) */\n",
+                             taken ? (int)tgt : next, bi, want, s_vp_branch_bits);
+                else                                       /* CLB */
+                    snprintf(flow_term, sizeof flow_term,
+                             "        if (%d) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d; /* CLB b%u==%u */\n",
+                             taken, next, tgt, next, bi, want);
             }
         }
         /* ---- scalar ALU (reads SRC2) ---- */
@@ -542,6 +581,7 @@ static int rsx_vp_decompile_impl(
                  * own it; otherwise it targets its own temp. */
                 if (!vec_result && dst_out != 0x1F)
                     emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
+                if (sca_dst_tmp != 0x3F && smw) minw[sca_dst_tmp & 31] = 0;
                 if (sca_dst_tmp != 0x3F)
                     emit_store_cc(&b, "r[%u]", sca_dst_tmp & 31, m, &cc);
                 emit(&b, "    }\n");
@@ -649,9 +689,21 @@ static int rsx_vp_decompile_impl(
         "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
         "    float4 cc[2]; cc[0] = (float4)0; cc[1] = (float4)0;\n");
 
-    if (has_flow)
-        emit(&o, "    int _pc = 0; int _cs[8]; int _csp = 0;\n"
-                 "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n");
+    if (has_flow) {
+        /* RSX_VP_FLOW_CAP=<n>: iteration cap of the branch dispatcher (default
+         * 16384). A branch we do not model (BRB/CLB) can leave a loop that never
+         * exits; at 16384 iterations per vertex that is a GPU hang (TDR). */
+        static int s_cap = -1;
+        if (s_cap < 0) { const char* e = getenv("RSX_VP_FLOW_CAP"); s_cap = (e && atoi(e) > 0) ? atoi(e) : 16384; }
+        char head[160];
+        snprintf(head, sizeof head, "    int _pc = 0; int _cs[8]; int _csp = 0;\n"
+                 "    [loop] for (int _it = 0; _it < %d && _pc >= 0; _it++) {\n", s_cap);
+        emit(&o, head);
+        static int s_nlog = 0;
+        if (s_nlog < 64 && ++s_nlog)
+            fprintf(stderr, "[vp-flow] program with branches: %d instrs, %d unmodelled flow/vec ops, cap %d\n",
+                    instrs, n_flow_skipped, s_cap);
+    }
     emit(&o, body);
     if (has_flow) emit(&o, "    }\n");
 
@@ -669,7 +721,20 @@ static int rsx_vp_decompile_impl(
          * reg_table. Unrouted, every fragment program reading TEX8/9 got
          * zero: Unreal Engine 3 carries its light vectors there, so lit
          * furniture and props rendered black. */
-        "    Out.t8=o[15]; Out.t9=o[6];\n"
+        "    Out.t8=o[15]; Out.t9=o[6];\n");
+    /* TEX4.w = depth*0.05-3 is a shadow-fade factor (character eye/spot lights lerp avg_shadow->1 with it, unsaturated). In cutscenes the view depth is ~260, w ~ +10 and every additive pass saturates to white (white eyes). RSX_VP_SAT_T4=0 disables. */
+    { static int s_sat4 = -1; if (s_sat4 < 0) { const char* e = getenv("RSX_VP_SAT_T4"); s_sat4 = !(e && e[0] == '0'); }
+      if (s_sat4) emit(&o, "    Out.t4.w = saturate(Out.t4.w);\n"); }
+    /* RSX_VP_SAT_FOG=0 disables. A TEXn.w output that is a MIN-capped linear function (the engine's fog factor,
+     * min(depth*k0 + k1, cap)) has no lower bound in the program: on the RSX it reaches the fragment program
+     * clamped to [0,1] (as TEX4.w above), here it was negative for every near surface, and the fragment program's
+     * final `colour = fog*(fogcolour - colour) + colour` subtracted the fog colour: the whole near floor of Ardolis
+     * went solid black (visible on PS3 as dim readable cobbles). */
+    { static int s_satfog = -1; if (s_satfog < 0) { const char* e = getenv("RSX_VP_SAT_FOG"); s_satfog = !(e && e[0] == '0'); }
+      if (s_satfog) for (unsigned t = 0; t < 8; t++) {
+          const unsigned oi = 7 + t;
+          if (outsatw[oi] && t != 4 && t != 0) { char ln[64]; snprintf(ln, sizeof ln, "    Out.t%u.w = saturate(Out.t%u.w);\n", t, t); emit(&o, ln); } } }
+    emit(&o,
         "    return Out;\n"
         "}\n");
 

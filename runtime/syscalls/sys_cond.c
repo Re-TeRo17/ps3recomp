@@ -19,6 +19,7 @@
 struct sys_cond_waiter {
     struct sys_cond_waiter* next;
     int signalled;
+    sys_mutex_info* pend_mtx;   /* mutex whose pending_reacquire this wake counted (or NULL) */
 };
 
 sys_cond_info g_sys_conds[SYS_COND_MAX];
@@ -151,7 +152,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
-    struct sys_cond_waiter waiter = {NULL, 0};
+    struct sys_cond_waiter waiter = {NULL, 0, NULL};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
     *tail = &waiter;
@@ -203,6 +204,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    /* Owned again: the signal-to-reacquire window is closed (see signal_cond). */
+    if (waiter.pend_mtx) __atomic_sub_fetch(&waiter.pend_mtx->pending_reacquire, 1, __ATOMIC_SEQ_CST);
     return result;
 }
 
@@ -214,6 +217,19 @@ static int64_t signal_cond(uint32_t id, int all)
     for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
         if (w->signalled) continue;
         w->signalled = 1;
+        /* LV2 gives the woken waiter ownership of the mutex at signal time. Our
+         * waiter re-locks on its own host thread some time later; mark the mutex
+         * as claimed meanwhile so another thread's trylock/lock cannot take it
+         * in that gap (the game's loader handshake trylocks right after
+         * signalling, sees "free", resumes again, and deadlocks both threads).
+         * PS3_COND_NO_HANDOFF=1 restores the old behaviour. */
+        if (c->mutex_id && c->mutex_id <= SYS_MUTEX_MAX && !getenv("PS3_COND_NO_HANDOFF")) {
+            sys_mutex_info* pm = &g_sys_mutexes[c->mutex_id - 1];
+            if (pm->active) {
+                w->pend_mtx = pm;
+                __atomic_add_fetch(&pm->pending_reacquire, 1, __ATOMIC_SEQ_CST);
+            }
+        }
         selected = 1;
         if (!all) break;
     }

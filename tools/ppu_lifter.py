@@ -3125,9 +3125,11 @@ class PPULifter:
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
+            # reserve_addr is set BEFORE the load: a store by another agent that lands between
+            # the two then breaks the reservation (ppu_resv_break_line) instead of being missed.
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; "
+                    f"ctx->gpr[{rd}] = vm_read32(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -3146,8 +3148,8 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; "
+                    f"ctx->gpr[{rd}] = vm_read64(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -5239,6 +5241,28 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             continue
                         if count is None or _c > count:
                             count = _c
+            if count is None:
+                # The bounds check can sit far above the dispatch: a big switch
+                # function bounds-checks its argument first and then runs a long
+                # prologue (Ratchet & Clank ToD func_00405624: `cmplwi cr7,r3,0x6D9`
+                # at the entry, ~40 stores before the bctr). Missing it fell back to
+                # 256 entries -> 204 of 1589 cases lifted -> an `unresolved
+                # indirect call` into case 0x43B and the main thread ran on garbage.
+                # Walk back to the function entry, up to the first redefinition of
+                # the raw index.
+                for w in reversed(all_insns[_scan_lo(i):max(0, i - 30)]):
+                    a = [x.strip() for x in w.operands.split(',')]
+                    if w.mnemonic in ('cmplwi', 'cmpwi'):
+                        _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                        if _cmp_reg == _raw_idx:
+                            try:
+                                _c = int(a[-1], 0)
+                            except ValueError:
+                                continue
+                            if count is None or _c > count:
+                                count = _c
+                    elif a and a[0] == _raw_idx and not w.mnemonic.startswith(('st', 'cmp')):
+                        break
             if count is None or count < 0 or count > 4096:
                 count = 256
             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
@@ -5861,8 +5885,13 @@ def main() -> None:
                 for o in range(0, len(d) - 7, 8):
                     c = int.from_bytes(d[o:o+4], 'big')
                     t = int.from_bytes(d[o+4:o+8], 'big')
+                    # r2 points 0x8000 past the start of its TOC (the ELFv1
+                    # bias), so a TOC at the end of the data segment has its
+                    # r2 value up to 0x8000 beyond the segment's file end
+                    # (Ratchet & Clank ToD: r2 0x8AFE5C, segment ends
+                    # 0x8AD4E8, 8205 OPDs carry it).
                     if text_lo <= c < text_hi and (c & 3) == 0 and \
-                       v0 <= t < v1 and (t & 3) == 0:
+                       v0 <= t < v1 + 0x8000 and (t & 3) == 0:
                         toc_freq[t] += 1
             for t, n in toc_freq.most_common(8):
                 if n >= 64 and t not in toc_candidates:

@@ -228,6 +228,47 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
 
 unsigned spu_workload_count(void) { return s_registry_count; }
 
+/* ---- prefix registry (see spu_workload.h) ------------------------------- */
+#define SPU_PREFIX_MAX 16
+static struct {
+    uint64_t fp; uint32_t len; spu_lifted_entry_fn fn; int image_id; const char* name;
+} s_prefix[SPU_PREFIX_MAX];
+static unsigned s_prefix_count;
+
+void spu_workload_register_prefix(uint64_t fingerprint, uint32_t hashed_len,
+                                  spu_lifted_entry_fn fn, int image_id,
+                                  const char* name)
+{
+    if (!fn || !hashed_len) return;
+    for (unsigned i = 0; i < s_prefix_count; i++)
+        if (s_prefix[i].fp == fingerprint && s_prefix[i].len == hashed_len) {
+            s_prefix[i].fn = fn; s_prefix[i].image_id = image_id; s_prefix[i].name = name;
+            return;                                  /* idempotent */
+        }
+    if (s_prefix_count >= SPU_PREFIX_MAX) {
+        fprintf(stderr, "[spu_workload] prefix registry full; dropping '%s'\n", name ? name : "?");
+        return;
+    }
+    s_prefix[s_prefix_count].fp = fingerprint;  s_prefix[s_prefix_count].len = hashed_len;
+    s_prefix[s_prefix_count].fn = fn;           s_prefix[s_prefix_count].image_id = image_id;
+    s_prefix[s_prefix_count].name = name;
+    s_prefix_count++;
+}
+
+spu_lifted_entry_fn spu_workload_find_prefix(const void* run, size_t run_len,
+                                             int* image_id_out)
+{
+    for (unsigned i = 0; i < s_prefix_count; i++) {
+        if (run_len < s_prefix[i].len) continue;
+        if (spu_workload_fingerprint(run, s_prefix[i].len) == s_prefix[i].fp) {
+            if (image_id_out) *image_id_out = s_prefix[i].image_id;
+            return s_prefix[i].fn;
+        }
+    }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
 
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -825,7 +866,15 @@ static void spu_task_ls_put(uint8_t* ls)
     if (ls && ls != t_spu_ls_scratch) free(ls);
 }
 
+static void spu_async_run_impl(spu_async_job* j);
 static void spu_async_run(spu_async_job* j)
+{
+    extern volatile int g_tl_on; extern void tl_spu_run(int, int, int, int);   /* TOD_TIMELINE: wid 2000+ = async SPU task (image id) */
+    if (g_tl_on) tl_spu_run(0, 2000, -1, j->image_id);
+    spu_async_run_impl(j);
+    if (g_tl_on) tl_spu_run(1, 2000, -1, j->image_id);
+}
+static void spu_async_run_impl(spu_async_job* j)
 {
     const uint64_t t_begin = j->t_submit ? spu_wl_now_ns() : 0;
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
@@ -1287,6 +1336,7 @@ static DWORD WINAPI spu_pool_thread(LPVOID p)
     spu_pool_worker* w = (spu_pool_worker*)p;
     int named_image = -1;
     t_spu_pool_thread = 1;
+    { extern void ps3_ccx_role(int); ps3_ccx_role(5); }
     /* Handler headroom for a stack overflow in lifted SPU code, as in
      * spu_async_thread. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
@@ -1296,6 +1346,7 @@ static DWORD WINAPI spu_pool_thread(LPVOID p)
         spu_async_job* j = w->job;
         w->job = NULL;
         ReleaseSRWLockExclusive(&w->mu);
+        { extern void ps3_cpu_note(void); ps3_cpu_note(); }
         extern void spu_task_begin(void);
         spu_task_begin();
         if (j->image_id != named_image) {

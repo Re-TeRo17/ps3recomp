@@ -24,6 +24,22 @@ int  rsx_d3d12_engine_active(void);
 /* Pump the window's messages; -1 once it has been closed. */
 int  rsx_d3d12_engine_pump_messages(void);
 
+/* A port's overlay drawn over the presented frame (tod-recomp: the settings page).
+ * message: every window message first, on the window's thread; non-zero = handled,
+ *   *result is the answer. render: while the present records, on the thread that
+ *   encodes, with the back buffer as the render target (RENDER_TARGET state) and
+ *   its descriptor; the hook records into the command list and must leave the
+ *   back buffer in that state. Both optional; render is called on every present,
+ *   so it must return at once when the overlay is closed. dev/queue/list are the
+ *   ID3D12Device / ID3D12CommandQueue / ID3D12GraphicsCommandList; rtv is the
+ *   D3D12_CPU_DESCRIPTOR_HANDLE.ptr; frames = command allocator slots (reuse
+ *   distance of per-frame GPU buffers). */
+typedef struct RsxD3D12Overlay {
+    int  (*message)(void* hwnd, unsigned msg, uintptr_t wparam, intptr_t lparam, intptr_t* result);
+    void (*render)(void* dev, void* queue, void* list, uint64_t rtv, unsigned w, unsigned h, int frames);
+} RsxD3D12Overlay;
+void rsx_d3d12_set_overlay(const RsxD3D12Overlay* o);
+
 /* Test hooks, as the Metal backend's. */
 u32  rsx_d3d12_engine_debug_color(void);
 u32  rsx_d3d12_engine_readback_center(void);

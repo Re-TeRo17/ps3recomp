@@ -112,6 +112,12 @@ extern char g_sys_fs_root[512];
 /* Path translation: convert PS3 path to host path */
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 
+/* Mods folder (sys_fs.c): index <mods_dir> once (returns the file count, 0 = idle and
+ * silent), then let the READ-ONLY open/stat paths swap a translated host path for the
+ * mod file that replaces it. Never call the resolver for a write. */
+int ps3_mods_init(const char* mods_dir, const char* vfs_root);
+int ps3_mods_resolve(const char* guest, char* host_path, size_t cap);
+
 /* Syscall handlers */
 int64_t sys_fs_open(ppu_context* ctx);
 int64_t sys_fs_read(ppu_context* ctx);

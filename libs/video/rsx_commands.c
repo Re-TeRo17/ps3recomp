@@ -364,13 +364,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        { extern void rsx_draw_engine_b2_ordered_write32(unsigned, unsigned); rsx_draw_engine_b2_ordered_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val); }
         { static int _l=0; if (_l < 8 && ++_l) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }
       if (method == 0x1D74) {
         extern void vm_write32(uint32_t a, uint32_t v);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+        { extern void rsx_draw_engine_b2_ordered_write32(unsigned, unsigned); rsx_draw_engine_b2_ordered_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data); }
         return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||

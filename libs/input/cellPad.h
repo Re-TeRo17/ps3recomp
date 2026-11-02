@@ -227,6 +227,21 @@ typedef struct CellPadHostInput {
 typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
 
+/* DualSense (SDL backend; no-ops elsewhere and on ports without one). Any thread.
+ *   present:     a DualSense is on this host port.
+ *   triggers:    the adaptive-trigger effect of R2 and L2 as the controller's 11-byte
+ *                blocks (mode byte first: 0x21 feedback, 0x25 weapon, 0x26 vibration,
+ *                0x05 off); NULL = no effect on that trigger. Sent when it changes and
+ *                refreshed every second; slack again when the pad closes.
+ *   fire_on_r2:  on DualSense ports the game's R1 is the right trigger and its R2 the
+ *                right bumper (the trigger with the motor is the one that fires).
+ *   r2_threshold: how far (0-255) the right trigger must be pulled to count as a button.
+ */
+int  cellPad_host_ds_present(u32 port);
+void cellPad_host_ds_triggers(u32 port, const u8* r2, const u8* l2);
+void cellPad_host_ds_fire_on_r2(int on);
+void cellPad_host_ds_r2_threshold(int raw255);
+
 #ifdef __cplusplus
 }
 #endif

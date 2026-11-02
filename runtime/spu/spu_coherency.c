@@ -101,6 +101,7 @@ typedef struct spu_coh_entry {
 static spu_coh_entry* s_coh_ctxs;
 
 unsigned long g_spu_lr_raise = 0;
+extern void ppu_resv_break_line(uint32_t ea);
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
@@ -115,12 +116,18 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
           fprintf(stderr, "[spu-coh] first reserved line in page 0x%08X (ea 0x%08X, spu %d)\n",
                   ea & 0xFFFF0000u, ea, ctx ? (int)ctx->spu_id : -1);
           fflush(stderr); } }
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+    /* Test before writing: every GETLLAR comes here, and an unconditional
+     * store (or a CAS that writes the same byte) takes the shared line --
+     * the page table is read by every inline PPU load/store. */
+    { const unsigned char bit = (unsigned char)(1u << (line & 7));
+      if (!(s_coh_bitmap[line >> 3] & bit)) s_coh_bitmap[line >> 3] |= bit; }
     /* Atomic: ppu_vm_slow_any_update rewrites the page's other bits from
      * another thread, without the lock-line lock. The bit a store tests
      * goes off in the same step. */
-    ppu_vm_page_update(ea >> 16, 0, PPU_VM_PAGE_COH);
-    s_coh_armed = 1;
+    { const unsigned char pg = __atomic_load_n(&g_ppu_vm_page[ea >> 16], __ATOMIC_ACQUIRE);
+      if (!(pg & PPU_VM_PAGE_COH) || (pg & PPU_VM_PAGE_ST))
+          ppu_vm_page_update(ea >> 16, 0, PPU_VM_PAGE_COH); }
+    if (!s_coh_armed) s_coh_armed = 1;
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -208,28 +215,59 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
+void spu_hangline_note(char kind, int img, uint32_t spu, uint32_t pc, uint32_t ea, const uint8_t* line);
+extern uint8_t* vm_base;
+#include <intrin.h>
+#include <immintrin.h>
+#include "spu_c37.inc"
+/* SPU_COH_WATCH=<hex ea>: who writes that 128-byte line (SPU DMA: image + pc; PPU: host return
+ * address, resolve with llvm-symbolizer against tod.pdb). First 24 events, then a count every 200k. */
+static void spu_coh_watch(const char* who, uint32_t ea, int img, uint32_t pc, uintptr_t ra)
+{
+    static int64_t s_w = -2;
+    if (s_w == -2) { const char* e = getenv("SPU_COH_WATCH"); s_w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+    if (s_w < 0 || ((uint32_t)s_w & ~127u) != (ea & ~127u)) return;
+    static volatile long n; long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+    extern char __ImageBase;
+    if (k <= 24 || (k % 200000) == 0)
+        fprintf(stderr, "[coh-watch] #%ld %s line 0x%08X img=%d pc=0x%05X ra_rva=0x%llX word0=%08X\n", k, who, ea & ~127u, img, pc,
+                (unsigned long long)(ra ? (char*)ra - &__ImageBase : 0), *(uint32_t*)(vm_base + (ea & ~127u)));
+}
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    spu_coh_watch("spu-dma", ea, ((const spu_context*)self)->image_id, (uint32_t)((const spu_context*)self)->pc, 0);
+    { extern volatile int g_tl_on; extern void tl_write(uint32_t, int); if (g_tl_on) tl_write(ea & ~127u, 1); }   /* TOD_TIMELINE */
+    spu_hangline_note('D', ((const spu_context*)self)->image_id, ((const spu_context*)self)->spu_id, 0, ea, vm_base + (ea & ~127u));
     uint32_t line = ea & ~127u;
+    ppu_resv_break_line(ea);   /* real PPC: an SPU DMA store kills PPU lwarx reservations on the line */
+    uint32_t c37wm = 0;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+            c37wm |= c->image_id == 110 ? 1u : c->image_id == 111 ? 2u : 4u;
             c->event_status |= SPU_EVENT_LR;
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
         }
     }
+    if (g_c37_on > 0) c37_notify(ea, ((const spu_context*)self)->image_id, c37wm, 0);
 }
 
 void spu_coh_notify_write(uint32_t ea)
 {
+    spu_coh_watch("ppu", ea, -1, 0, (uintptr_t)__builtin_return_address(0));
+    { extern volatile int g_tl_on; extern void tl_write(uint32_t, int); if (g_tl_on) tl_write(ea & ~127u, 0); }   /* TOD_TIMELINE */
+    spu_hangline_note('W', -1, 0, (uint32_t)(uintptr_t)__builtin_return_address(0), ea, vm_base + (ea & ~127u));
     uint32_t line = ea & ~127u;
+    ppu_resv_break_line(ea);   /* real PPC: PPU plain store / SPU PUTLLC(UC) kill PPU lwarx reservations on the line */
+    uint32_t c37wm = 0;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
+            c37wm |= c->image_id == 110 ? 1u : c->image_id == 111 ? 2u : 4u;
             c->event_status |= SPU_EVENT_LR;
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
@@ -248,6 +286,7 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+    if (g_c37_on > 0) c37_notify(ea, t_c37_wimg ? t_c37_wimg : -1, c37wm, (uintptr_t)__builtin_return_address(0));
 }
 
 #ifdef __cplusplus

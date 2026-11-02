@@ -91,9 +91,21 @@ static int find_free_slot(void)
         slots = e ? atoi(e) : 0;
         if (slots < 1 || slots > PPU_THREAD_MAX) slots = PPU_THREAD_MAX;
     }
-    for (int i = 0; i < slots; i++) {
-        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
+    /* Thread ids on the console are never reused soon: a title that polls
+     * sys_ppu_thread_get_priority(tid) until ESRCH to learn that a worker has
+     * ended (Ratchet & Clank: ToD's savedata/audio worker wrapper) must not
+     * see the id handed to a later, long-lived thread -- first-fit gave the
+     * ended worker's slot to "syn_tick_timer_thread" and the game waited on
+     * it forever. Next-fit instead: a freed id comes back only after every
+     * other slot has been tried. PPU_THREAD_ID_REUSE=1 restores first-fit. */
+    static int reuse = -1, next = 0;
+    if (reuse < 0) { const char* e = getenv("PPU_THREAD_ID_REUSE"); reuse = e && atoi(e) ? 1 : 0; }
+    for (int k = 0; k < slots; k++) {
+        int i = reuse ? k : (next + k) % slots;
+        if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE) {
+            next = (i + 1) % slots;
             return i;
+        }
     }
     return -1;
 }
@@ -200,6 +212,22 @@ static void* ppu_host_thread_proc(void* param)
           if (n && strncmp(info->name, list, n) == 0) {
               SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
               fprintf(stderr, "[THREAD %llu] \"%s\" runs at THREAD_PRIORITY_HIGHEST\n",
+                      (unsigned long long)info->ctx.thread_id, info->name);
+              break;
+          }
+          list = end ? end + 1 : NULL;
+      } }
+    /* PPU_QOS_TIMECRIT=<prefix>[,...]: THREAD_PRIORITY_TIME_CRITICAL, for a short
+     * periodic thread that must wake on time even while HIGHEST threads (the SPU
+     * workers) spin: at equal priority Windows let it wait out their 10-20 ms
+     * quanta (ToD's synth tick: usleep(16.7 ms) woke up to 18 ms late). */
+    { const char* list = getenv("PPU_QOS_TIMECRIT");
+      while (list && *list) {
+          const char* end = strchr(list, ',');
+          const size_t n = end ? (size_t)(end - list) : strlen(list);
+          if (n && strncmp(info->name, list, n) == 0) {
+              SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+              fprintf(stderr, "[THREAD %llu] \"%s\" runs at THREAD_PRIORITY_TIME_CRITICAL\n",
                       (unsigned long long)info->ctx.thread_id, info->name);
               break;
           }
@@ -505,6 +533,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint32_t stack_addr = stack_take(stack_size);
     if (stack_addr == 0) {
         table_unlock();
+        fprintf(stderr, "[SYS] sys_ppu_thread_create: no guest stack (0x%X bytes) -- ENOMEM (entry=0x%08llX)\n",
+                stack_size, (unsigned long long)entry);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
@@ -611,6 +641,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
         table_unlock();
+        fprintf(stderr, "[SYS] sys_ppu_thread_create: host thread creation failed (errno=%d) -- EAGAIN (entry=0x%08llX)\n",
+                errno, (unsigned long long)entry);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
@@ -621,8 +653,12 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * each miss is an audible gap. A mild boost, not TIME_CRITICAL: these
      * threads sleep between polls.
      * ponytail: two host levels only; map the full range if a title needs it. */
-    if (priority < 256)
-        SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    /* shad114 PS3_PRIO_ABOVE_THRESHOLD (default 512; 256 = the old cut). Tools of Destruction's 7 snd_stream_service_thread run at
+     * prio 401: below the old cut they stayed NORMAL and were starved by the busy frame (the music stuttered). Idea: RACiT (MIT,
+     * (c) 2026 HighDrexler), which makes the cut 512 for the same reason. Never lowers a thread (a new one starts at NORMAL). */
+    { static int thr = -1; if (thr < 0) { const char* e = getenv("PS3_PRIO_ABOVE_THRESHOLD"); thr = (e && e[0]) ? atoi(e) : 512; }
+      if (priority < thr && GetThreadPriority(t->host_thread) < THREAD_PRIORITY_ABOVE_NORMAL)
+          SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL); }
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
@@ -1316,12 +1352,24 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
+    { static int s_n = 0; if (getenv("PS3_THREAD_PRIO_LOG") && s_n < 40 && ++s_n)
+        fprintf(stderr, "[SYS] sys_ppu_thread_get_priority(tid=%llu) -> %s (lr=0x%08X, caller tid %u)\n",
+                (unsigned long long)tid, t ? t->name : "(unknown)", (uint32_t)ctx->lr, (unsigned)ctx->thread_id); }
     if (!t) {
         /* The main thread (and any thread we didn't spawn via sys_ppu_thread_create)
          * isn't in our table. Returning ESRCH here is fatal for engines that query
          * their own priority at startup (PhyreEngine PApplication::PlatformInit ->
          * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
+        /* An id the table could have handed out (2..PPU_THREAD_MAX; 1 is main)
+         * that holds no thread is a thread that has ended and been reaped:
+         * ESRCH, as on the console. Titles poll for exactly that to learn a
+         * detached worker is done (R&C: ToD's "Check Thread" wrapper); an OK
+         * here kept them waiting forever. PPU_THREAD_PRIO_UNKNOWN_OK=1 keeps
+         * the old always-OK answer. */
+        { static int old = -1;
+          if (old < 0) { const char* e = getenv("PPU_THREAD_PRIO_UNKNOWN_OK"); old = e && atoi(e) ? 1 : 0; }
+          if (!old && tid >= 2 && tid <= PPU_THREAD_MAX) return (int64_t)(int32_t)0x80010005; /* CELL_ESRCH */ }
         if (prio_addr != 0) {
             int32_t prio = 1000;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);
@@ -1521,3 +1569,136 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_PPU_THREAD_GET_STACK_INFORMATION, sys_ppu_thread_get_stack_information);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_RENAME,              sys_ppu_thread_rename);
 }
+
+/* ---- TOD_CCX_PIN / TOD_CPU_HIST: thread placement experiment ----------------
+ * ps3_ccx_role(role) is called at the start of a hot host thread (or by the
+ * main thread). TOD_CCX_PIN=1: the frame chain goes to the first last-level-
+ * cache group (Zen2: one CCX), everything else to the other group, the last
+ * core of all being SPURS' audio core. Roles: 1 PPU main, 2 RSX walker,
+ * 3 present, 4 SPURS graphics worker, 5 SPU pool/async, 6 raw SPU, 0 other.
+ * TOD_CPU_HIST=1: ps3_cpu_note() counts GetCurrentProcessorNumber() per role,
+ * printed every 5 s. Both off by default. */
+#ifdef _WIN32
+#define CCX_ROLES 8
+static __declspec(thread) int t_ccx_role;
+static ULONG s_pin_a[CCX_ROLES][2], s_pin_na[CCX_ROLES]; /* cpu set ids per role */
+static ULONG s_rest[16], s_nrest;
+static ULONG s_chain[16], s_nchain;                       /* TOD_CCX_PIN=4 */
+static int s_pin_on = -1, s_hist_on = -1;
+static volatile LONG s_pin_ready;
+static long s_hist[CCX_ROLES][64];
+
+static void ccx_init(void)
+{
+    const char* e = getenv("TOD_CCX_PIN"); s_pin_on = (e && e[0] >= '1' && e[0] <= '4') ? e[0] - '0' : 0;
+    e = getenv("TOD_CPU_HIST"); s_hist_on = (e && e[0] == '1');
+    if (!s_pin_on) return;
+    ULONG len = 0;
+    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+    uint8_t* buf = len ? (uint8_t*)malloc(len) : NULL;
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) { s_pin_on = 0; free(buf); return; }
+    struct { ULONG id; BYTE core, llc; } cs[64]; int n = 0; BYTE last_core = 0;
+    for (ULONG off = 0; off < len; ) {
+        SYSTEM_CPU_SET_INFORMATION* c = (SYSTEM_CPU_SET_INFORMATION*)(buf + off);
+        if (c->Type == CpuSetInformation && n < 64) {
+            cs[n].id = c->CpuSet.Id; cs[n].core = c->CpuSet.CoreIndex; cs[n].llc = c->CpuSet.LastLevelCacheIndex;
+            if (c->CpuSet.CoreIndex > last_core) last_core = c->CpuSet.CoreIndex; n++; }
+        off += c->Size;
+    }
+    free(buf);
+    if (n < 10) { s_pin_on = 0; return; }
+    if (s_pin_on == 4) {
+        /* 30/10: the collision chain only. The PPU main and the two raw collision SPUs hand work to each other
+         * thousands of times a frame through one cache line (10612E80); keep the three on the logical CPUs of
+         * core 0's last-level-cache group (a Zen 2 CCX) so the line never crosses CCXs. Nothing else is placed. */
+        for (int i = 0; i < n; i++) if (cs[i].llc == cs[0].llc && s_nchain < 16) s_chain[s_nchain++] = cs[i].id;
+        if (s_nchain < 4) { s_pin_on = 0; return; }
+        fprintf(stderr, "[ccx-pin] mode 4: PPU main + raw SPUs on the %lu logical CPUs of LLC group %u\n", (unsigned long)s_nchain, (unsigned)cs[0].llc);
+        InterlockedExchange(&s_pin_ready, 1);
+        return;
+    }
+    if (s_pin_on == 3) {
+        /* main on ONE logical CPU of core 0; its SMT sibling is excluded from the
+         * process default set and from every other thread (also SPURS' core). */
+        int got = 0;
+        for (int i = 0; i < n; i++) if (cs[i].core == cs[0].core && !got) { s_pin_a[1][0] = cs[i].id; s_pin_na[1] = 1; got = 1; }
+        for (int i = 0; i < n; i++) if (cs[i].core != last_core && cs[i].core != cs[0].core && s_nrest < 16) s_rest[s_nrest++] = cs[i].id;
+        if (!s_nrest) { s_pin_on = 0; return; }
+        SetProcessDefaultCpuSets(GetCurrentProcess(), s_rest, s_nrest);
+        fprintf(stderr, "[ccx-pin] mode 3: main alone on cpuset %lu (core %u), sibling excluded; %lu logical CPUs for the rest\n", (unsigned long)s_pin_a[1][0], (unsigned)cs[0].core, (unsigned long)s_nrest);
+        InterlockedExchange(&s_pin_ready, 1);
+        return;
+    }
+    /* cores 0..last-1 (the last one is SPURS'), group A = the LLC of core 0 */
+    BYTE llcA = cs[0].llc; BYTE ca[8]; int nca = 0;
+    for (int i = 0; i < n; i++) if (cs[i].llc == llcA && cs[i].core != last_core) {
+        int seen = 0; for (int k = 0; k < nca; k++) if (ca[k] == cs[i].core) seen = 1;
+        if (!seen && nca < 8) ca[nca++] = cs[i].core; }
+    if (nca < 3) { s_pin_on = 0; return; }
+    /* A cores: ca[0] PPU main, ca[1] walker, ca[2] present + SPURS workers */
+    const int role_core[CCX_ROLES] = { -1, 0, 1, 2, 2, -1, -1, -1 };
+    for (int r = 1; r <= (s_pin_on == 2 ? 2 : 4); r++)
+        for (int i = 0; i < n; i++) if (cs[i].core == ca[role_core[r]] && s_pin_na[r] < 2) s_pin_a[r][s_pin_na[r]++] = cs[i].id;
+    for (int i = 0; i < n; i++) if (cs[i].core != last_core) {
+        int inA = 0; for (int k = 0; k < (s_pin_on == 2 ? 2 : nca); k++) if (ca[k] == cs[i].core) inA = 1;
+        if (!inA && s_nrest < 16) s_rest[s_nrest++] = cs[i].id; }
+    if (!s_nrest) { s_pin_on = 0; return; }
+    SetProcessDefaultCpuSets(GetCurrentProcess(), s_rest, s_nrest);
+    fprintf(stderr, "[ccx-pin] on: %d cores in LLC group A; %lu logical CPUs for the rest\n", nca, (unsigned long)s_nrest);
+    InterlockedExchange(&s_pin_ready, 1);
+}
+
+void ps3_ccx_role(int role)
+{
+    static LONG once; static volatile LONG done;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0) { ccx_init(); done = 1; } else while (!done) YieldProcessor();
+    t_ccx_role = role;
+    /* TOD_ROLE_PRIO (31/10 spurs34, default off): scheduler priority of the frame-critical chain. 1 = PPU main HIGHEST,
+     * raw SPUs (6) and SPURS graphics workers (4) ABOVE_NORMAL; 2 = main only; 3 = SPUs/workers only. */
+    { static int rp = -1; if (rp < 0) { const char* e = getenv("TOD_ROLE_PRIO"); rp = e ? atoi(e) : 0; }
+      if (rp) {
+          /* shad114: raise only, never lower (a guest thread with a high priority may already be ABOVE_NORMAL/HIGHEST) */
+          if (role == 1 && (rp & 3) != 3) { if (GetThreadPriority(GetCurrentThread()) < THREAD_PRIORITY_HIGHEST) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
+          else if ((role == 6 || role == 4) && (rp == 1 || rp == 3)) { if (GetThreadPriority(GetCurrentThread()) < THREAD_PRIORITY_ABOVE_NORMAL) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); }
+      } }
+    { static int ad = -1; if (ad < 0) { const char* e = getenv("TOD_ADDR_DIAG"); ad = (e && e[0] == '1'); }
+      if (ad) { int local = 0; void* h = malloc(4096);
+        fprintf(stderr, "[addr-diag] role %d tid %lu: stack~%p heap~%p exe=%p vm_base=%p\n", role, (unsigned long)GetCurrentThreadId(), (void*)&local, h, (void*)GetModuleHandleA(NULL), (void*)vm_base); free(h); } }
+    if (s_pin_on == 4) { if (role == 1 || role == 6) SetThreadSelectedCpuSets(GetCurrentThread(), s_chain, s_nchain); return; }
+    if (!s_pin_on || role < 1 || role >= CCX_ROLES) {
+        if (s_pin_on && role >= 5 && s_nrest) SetThreadSelectedCpuSets(GetCurrentThread(), s_rest, s_nrest);
+        return; }
+    if (s_pin_na[role]) SetThreadSelectedCpuSets(GetCurrentThread(), s_pin_a[role], s_pin_na[role]);
+}
+
+/* Called by the SPURS audio-core code after it resets the process default set. */
+void ps3_ccx_reapply_default(void)
+{
+    if (s_pin_on > 0 && s_nrest) SetProcessDefaultCpuSets(GetCurrentProcess(), s_rest, s_nrest);
+}
+
+void ps3_cpu_note(void)
+{
+    if (s_hist_on < 0) { const char* e = getenv("TOD_CPU_HIST"); s_hist_on = (e && e[0] == '1'); }
+    if (s_hist_on <= 0) return;
+    static LONGLONG t0; static LONG busy;
+    const unsigned cpu = GetCurrentProcessorNumber(), r = (unsigned)t_ccx_role & 7;
+    if (cpu < 64) InterlockedIncrement((volatile LONG*)&s_hist[r][cpu]);
+    LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+    if (!t0) t0 = q.QuadPart;
+    if (q.QuadPart - t0 > 5 * f.QuadPart && InterlockedCompareExchange(&busy, 1, 0) == 0) {
+        t0 = q.QuadPart;
+        for (int i = 0; i < CCX_ROLES; i++) {
+            long tot = 0; for (int c = 0; c < 16; c++) tot += s_hist[i][c];
+            if (!tot) continue;
+            fprintf(stderr, "[cpu-hist] role %d:", i);
+            for (int c = 0; c < 16; c++) if (s_hist[i][c]) fprintf(stderr, " cpu%d=%ld%%", c, s_hist[i][c] * 100 / tot);
+            fprintf(stderr, "\n"); memset(s_hist[i], 0, sizeof s_hist[i]); }
+        InterlockedExchange(&busy, 0);
+    }
+}
+#else
+void ps3_ccx_role(int role) { (void)role; }
+void ps3_ccx_reapply_default(void) {}
+void ps3_cpu_note(void) {}
+#endif

@@ -32,6 +32,12 @@
 #include <string.h>
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+#include "spu_interp.h"
+extern SPU_THREAD_LOCAL int g_spu_force_interp;   /* spu_channels.c */
+static void spu_interp_pm_entry(spu_context* ctx)
+{
+    spu_interp_run_until(ctx, 0xA00, SPURS_PM_EXIT_TO_KERNEL_LS);
+}
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (per worker, including the exit classification used by the caller). */
@@ -390,7 +396,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
-    const int pm_halted = spu_run_with_halt(entry, ctx);
+    /* SPU_INTERP_WID=<wid>[@<spurs ea hex>]: run this workload's PM + job code
+     * entirely in the interpreter (lifted lookups disabled on this thread), to
+     * tell a lifting error from a timing problem (audio synth = wid 7). */
+    static int s_iw = -2; static uint32_t s_iw_ea = 0;
+    if (s_iw == -2) { const char* e = getenv("SPU_INTERP_WID"); s_iw = -1;
+        if (e && *e) { s_iw = atoi(e); const char* at = strchr(e, '@');
+            if (at) s_iw_ea = (uint32_t)strtoul(at + 1, NULL, 16);
+            fprintf(stderr, "[spu] SPU_INTERP_WID: wid %d spurs 0x%08X interpreted\n", s_iw, s_iw_ea); } }
+    const int interp_run = (s_iw >= 0 && (uint32_t)s_iw == wid && (!s_iw_ea || s_iw_ea == spurs_ea));
+    if (interp_run) g_spu_force_interp = 1;
+    const int pm_halted = spu_run_with_halt(interp_run ? spu_interp_pm_entry : entry, ctx);
+    g_spu_force_interp = 0;
     /* A lane's run should only end through exitToKernel. Anything else strands
      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {

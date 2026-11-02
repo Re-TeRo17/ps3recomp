@@ -64,6 +64,7 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  *          control word is available (standalone tests) to fall back to the
  *          legacy "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+unsigned long long rsx_fp_codegen_salt(void);   /* integ113: 0 by default; non-zero when a run-time toggle changes the generated HLSL (cache id salt) */
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
@@ -115,6 +116,7 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * bit (21) set. */
 typedef struct { u32 instrs, prec[4], exp_tex; } rsx_fp_decompile_stats;
 extern rsx_fp_decompile_stats g_rsx_fp_stats;
+int rsx_fp_shadow_oob_lit(void);   /* shad114 RSX_SHADOW_OOB_LIT */
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs);
 /* Unnormalised units for the NEXT decompile call: bit u of mask means unit u's
  * texture carries RSX_TEX_FMT_UNNORM (addressed in texels) and dim[u] is its
@@ -131,6 +133,12 @@ void rsx_fp_set_texel_ops(const u32* ops);
  * [0, 1] (a per-title correction the engine applies by program; see
  * RSX_FP_SAT_ALPHA in rsx_draw_engine.c). Reset to 0 after. */
 void rsx_fp_set_saturate_alpha(int on);
+/* WPOS reads as the RSX's bottom-left-origin window y (fp_alpha.y = surface height). */
+void rsx_fp_set_wpos_flip(int on);
+/* RSX_SSR: fragment units carrying the previous frame's scene colour / depth (-1,-1 = off): cube LOD samples try a screen-space ray first. */
+void rsx_fp_set_ssr(int col_unit, int dep_unit);
+void rsx_fp_set_ssr_debug(int on);
+void rsx_fp_set_ssr_params(float minup, int axis);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 

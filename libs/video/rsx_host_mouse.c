@@ -94,7 +94,7 @@ int rsx_host_mouse_message(void* hwnd_, unsigned msg, uintptr_t wp, intptr_t lp,
         *result = 0;
         return 1;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE && !s_escape_closes) {
+        if (wp == VK_ESCAPE && !s_escape_closes && !(GetKeyState(VK_SHIFT) & 0x8000)) {   /* Shift+Esc still closes */
             *result = 0;
             return 1;
         }

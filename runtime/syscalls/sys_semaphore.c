@@ -331,9 +331,32 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
+/* AUDIO_TICK_DIAG=1: report waits > 5 ms (max 20 lines/s): sem id/name, waiting tid, last poster tid, duration, caller. */
+static unsigned long long g_sem_last_poster[SYS_SEMAPHORE_MAX + 1];
+static int sem_tick_diag(void) { static int d = -1; if (d < 0) { const char* e = getenv("AUDIO_TICK_DIAG"); d = (e && e[0] && e[0] != '0') ? 1 : 0; } return d; }
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    LARGE_INTEGER dq0, dq1, dqf; uint32_t dsem = 0;
+    const int dg = sem_tick_diag();
+    if (dg) { dsem = (uint32_t)ctx->gpr[3]; QueryPerformanceCounter(&dq0); }
     int64_t r = sys_semaphore_wait_impl(ctx);
+    if (dg) {
+        QueryPerformanceCounter(&dq1); QueryPerformanceFrequency(&dqf);
+        const double ms = (dq1.QuadPart - dq0.QuadPart) * 1000.0 / dqf.QuadPart;
+        if (ms > 5.0) {
+            static long long sec = -1; static int n = 0;
+            const long long cs = dq1.QuadPart / dqf.QuadPart;
+            if (cs != sec) { sec = cs; n = 0; }
+            if (n < 20 && ++n) {
+                char nm[9] = {0};
+                if (dsem >= 1 && dsem <= SYS_SEMAPHORE_MAX) memcpy(nm, g_sys_semaphores[dsem - 1].name, 8);
+                fprintf(stderr, "[sem-long] sem=%u name='%s' tid=%llu lastpost_tid=%llu wait=%.1fms r=%lld lr=0x%08X%c",
+                        dsem, nm, (unsigned long long)ctx->thread_id,
+                        (unsigned long long)(dsem <= SYS_SEMAPHORE_MAX ? g_sem_last_poster[dsem] : 0),
+                        ms, (long long)r, (unsigned)ctx->lr, 10);
+            }
+        }
+    }
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (n < 12 && ++n)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
@@ -505,6 +528,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
+    if (sem_tick_diag()) { uint32_t _id = (uint32_t)ctx->gpr[3]; if (_id >= 1 && _id <= SYS_SEMAPHORE_MAX) g_sem_last_poster[_id] = (unsigned long long)ctx->thread_id; }
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 

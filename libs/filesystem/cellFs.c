@@ -16,6 +16,9 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
+/* Mods folder (runtime/syscalls/sys_fs.c). Read-only opens and stat only. */
+extern int ps3_mods_resolve(const char* guest, char* host_path, size_t cap);
+
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
  * PS3 CellFsStat struct, so undefine them here; host times are read via the
@@ -243,7 +246,11 @@ static const char* gpath(const char* guest)
 
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
-    return translate_path(ps3_path, host_buf, buf_size);
+    /* The callers are the image decoders (cellPngDec, ...), which only read: the
+     * mods folder applies. */
+    const int r = translate_path(ps3_path, host_buf, buf_size);
+    if (r == 0) ps3_mods_resolve(ps3_path, host_buf, buf_size);
+    return r;
 }
 
 /* ---------------------------------------------------------------------------
@@ -452,6 +459,8 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         printf("[cellFs] Open: no path mapping for '%s'\n", gpath(path));
         return (s32)CELL_ENOENT;
     }
+    /* Mods folder (runtime/syscalls/sys_fs.c): a read-only open reads the mod file instead. */
+    if (flags == CELL_FS_O_RDONLY) ps3_mods_resolve(gpath(path), host_path, sizeof(host_path));
 
     /* If creating, ensure parent directories exist */
     if (flags & CELL_FS_O_CREAT) {
@@ -654,6 +663,7 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
+    ps3_mods_resolve(gpath(path), host_path, sizeof(host_path));   /* mods folder: the size is the mod file's */
 
     HOST_STAT_T hst;
     if (HOST_STAT(host_path, &hst) != 0) {

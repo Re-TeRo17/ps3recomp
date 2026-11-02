@@ -115,3 +115,10 @@ fw_spu/
 
 # SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
 runtime/spu/tests/build_diff/
+
+# Mechanical translations of SPU code of the game and data captured from it (see runtime/spu/anim_ref.c, spu_coll_sync.c):
+# generated locally, never committed
+runtime/spu/anim_gen_*.inc
+runtime/spu/spu_coll_l2_gen_*.inc
+runtime/spu/spu_coll_l2_img.inc
+runtime/spu/spu_coll_sync_regs.inc

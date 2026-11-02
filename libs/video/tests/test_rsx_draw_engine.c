@@ -78,6 +78,7 @@ int  rsx_capture_wants_mean(u32 frame) { (void)frame; return 0; }
 void rsx_capture_present(u32 frame, double mean, const u32* regs, u32 nregs, const u32* vp, u32 nvp,
                          const u32* constants, u32 nconst_words, const u32* dispbuf, u32 ndispbuf)
 { (void)frame; (void)mean; (void)regs; (void)nregs; (void)vp; (void)nvp; (void)constants; (void)nconst_words; (void)dispbuf; (void)ndispbuf; }
+volatile uint32_t g_ppu_frame_counter;
 int      vm_watch_available(void) { return 0; }
 uint64_t vm_watch_arm(uint32_t ea, uint32_t len, uint32_t* unwatched) { (void)ea; if (unwatched) *unwatched = len; return 0; }
 void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected) { if (faults) *faults = 0; if (pages_protected) *pages_protected = 0; }

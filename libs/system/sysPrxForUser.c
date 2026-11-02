@@ -167,6 +167,7 @@ static u32 s_next_heap_id = 1;
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
+extern void cellSaveData_flush_async(void);   /* hitch116: finish a deferred (PS3_SAVEDATA_ASYNC) autosave before the process goes */
 void sys_process_exit(s32 exitcode)
 {
     g_sys_process_exit_code   = exitcode;
@@ -194,6 +195,7 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
+    cellSaveData_flush_async();
     exit(exitcode);
 }
 

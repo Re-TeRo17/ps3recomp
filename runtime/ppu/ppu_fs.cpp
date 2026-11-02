@@ -69,6 +69,11 @@ static int FS_STAT64(const char* p, fs_stat64_t* s)
 #  define FS_STAT64(p, s)    stat((p), (s))
 typedef struct stat fs_stat64_t;
 #endif
+#ifdef _WIN32
+#  define FS_FSTAT64(f, s)   _fstat64(_fileno(f), (s))
+#else
+#  define FS_FSTAT64(f, s)   fstat(fileno(f), (s))
+#endif
 
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
@@ -124,6 +129,9 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
  * translators. (extern "C" is ill-formed at block scope.) */
 extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+/* Mods folder (sys_fs.c): swap a translated host path for the mod file that
+ * replaces it. READ-ONLY opens and stat only -- never a write. */
+extern "C" int ps3_mods_resolve(const char* guest, char* host_path, size_t cap);
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
@@ -214,6 +222,7 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+    if (flags == CELL_FS_O_RDONLY) ps3_mods_resolve(gpath, hpath, sizeof hpath);   /* mods folder: reads only */
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
@@ -311,6 +320,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+    ps3_mods_resolve(gpath, hpath, sizeof hpath);   /* mods folder (a read-only open) */
 
     /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
      * into a cache file and that is opened in its place. This used to be a
@@ -595,14 +605,18 @@ static void cellFsLseek(ppu_context* ctx)
  * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
  * field right after the stat (the fd at obj+0x10c), which later fails lseek.
  * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
-static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
+/* The times are the host file's (Stat, Fstat and GetDirectoryEntries agree):
+ * FIOS caches a file's blocks together with its mtime and drops them when a
+ * later stat reports another one ("mod date changed at read"). */
+static void write_stat(uint32_t sb, uint32_t mode, uint64_t size,
+                       uint64_t atime = 0, uint64_t mtime = 0, uint64_t ctime = 0)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write64(sb + 0x0C, 0);            /* atime */
-    vm_write64(sb + 0x14, 0);            /* mtime */
-    vm_write64(sb + 0x1C, 0);            /* ctime */
+    vm_write64(sb + 0x0C, atime);        /* atime */
+    vm_write64(sb + 0x14, mtime);        /* mtime */
+    vm_write64(sb + 0x1C, ctime);        /* ctime */
     vm_write64(sb + 0x24, size);         /* size */
     vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
@@ -613,6 +627,7 @@ static void cellFsStat(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
+    ps3_mods_resolve(gpath, hpath, sizeof hpath);   /* mods folder: the size the guest sees is the mod file's */
     fs_stat64_t st;
     if (FS_STAT64(hpath, &st) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
@@ -621,7 +636,8 @@ static void cellFsStat(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    if (sb) write_stat(sb, mode, (uint64_t)st.st_size, (uint64_t)st.st_atime,
+                       (uint64_t)st.st_mtime, (uint64_t)st.st_ctime);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
@@ -649,7 +665,10 @@ static void cellFsFstat(ppu_context* ctx)
           if (c > 0 && sz > c) {
               fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
               sz = c; } } }
-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+    fs_stat64_t st;
+    if (FS_FSTAT64(g_files[fd], &st) != 0) memset(&st, 0, sizeof st);
+    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz, (uint64_t)st.st_atime,
+                       (uint64_t)st.st_mtime, (uint64_t)st.st_ctime);
     if (getenv("PS3_FSLOG")) { static int _n=0; if (_n < 12 && ++_n) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
@@ -732,10 +751,8 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
         memset(vm_base + out, 0, 312);
         bool directory = (st.st_mode & S_IFDIR) != 0;
         write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
-                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size));
-        vm_write64(out + 0x0C, uint64_t(st.st_atime));
-        vm_write64(out + 0x14, uint64_t(st.st_mtime));
-        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
+                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size),
+                   uint64_t(st.st_atime), uint64_t(st.st_mtime), uint64_t(st.st_ctime));
         size_t length = strlen(entry->d_name);
         if (length > 255) length = 255;
         vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;

@@ -90,6 +90,10 @@ typedef struct {
     u8   press_square;
     u8   press_l1;
     u8   press_r1;
+    /* The buttons as the pad itself has them (before the DualSense fire-on-R2 swap): the port's settings
+     * page reads these. Only the SDL backend sets phys_valid. */
+    int  phys_valid;
+    u16  phys_buttons;
 } PadHostState;
 
 static int           s_pad_initialized = 0;
@@ -107,6 +111,9 @@ static cellPad_host_input_fn s_host_input_fn;
 static void* s_host_input_user;
 static volatile int s_host_keyboard_last;   /* of the keyboard and the pad, the one touched last */
 static volatile int s_host_pad0;            /* a real pad is on port 0 */
+/* g_cellPad_input_block: while non-zero port 0 reads as an untouched pad (nothing
+ * pressed, sticks centred) -- the port's overlay owns the input. */
+volatile int g_cellPad_input_block;
 
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user)
 {
@@ -281,6 +288,99 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     return (u8)val;
 }
 
+/* The DualSense output report below (SDL_GameControllerSendEffect with SDL's DS5EffectsState_t, the
+ * trigger blocks at bytes 10 and 21, "off" = 0x05) and the "fire on R2" swap are ported from RACiT
+ * (A Crack in Time port), MIT licence:
+ *   Copyright (c) 2026 HighDrexler
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+ *   associated documentation files (the "Software"), to deal in the Software without restriction,
+ *   including without limitation the rights to use, copy, modify, merge, publish, distribute,
+ *   sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions: The above copyright notice and this
+ *   permission notice shall be included in all copies or substantial portions of the Software.
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND (the full text is in the port's
+ *   THIRD_PARTY_NOTICES.md).
+ */
+/* DualSense extras (the port's tod_dualsense.cpp drives them through the
+ * cellPad_host_ds_* calls in cellPad.h; with no DualSense on a port every one
+ * of them does nothing).
+ *   - adaptive triggers: the port builds the 11-byte effect block of each
+ *     trigger, this file only carries it to the pad (SDL's DualSense output
+ *     report, the same one SDL's testcontroller uses): when it changes, and
+ *     again every PAD_DS_REFRESH_MS while an effect is on, in case the
+ *     controller dropped it (a reconnect, another program). Off at exit.
+ *   - "fire on R2": R1 and R2 trade places on DualSense ports, so the weapon
+ *     trigger is the one with the motor behind it.
+ *   - the R2 digital threshold: where a pull counts as the button, so the
+ *     game fires at the click of a weapon effect, not at the first touch. */
+#define PAD_DS_REFRESH_MS 1000
+static volatile int s_ds_swap;                      /* R1 <-> R2 on DualSense ports */
+static volatile int s_ds_r2_thr = 3000;             /* SDL axis units (0-32767) */
+static u8           s_ds_fx[PAD_MAX_HOST_PORTS][2][11];   /* requested: [0] R2, [1] L2; under s_sdl_lock */
+static u8           s_ds_fx_on[PAD_MAX_HOST_PORTS][2];    /* under s_sdl_lock */
+/* The pad thread's own */
+static u8           s_ds_sent[PAD_MAX_HOST_PORTS][2][11];
+static u8           s_ds_sent_on[PAD_MAX_HOST_PORTS][2];
+static int          s_ds_dirty[PAD_MAX_HOST_PORTS];
+static Uint32       s_ds_last[PAD_MAX_HOST_PORTS];
+
+static int pad_sdl_is_ds(int port)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    return s_sdl_controllers[port] && SDL_GameControllerGetType(s_sdl_controllers[port]) == SDL_CONTROLLER_TYPE_PS5;
+#else
+    (void)port; return 0;
+#endif
+}
+
+static volatile int s_ds_exiting;
+/* At exit: the triggers go slack (a closed game would otherwise leave the last weapon's resistance on the pad). */
+static void pad_ds_atexit(void)
+{
+    s_ds_exiting = 1;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        if (!pad_sdl_is_ds(i)) continue;
+        Uint8 st[47]; memset(st, 0, sizeof st);
+        st[0] = 0x04 | 0x08; st[10] = 0x05; st[21] = 0x05;
+        SDL_GameControllerSendEffect(s_sdl_controllers[i], st, sizeof st);
+    }
+}
+
+/* Pad thread, s_sdl_lock NOT held (the HID write can take a while). */
+static void pad_sdl_ds_apply(int force_off)
+{
+    static int registered;
+    if (s_ds_exiting) return;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        if (!pad_sdl_is_ds(i)) continue;
+        u8 want[2][11]; u8 on[2];
+        if (force_off) { memset(want, 0, sizeof want); memset(on, 0, sizeof on); }
+        else {
+            SDL_LockMutex(s_sdl_lock);
+            memcpy(want, s_ds_fx[i], sizeof want); memcpy(on, s_ds_fx_on[i], sizeof on);
+            SDL_UnlockMutex(s_sdl_lock);
+        }
+        const Uint32 now = SDL_GetTicks();
+        const int changed = s_ds_dirty[i] || memcmp(want, s_ds_sent[i], sizeof want) || memcmp(on, s_ds_sent_on[i], sizeof on);
+        const int refresh = (on[0] || on[1]) && now - s_ds_last[i] >= PAD_DS_REFRESH_MS;
+        if (!changed && !refresh) continue;
+        /* SDL's DS5EffectsState_t: enable bits 0x04 / 0x08 = right / left trigger effect,
+         * the blocks at 10 (right) and 21 (left); 0x05 = "off". */
+        Uint8 st[47]; memset(st, 0, sizeof st);
+        st[0] = 0x04 | 0x08;
+        for (int t = 0; t < 2; t++) {
+            Uint8* d = st + (t ? 21 : 10);
+            if (on[t]) memcpy(d, want[t], 11); else d[0] = 0x05;
+        }
+        if (!registered && (on[0] || on[1])) { registered = 1; atexit(pad_ds_atexit); }
+        if (SDL_GameControllerSendEffect(s_sdl_controllers[i], st, sizeof st) != 0) {
+            static int n; if (n++ < 5) { printf("[cellPad] DualSense trigger effect not sent: %s\n", SDL_GetError()); fflush(stdout); }
+        }
+        memcpy(s_ds_sent[i], want, sizeof want); memcpy(s_ds_sent_on[i], on, sizeof on);
+        s_ds_dirty[i] = 0; s_ds_last[i] = now;
+    }
+}
+
 /* The subsystem, started on the pad thread. */
 static int pad_sdl_start(void)
 {
@@ -377,6 +477,7 @@ static void pad_sdl_open_new(void)
         if (!gc) continue;
         s_sdl_controllers[slot] = gc;
         s_host_kind[slot] = pad_sdl_kind(gc);
+        s_ds_dirty[slot] = 1; memset(s_ds_sent[slot], 0, sizeof s_ds_sent[slot]); memset(s_ds_sent_on[slot], 0, sizeof s_ds_sent_on[slot]);
         const char* name = SDL_GameControllerName(gc);
         printf("[cellPad] port %d: %s\n", slot, name ? name : "controller");
         fflush(stdout);
@@ -430,9 +531,24 @@ static void pad_sdl_read(PadHostState* st)
         int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
         int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
         if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
-        if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
+        const u16 phys = (u16)(btns | (rt > 3000 ? CELL_PAD_CTRL_R2 : 0));
+        int swapped_r1 = -1;
+        if (pad_sdl_is_ds(i)) {
+            /* The pull that counts as the button: the port's threshold. "Fire on R2": the game's R1 is the
+             * trigger and its R2 the bumper. */
+            const int thr = s_ds_r2_thr;
+            if (s_ds_swap) {
+                const int rb = (btns & CELL_PAD_CTRL_R1) != 0;
+                btns &= (u16)~(CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_R2);
+                if (rt > thr) btns |= CELL_PAD_CTRL_R1;
+                if (rb) btns |= CELL_PAD_CTRL_R2;
+                swapped_r1 = rt;
+                rt = rb ? 32767 : 0;
+            } else if (rt > thr) btns |= CELL_PAD_CTRL_R2;
+        } else if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
         hs->buttons = btns;
+        hs->phys_buttons = phys; hs->phys_valid = 1;
 
         /* Analog sticks */
         hs->analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
@@ -455,6 +571,7 @@ static void pad_sdl_read(PadHostState* st)
         hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        if (swapped_r1 >= 0 && (btns & CELL_PAD_CTRL_R1)) hs->press_r1 = pad_sdl_trigger_to_u8(swapped_r1);   /* analog fire */
     }
 }
 
@@ -464,6 +581,12 @@ static void pad_sdl_read(PadHostState* st)
 static void pad_sdl_rumble_apply(void)
 {
     static Uint32 last[PAD_MAX_HOST_PORTS];
+    /* PAD_RUMBLE=0 turns the rumble off; so does a PAD_REPLAY run (a hidden bench
+     * would otherwise shake the controller on the desk), unless PAD_RUMBLE=1. */
+    static int s_rumble = -1;
+    if (s_rumble < 0) { const char* e = getenv("PAD_RUMBLE"); const char* r = getenv("PAD_REPLAY");
+        s_rumble = e ? (e[0] != '0') : !(r && *r); }
+    if (!s_rumble) return;
     const Uint32 now = SDL_GetTicks();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
@@ -499,9 +622,11 @@ static int SDLCALL pad_sdl_thread_main(void* arg)
             memcpy(s_sdl_state, st, sizeof st);
             pad_sdl_rumble_apply();
             SDL_UnlockMutex(s_sdl_lock);
+            pad_sdl_ds_apply(0);
         }
         SDL_Delay(PAD_POLL_INTERVAL_MS);
     }
+    pad_sdl_ds_apply(1);   /* the triggers go slack before the pad is closed */
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         if (s_sdl_controllers[i]) {
             SDL_GameControllerClose(s_sdl_controllers[i]);
@@ -518,6 +643,29 @@ static void pad_poll_sdl2(void)
     SDL_LockMutex(s_sdl_lock);
     memcpy(s_host_state, s_sdl_state, sizeof s_sdl_state);
     SDL_UnlockMutex(s_sdl_lock);
+}
+
+/* DualSense calls (cellPad.h). Any thread. */
+int cellPad_host_ds_present(u32 port)
+{
+    return port < PAD_MAX_HOST_PORTS && s_host_kind[port] == CELL_PAD_HOST_PS5;
+}
+void cellPad_host_ds_triggers(u32 port, const u8* r2, const u8* l2)
+{
+    if (port >= PAD_MAX_HOST_PORTS || !s_sdl_lock) return;
+    SDL_LockMutex(s_sdl_lock);
+    if (r2) memcpy(s_ds_fx[port][0], r2, 11);
+    if (l2) memcpy(s_ds_fx[port][1], l2, 11);
+    s_ds_fx_on[port][0] = r2 != NULL;
+    s_ds_fx_on[port][1] = l2 != NULL;
+    SDL_UnlockMutex(s_sdl_lock);
+}
+void cellPad_host_ds_fire_on_r2(int on) { s_ds_swap = on != 0; }
+void cellPad_host_ds_r2_threshold(int raw255)
+{
+    if (raw255 < 1) raw255 = 1;
+    if (raw255 > 250) raw255 = 250;
+    s_ds_r2_thr = raw255 * 32767 / 255;
 }
 
 static void pad_init_backend(void)
@@ -544,6 +692,14 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_SDL2 */
+
+#if !PAD_BACKEND_SDL2
+/* DualSense calls: only the SDL backend drives a DualSense. */
+int  cellPad_host_ds_present(u32 port) { (void)port; return 0; }
+void cellPad_host_ds_triggers(u32 port, const u8* r2, const u8* l2) { (void)port; (void)r2; (void)l2; }
+void cellPad_host_ds_fire_on_r2(int on) { (void)on; }
+void cellPad_host_ds_r2_threshold(int raw255) { (void)raw255; }
+#endif
 
 
 /* Keyboard fallback for port 0.
@@ -706,6 +862,14 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* Port 0's real-pad buttons as last read (before the keyboard is merged in):
+ * for host-side hotkeys on the controller (ToD's hold-START movie skip). */
+u32 cellPad_host_pad0_buttons(void)
+{
+    const PadHostState* hs = &s_host_state[0];
+    return hs->connected ? (hs->phys_valid ? hs->phys_buttons : hs->buttons) : 0;
+}
+
 /* The port's keyboard and mouse into port 0, beside whatever pad is there. */
 static void pad_poll_host_input(void)
 {
@@ -740,6 +904,11 @@ static void pad_poll_host_input(void)
     if (in.rx != 128 || in.ry != 128) { hs->analog_rx = in.rx; hs->analog_ry = in.ry; }
     if (in.l2 > hs->trigger_l2) hs->trigger_l2 = in.l2;
     if (in.r2 > hs->trigger_r2) hs->trigger_r2 = in.r2;
+    if (g_cellPad_input_block) {
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+        hs->trigger_l2 = hs->trigger_r2 = 0;
+    }
 }
 
 static void pad_poll_backend(void)
@@ -844,6 +1013,107 @@ void cellPad_poll(void)
  * written for host pointers and was never actually invoked until its NIDs
  * were fixed.) These used to be redeclared here with a 64-bit address
  * parameter, which conflicts with the header now that it is included. */
+
+/* PAD_RECORD=<file> / PAD_REPLAY=<file>: record the pad on port 0 and replay it later.
+ *
+ * File format (plain text, one line per CHANGE of pad state):
+ *     <call> <ms> <w2> <w3> ... <w19>      (call, ms decimal; wN = button[N] in hex)
+ * call = 1-based index of cellPadGetData calls on port 0 (one per game frame,
+ * give or take a drain call), ms = ms since the first such call. w2..w19 are
+ * DIGITAL1, DIGITAL2, the four analog axes (RX RY LX LY) and the 12 pressure
+ * words. Lines starting with '#' are comments. The first call always writes a
+ * line (the initial state).
+ *
+ * Replay overrides those 18 words with the recorded ones, keyed on PAD_REPLAY_CLOCK=
+ * frame (default, the call index; immune to a slow host) or ms. PAD_REPLAY_OFFSET_FRAMES
+ * / PAD_REPLAY_OFFSET_MS delay the start of the recording by that much on the matching
+ * clock. Before the start the pad is neutral; after the last line every button is
+ * released and "[pad-replay] end" is printed once. len and the fresh-packet logic are
+ * left alone. */
+#define PADREC_FIRST 2
+#define PADREC_N     18
+typedef struct { unsigned long long call, ms; u16 w[PADREC_N]; } padrec_ev;
+
+static void padrec_neutral(u16* w)
+{
+    memset(w, 0, PADREC_N * sizeof(u16));
+    w[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X - PADREC_FIRST] = 0x80;
+    w[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y - PADREC_FIRST] = 0x80;
+    w[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X  - PADREC_FIRST] = 0x80;
+    w[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y  - PADREC_FIRST] = 0x80;
+}
+
+static FILE* s_rec_f;
+static void padrec_close(void) { if (s_rec_f) { fflush(s_rec_f); fclose(s_rec_f); s_rec_f = NULL; } }
+
+static void padrec_frame(u16* button)   /* port 0, once per GetData call */
+{
+    static int mode = -1;               /* 0 off, bit0 record, bit1 replay */
+    static unsigned long long n = 0, t0 = 0, lastflush = 0;
+    static u16 last[PADREC_N]; static int have_last = 0;
+    static padrec_ev* ev = NULL; static size_t n_ev = 0, cur = 0;
+    static int by_ms = 0, ended = 0; static long long off = 0;
+    if (mode < 0) {
+        const char* r = getenv("PAD_RECORD"); const char* p = getenv("PAD_REPLAY");
+        mode = 0;
+        if (r && *r) {
+            s_rec_f = fopen(r, "a");
+            if (s_rec_f) { mode |= 1; atexit(padrec_close);
+                fprintf(s_rec_f, "# pad-record v1: call ms w2..w19 (hex) -- DIGITAL1 DIGITAL2 RX RY LX LY press[12]\n");
+                fprintf(stderr, "[pad-record] appending to %s\n", r); }
+            else fprintf(stderr, "[pad-record] cannot open %s\n", r);
+        }
+        if (p && *p) {
+            FILE* f = fopen(p, "r"); char line[512]; size_t cap = 0;
+            if (!f) fprintf(stderr, "[pad-replay] cannot open %s\n", p);
+            else {
+                while (fgets(line, sizeof line, f)) {
+                    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+                    padrec_ev e; char* q = line; char* nx;
+                    e.call = strtoull(q, &nx, 10); q = nx;
+                    e.ms   = strtoull(q, &nx, 10); q = nx;
+                    int i = 0;
+                    for (; i < PADREC_N; i++) { e.w[i] = (u16)strtoul(q, &nx, 16); if (nx == q) break; q = nx; }
+                    if (i < PADREC_N) continue;
+                    if (n_ev == cap) { cap = cap ? cap * 2 : 4096; ev = (padrec_ev*)realloc(ev, cap * sizeof *ev); if (!ev) break; }
+                    ev[n_ev++] = e;
+                }
+                fclose(f);
+                const char* c = getenv("PAD_REPLAY_CLOCK");
+                by_ms = (c && (c[0] == 'm' || c[0] == 'M')) ? 1 : 0;
+                const char* o = getenv(by_ms ? "PAD_REPLAY_OFFSET_MS" : "PAD_REPLAY_OFFSET_FRAMES");
+                if (o) off = strtoll(o, NULL, 0);
+                mode |= 2;
+                fprintf(stderr, "[pad-replay] %s: %zu states, clock=%s offset=%lld\n", p, n_ev, by_ms ? "ms" : "frame", off);
+            }
+        }
+    }
+    if (!mode) return;
+    n++;
+    unsigned long long now = GetTickCount64();
+    if (n == 1) t0 = now;
+    unsigned long long ms = now - t0;
+    if (mode & 2) {
+        long long clk = (by_ms ? (long long)ms : (long long)n) - off;
+        u16 w[PADREC_N]; padrec_neutral(w);
+        if (clk >= 0 && n_ev) {
+            while (cur < n_ev && (long long)(by_ms ? ev[cur].ms : ev[cur].call) <= clk) cur++;
+            if (cur > 0) memcpy(w, ev[cur - 1].w, sizeof w);
+            if (cur >= n_ev && !ended) { ended = 1; fprintf(stderr, "[pad-replay] end (call %llu, %llu ms)\n", n, ms); }
+        }
+        if (ended) padrec_neutral(w);   /* file is over: release everything */
+        memcpy(&button[PADREC_FIRST], w, sizeof w);
+    }
+    if (mode & 1) {
+        if (!have_last || memcmp(last, &button[PADREC_FIRST], sizeof last)) {
+            memcpy(last, &button[PADREC_FIRST], sizeof last); have_last = 1;
+            fprintf(s_rec_f, "%llu %llu", n, ms);
+            for (int i = 0; i < PADREC_N; i++) fprintf(s_rec_f, " %04X", last[i]);
+            fputc('\n', s_rec_f);
+        }
+        if (ms - lastflush >= 1000) { lastflush = ms; fflush(s_rec_f); }
+    }
+}
 
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
@@ -1204,6 +1474,23 @@ emit:
         if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;
+        }
+    }
+    { /* PAD_RECORD / PAD_REPLAY (see padrec_frame) */
+        static int pr = -1;
+        if (pr < 0) pr = (getenv("PAD_RECORD") || getenv("PAD_REPLAY")) ? 1 : 0;
+        if (pr && port_no == 0) padrec_frame(data->button);
+    }
+    { /* PAD_TRACE=1: log every change of the digital words handed to the guest (port 0). */
+        static int tr = -1; static u16 l0 = 0xFFFF, l1 = 0xFFFF; static unsigned long long n = 0;
+        if (tr < 0) tr = getenv("PAD_TRACE") ? 1 : 0;
+        if (tr && port_no == 0) {
+            n++;
+            if (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] != l0 || data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] != l1) {
+                l0 = data->button[CELL_PAD_BTN_OFFSET_DIGITAL1]; l1 = data->button[CELL_PAD_BTN_OFFSET_DIGITAL2];
+                fprintf(stderr, "[padtrace] call#%llu t=%llu len=%d d1=%04X d2=%04X\n", n,
+                        (unsigned long long)GetTickCount64(), (int)data->len, l0, l1);
+            }
         }
     }
     {

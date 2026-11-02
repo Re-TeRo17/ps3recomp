@@ -517,28 +517,35 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
  * Returns the callback's cbResult->result (0 when there is no guest caller to
  * run, which both callers treat as success). */
 static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
-                                  uint32_t func_opd, uint32_t is_new_data)
+                                  uint32_t func_opd, uint32_t is_new_data,
+                                  uint32_t* set_param_ea)
 {
     const char* dir = dir_ea ? (const char*)(vm_base + dir_ea) : "";
-    printf("[cellGame] %s(version=%u dir='%s' funcStat=0x%08X)\n",
-           tag, version, dir, func_opd);
+    printf("[cellGame] %s(version=%u dir='%s' funcStat=0x%08X isNewData=%u)\n",
+           tag, version, dir, func_opd, is_new_data);
+    if (set_param_ea) *set_param_ea = 0;
 
     if (!g_ps3_guest_caller)
         return CELL_GAMEDATA_CBRESULT_OK;
 
-    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
+    /* Guest scratch for the 3 callback structs. CellGameDataStatGet is 0x144C bytes
+     * (getParam alone is 0xBA0 and sits at 0x860, sizeKB/sysSizeKB follow it at
+     * 0x1400/0x1404 -- the offsets ToD's own funcStat reads), so StatSet must sit
+     * PAST that. It used to start at get+0xC00, i.e. inside getParam: the
+     * callback's writes to its StatSet landed in the title-language slots, and
+     * the bytes past the memset (including sizeKB) were never cleared. */
     uint32_t cb  = GAMEDATA_CB_BASE;
     uint32_t get = cb + 0x20;
-    uint32_t set = get + 0xC00;
+    uint32_t set = get + 0x1500;
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
     vm_write32(get + 0x000, (u32)content_free_kb());
-    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
+    vm_write32(get + 0x004, is_new_data);                            /* CELL_GAMEDATA_ISNEWDATA_YES=1 / NO=0 */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
-    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
-    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
+    vm_write32(get + 0x1400, 0xFFFFFFFFu);                 /* sizeKB = NOTCALC (-1) */
+    vm_write32(get + 0x1404, 0);                           /* sysSizeKB */
     /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
     uint32_t gp = get + 0x860;
     snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
@@ -551,8 +558,68 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     g_ps3_guest_caller(func_opd, cb, get, set, 0, 0, 0, 0, 0);
 
     s32 result = (s32)vm_read32(cb + 0x000);
-    printf("[cellGame] %s: funcStat returned result=%d\n", tag, result);
+    if (set_param_ea) *set_param_ea = vm_read32(set + 0x000);   /* CellGameDataStatSet.setParam */
+    printf("[cellGame] %s: funcStat returned result=%d setParam=0x%08X\n", tag, result,
+           set_param_ea ? *set_param_ea : 0);
     return result;
+}
+
+/* Host path of a game-data directory's PARAM.SFO: <content root>/<dir>/PARAM.SFO. */
+static void gamedata_sfo_path(char* out, size_t n, const char* dir)
+{
+    snprintf(out, n, "%s/%s/PARAM.SFO", content_root(), dir);
+}
+
+static int file_exists(const char* path)
+{
+    HOST_STAT_T st;
+    return HOST_STAT(path, &st) == 0;
+}
+
+/* Minimal PARAM.SFO writer for a created game-data directory (CATEGORY "GD").
+ * Little-endian PSF: header, then 16-byte index entries sorted by key, the key
+ * table and the data table. Keys are written alphabetically, which is the order
+ * the format requires. */
+static void gamedata_write_sfo(const char* path, const char* title_id, const char* title,
+                               const char* version, u32 parental_level)
+{
+    struct ent { const char* key; u16 fmt; u32 max; const char* str; u32 ival; };
+    struct ent e[5] = {
+        { "CATEGORY",       0x0204, 4,   "GD",     0 },
+        { "PARENTAL_LEVEL", 0x0404, 4,   NULL,     parental_level },
+        { "TITLE",          0x0204, 128, title,    0 },
+        { "TITLE_ID",       0x0204, 16,  title_id, 0 },
+        { "VERSION",        0x0204, 8,   version,  0 },
+    };
+    unsigned char buf[1024];
+    memset(buf, 0, sizeof buf);
+    const u32 n = 5, key_tab = 0x14 + n * 0x10;
+    u32 key_len = 0, data_len = 0;
+    for (u32 i = 0; i < n; i++) { key_len += (u32)strlen(e[i].key) + 1; data_len += e[i].max; }
+    const u32 data_tab = (key_tab + key_len + 3u) & ~3u;
+    if (data_tab + data_len > sizeof buf) return;
+#define W16(o, v) do { buf[o] = (unsigned char)(v); buf[(o)+1] = (unsigned char)((v) >> 8); } while (0)
+#define W32(o, v) do { W16(o, (v) & 0xFFFF); W16((o)+2, ((v) >> 16) & 0xFFFF); } while (0)
+    buf[1] = 'P'; buf[2] = 'S'; buf[3] = 'F';
+    W32(0x04, 0x0101u); W32(0x08, key_tab); W32(0x0C, data_tab); W32(0x10, n);
+    u32 ko = 0, doff = 0;
+    for (u32 i = 0; i < n; i++) {
+        u32 p = 0x14 + i * 0x10;
+        u32 len = e[i].fmt == 0x0404 ? 4u : (u32)strlen(e[i].str) + 1u;
+        if (len > e[i].max) len = e[i].max;
+        W16(p + 0, ko); W16(p + 2, e[i].fmt); W32(p + 4, len); W32(p + 8, e[i].max); W32(p + 0xC, doff);
+        memcpy(buf + key_tab + ko, e[i].key, strlen(e[i].key) + 1);
+        if (e[i].fmt == 0x0404) { W32(data_tab + doff, e[i].ival); }
+        else { memcpy(buf + data_tab + doff, e[i].str, len - 1); }
+        ko += (u32)strlen(e[i].key) + 1;
+        doff += e[i].max;
+    }
+#undef W16
+#undef W32
+    FILE* fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(buf, 1, data_tab + data_len, fp);
+    fclose(fp);
 }
 
 s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
@@ -565,13 +632,48 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     if (version != 0 || !dir_ea || !func_opd)
         return CELL_GAME_ERROR_PARAM;
 
-    /* We report existing data (isNewData=0) + ample space; DeS's callback
-     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+    /* isNewData must tell the truth. Like firmware (and RPCS3) it is YES until the
+     * game-data directory has a PARAM.SFO. It used to be hardcoded NO ("data
+     * exists"), which is a lie on a first boot: Ratchet & Clank ToD's funcStat only
+     * sets its "game data is new" flag when told so, the title's later
+     * DataCheckCreate2 -- the one whose callback fills StatSet.setParam so the
+     * directory gets created -- then never runs, and the title goes on to use a
+     * game-data directory that was never made. It reports that as
+     * GEN_SYSTEM_HDISK_CORRUPTDETECT: "Game data has become corrupted. Please
+     * delete game data."  (Same family as the LBP note at the top of this file.) */
+    const char* dir = (const char*)(vm_base + dir_ea);
+    char sfo_path[CELL_GAME_PATH_MAX];
+    gamedata_sfo_path(sfo_path, sizeof sfo_path, dir);
+    const u32 is_new = file_exists(sfo_path) ? 0u : 1u;
+
+    uint32_t set_param = 0;
     s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
-                                        func_opd, 0);
+                                        func_opd, is_new, &set_param);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
-    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+    if (result == CELL_GAMEDATA_CBRESULT_OK_CANCEL)
+        return CELL_OK;                 /* check only: create nothing */
+
+    /* CBRESULT_OK: the game confirms. New data needs StatSet.setParam (that is what
+     * is written to PARAM.SFO); without it firmware answers ERROR_PARAM. */
+    if (is_new && !set_param)
+        return CELL_GAME_ERROR_PARAM;
+    if (is_new) {
+        char path[CELL_GAME_PATH_MAX];
+        snprintf(path, sizeof path, "%s/%s/USRDIR", content_root(), dir);
+        ensure_dirs(path);
+    }
+    if (set_param) {
+        /* CellGameDataSystemFileParam: title@0 titleId@0xA80 dataVersion@0xA8C parentalLevel@0xA94 */
+        char title[129], tid[11], ver[7];
+        memcpy(title, vm_base + set_param + 0x000, 128); title[128] = 0;
+        memcpy(tid,   vm_base + set_param + 0xA80, 10);  tid[10] = 0;
+        memcpy(ver,   vm_base + set_param + 0xA8C, 6);   ver[6] = 0;
+        const u32 parental = vm_read32(set_param + 0xA94);
+        gamedata_write_sfo(sfo_path, tid[0] ? tid : dir, title, ver, parental);
+        printf("[cellGame] DataCheckCreate2: wrote %s (title='%s' titleId='%s' version='%s')\n",
+               sfo_path, title, tid, ver);
+    }
     return CELL_OK;
 }
 
@@ -614,7 +716,7 @@ s32 cellHddGameCheck(u32 version, const char* dirName, u32 errDialog,
         return CELL_HDDGAME_ERROR_PARAM;
 
     s32 result = gamedata_stat_callback("HddGameCheck", version, dir_ea,
-                                        func_opd, CELL_HDDGAME_ISNEWDATA_EXIST);
+                                        func_opd, CELL_HDDGAME_ISNEWDATA_EXIST, NULL);
     if (result < 0)
         return CELL_HDDGAME_ERROR_CBRESULT;
     return CELL_HDDGAME_RET_OK;

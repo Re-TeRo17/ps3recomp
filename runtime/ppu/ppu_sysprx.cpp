@@ -67,8 +67,10 @@ static void sys_initialize_tls(ppu_context* ctx)
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
  * and every frontend animation timed off it crawled. */
+extern "C" { extern volatile long long g_dt_cnt[4]; extern int g_dt_on; }
 static void sys_time_get_system_time(ppu_context* ctx)
 {
+    if (g_dt_on > 0) g_dt_cnt[0]++;
 #ifdef _WIN32
     static LARGE_INTEGER s_freq, s_base;
     if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
@@ -163,6 +165,7 @@ static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us;
     volatile long state;   /* Windows fast path: 0 free, 1 held, 2 held with waiters */
+    volatile long pending; /* lwcond waiters signalled but not yet re-locked (LV2 hands them the mutex at signal time) */
     } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
@@ -306,6 +309,17 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
+        { /* Queue behind a signalled lwcond waiter that has not re-locked yet. */
+          struct LwmSlot* psl = lwm_find(lwm);
+          if (psl && psl->pending > 0) {
+              const ULONGLONG pd = timeout_us ? GetTickCount64() + (timeout_us + 999) / 1000 : 0;
+              while (psl->pending > 0) {
+                  if (pd && GetTickCount64() >= pd) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; }
+                  SwitchToThread();
+              }
+              if (pd) { const ULONGLONG now = GetTickCount64();   /* the lock wait gets only what is left */
+                        timeout_us = (pd > now ? pd - now : 1) * 1000; }
+          } }
         if (!lwm_lock_try(lwm, s)) {
             /* Contended: log who we're stuck behind (owner stamped at acquire),
              * then block. Bounded diagnostics for park hunts; uncapped while the
@@ -353,7 +367,9 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (!lwm_lock_try(lwm, s)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        { struct LwmSlot* psl = lwm_find(lwm);
+          if (psl && psl->pending > 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } }
+        if (!lwm_lock_try(lwm, s)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // EBUSY (was 0x8001000B = ETIMEDOUT)
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
@@ -450,11 +466,26 @@ static std::atomic<uint32_t>* lwc_gen(uint32_t lwcond)
 static std::mutex              s_lwc_mu[64];
 static std::condition_variable s_lwc_cv[64];
 #endif
+static std::atomic<int> s_lwc_lk[LWC_TAB];       /* tiny spinlock per lwcond: signal vs waiter exit */
+static std::atomic<int> s_lwc_nwait[LWC_TAB];    /* waiters currently parked in sys_lwcond_wait */
+static void lwc_lk(std::atomic<int>& l) { while (l.exchange(1, std::memory_order_acquire)) SwitchToThread(); }
+static void lwc_ul(std::atomic<int>& l) { l.store(0, std::memory_order_release); }
 static void lwc_wake(uint32_t lwcond)
 {
     std::atomic<uint32_t>* g = lwc_gen(lwcond);
     if (!g) return;
-    g->fetch_add(1, std::memory_order_release);
+    {   /* Every parked waiter wakes on a generation change; each is now owed the
+         * mutex (LV2 gives it to them at signal time). Count them under the lock
+         * so a waiter leaving concurrently is either counted AND decrements, or
+         * not counted AND does not. */
+        const size_t i = (size_t)(g - s_lwc_gen);
+        lwc_lk(s_lwc_lk[i]);
+        g->fetch_add(1, std::memory_order_release);
+        int n = s_lwc_nwait[i].exchange(0);   /* signalled from here on: counted once, however many signals follow */
+        if (n > 0) { struct LwmSlot* sl = lwm_find(vm_read32(lwcond + 0x00));
+                     if (sl) _InterlockedExchangeAdd(&sl->pending, n); }
+        lwc_ul(s_lwc_lk[i]);
+    }
 #ifdef _WIN32
     WakeByAddressAll((PVOID)g);
 #else
@@ -497,7 +528,9 @@ static void sys_lwcond_wait(ppu_context* ctx)
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         std::atomic<uint32_t>* g = lwc_sleep_mode() ? nullptr : lwc_gen(lwcond);
-        const uint32_t seen = g ? g->load(std::memory_order_acquire) : 0;   /* before the unlock: no lost signal */
+        const size_t gi = g ? (size_t)(g - s_lwc_gen) : 0;
+        uint32_t seen = 0;
+        if (g) { lwc_lk(s_lwc_lk[gi]); s_lwc_nwait[gi]++; seen = g->load(std::memory_order_acquire); lwc_ul(s_lwc_lk[gi]); }  /* before the unlock: no lost signal */
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
@@ -510,7 +543,10 @@ static void sys_lwcond_wait(ppu_context* ctx)
         } else {
             Sleep(1);
         }
-        lwm_lock_wait(lwmutex, s, INFINITE);
+        bool signalled = false;
+        if (g) { lwc_lk(s_lwc_lk[gi]); signalled = g->load(std::memory_order_acquire) != seen; if (!signalled) s_lwc_nwait[gi]--; lwc_ul(s_lwc_lk[gi]); }
+        lwm_lock_wait(lwmutex, s, INFINITE);   /* bypasses the pending check: we are the owed waiter */
+        if (signalled) { struct LwmSlot* sl = lwm_find(lwmutex); if (sl) _InterlockedDecrement(&sl->pending); }
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
@@ -674,6 +710,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
  * _sys_net_errno_loc returns a POINTER the game dereferences. */
 #define SYS_NET_EWOULDBLOCK_V 35
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+extern "C" void spurs_register_ctx(void);       /* libs/spurs/cellSpurs.c */
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 static uint32_t g_net_errno_ea = 0;
@@ -1009,6 +1046,7 @@ extern "C" void ppu_sysprx_register(void)
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();
+    spurs_register_ctx();   /* _cellSpursWorkloadAttributeInitialize: maxContention is a stack arg */
     /* cellSaveDataUserAutoLoad/UserAutoSave take nine arguments; the ninth
      * (userdata) is on the guest stack, so they need the full context too.
      * Registered here so no project has to remember the call. */

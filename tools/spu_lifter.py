@@ -498,6 +498,262 @@ def compute_link_returns(insns, bounds) -> set:
 # set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
+
+# ---------------------------------------------------------------------------
+# Register promotion (--promote / SPU_LIFT_PROMOTE=1)
+#
+# The straightforward lift keeps every SPU register in ctx->gpr[] (a store per
+# result, a load per operand, and -- because ctx->ls is a plain byte pointer --
+# every LS access forces the compiler to assume gpr[] changed). The promoted
+# form rewrites the already-lifted statement list of one C function so the
+# registers it touches are LOCAL variables (rN):
+#   * entry:   load the registers read before written (live-in);
+#   * "sync" points (anything that is not plain arithmetic / LS access / goto:
+#     channel ops, calls, stop, bisled ...): store every possibly-modified
+#     register back to ctx->gpr[] first (forward may-dirty analysis), run the
+#     statement unchanged on ctx->gpr[], then reload the registers that are live
+#     afterwards (backward liveness);
+#   * exits (return / trampoline tail / SPU_RET): flush the dirty set, then exit.
+# Liveness counts a flush as a use of the dirty registers, so a local that is
+# stored is always a valid value on every path (no stale store).
+# ---------------------------------------------------------------------------
+_GPR_RE = re.compile(r'ctx->gpr\[(\d+)\]')
+_LBL_RE = r'(loc_[0-9A-Fa-f]+)'
+
+
+def _mask_of(text):
+    m = 0
+    for g in _GPR_RE.findall(text):
+        m |= 1 << int(g)
+    return m
+
+
+def _bits(mask):
+    i = 0
+    while mask:
+        if mask & 1:
+            yield i
+        mask >>= 1
+        i += 1
+
+
+def _only_gpr_ctx(text):
+    """True if `ctx` appears only as ctx->gpr[n] / spu_ls_{read,write}128(ctx, ."""
+    t = _GPR_RE.sub('R', text)
+    t = t.replace('spu_ls_read128(ctx,', 'LSR(').replace('spu_ls_write128(ctx,', 'LSW(')
+    return 'ctx' not in t and 'return' not in t and 'goto' not in t and '{' not in t
+
+
+_TE_RES = [
+    re.compile(r'^\{ ctx->pc = [^;]+; g_spu_trampoline_fn = [A-Za-z0-9_]+; return; \}$'),
+    re.compile(r'^(ctx->int_enable = [01]; )?ctx->pc = (ctx->gpr\[\d+\]\._u32\[0\]|ctx->srr0); '
+               r'g_spu_trampoline_fn = spu_indirect_branch; return;$'),
+    re.compile(r'^(ctx->int_enable = [01]; )?SPU_RET(_REG)?\(ctx(, \d+)?\);$'),
+    re.compile(r'^ctx->stop_code = 0x[0-9A-Fa-f]+u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; '
+               r'spu_stop\(ctx\); return;$'),
+    re.compile(r'^ctx->status = SPU_STATUS_STOPPED_BY_HALT; return;$'),
+    re.compile(r'^spu_halt\(ctx\); return;$'),
+]
+_CE_RE = re.compile(r'^if \((.*?)\) \{ (.*) \}$')
+
+
+def _classify(t):
+    """-> (kind, ...) for one lifted statement (already stripped)."""
+    if t.startswith('/*') and t.endswith('*/;') and t.count('/*') == 1:
+        return ('nop',)
+    if t == 'spu_arch_fence();':
+        return ('alu', 0, 0)
+    m = re.fullmatch(r'goto ' + _LBL_RE + ';', t)
+    if m:
+        return ('goto', m.group(1))
+    m = re.fullmatch(r'if \((.*)\) goto ' + _LBL_RE + ';', t)
+    if m and _only_gpr_ctx(m.group(1)):
+        return ('cgoto', m.group(2), _mask_of(m.group(1)))
+    m = re.match(r'^ctx->gpr\[(\d+)\] = (.*);$', t)
+    if m and _only_gpr_ctx(m.group(2)):
+        return ('alu', 1 << int(m.group(1)), _mask_of(m.group(2)))
+    if t.startswith('spu_ls_write128(ctx,') and t.endswith(');') and _only_gpr_ctx(t):
+        return ('alu', 0, _mask_of(t))
+    for r in _TE_RES:
+        if r.match(t):
+            return ('texit',)
+    m = _CE_RE.match(t)
+    if m and _only_gpr_ctx(m.group(1)):
+        body = m.group(2)
+        if (('return;' in body or 'SPU_RET' in body) and
+                (body.startswith('ctx->pc =') or body.startswith('ctx->int_enable') or
+                 body.startswith('SPU_RET') or body.startswith('extern void spu_halt'))):
+            return ('cexit', _mask_of(m.group(1)))
+    return ('sync',)
+
+
+def promote_body(lines, rename, ref_name=None):
+    """lines: body_lines of one lifted function. Returns the promoted body_lines
+    (list of strings) or None when the function should stay as is. A function
+    without any sync statement (pure arithmetic / LS / branches, no calls or
+    channel ops) gets a prologue that, under SPU_PROMOTE_CHECK, runs the plain
+    twin `ref_name` and itself on copies of the context and compares the results."""
+    items = []          # dicts: k kind, t text, d defs, u uses, l label target
+    labels = {}
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        if t.endswith(':') and t.startswith('loc_'):
+            labels[t[:-1]] = len(items)
+            continue
+        c = _classify(t)
+        if c[0] == 'nop':
+            continue
+        it = {'k': c[0], 't': t, 'd': 0, 'u': 0, 'l': None}
+        if c[0] == 'alu':
+            it['d'], it['u'] = c[1], c[2]
+        elif c[0] == 'cgoto':
+            it['l'], it['u'] = c[1], c[2]
+        elif c[0] == 'goto':
+            it['l'] = c[1]
+        elif c[0] == 'cexit':
+            it['u'] = c[1]
+        items.append(it)
+    n = len(items)
+    if n == 0:
+        return None
+    for it in items:
+        if it['l'] is not None and it['l'] not in labels:
+            return None                      # unknown label: leave function alone
+    for k, v in list(labels.items()):
+        if v >= n:
+            labels[k] = n                    # label at the very end
+
+    def succs(i):
+        it = items[i]
+        k = it['k']
+        if k == 'goto':
+            return [labels[it['l']]]
+        if k == 'texit':
+            return []
+        if k == 'cgoto':
+            return [i + 1, labels[it['l']]]
+        return [i + 1]
+
+    S = [succs(i) for i in range(n)]
+    # forward may-dirty
+    Din = [0] * (n + 1)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            it = items[i]
+            if it['k'] == 'sync':
+                out = 0
+            elif it['k'] == 'alu':
+                out = Din[i] | it['d']
+            else:
+                out = Din[i]
+            for j in S[i]:
+                nv = Din[j] | out
+                if nv != Din[j]:
+                    Din[j] = nv
+                    changed = True
+    # backward liveness (a flush counts as a use of the dirty registers)
+    Lin = [0] * (n + 1)
+    Lin[n] = Din[n]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            it = items[i]
+            k = it['k']
+            lo = 0
+            for j in S[i]:
+                lo |= Lin[j]
+            if k == 'alu':
+                li = it['u'] | (lo & ~it['d'])
+            elif k == 'cgoto':
+                li = it['u'] | lo
+            elif k == 'goto':
+                li = lo
+            elif k == 'cexit':
+                li = it['u'] | Din[i] | lo
+            else:  # texit, sync
+                li = Din[i]
+            if li != Lin[i]:
+                Lin[i] = li
+                changed = True
+    used = Lin[0]
+    for i, it in enumerate(items):
+        used |= it['d'] | it['u'] | Din[i]
+        if it['k'] == 'sync':
+            for j in S[i]:
+                used |= Lin[j]
+    used |= Din[n]
+
+    def flush(mask, ind='    '):
+        return [f"{ind}ctx->gpr[{g}] = r{g};" for g in _bits(mask)]
+
+    def loc(text):
+        text = _GPR_RE.sub(lambda m: 'r' + m.group(1), text)
+        text = text.replace('spu_ls_read128(ctx, ', 'spu_ls_rd(ls, ')
+        text = text.replace('spu_ls_write128(ctx, ', 'spu_ls_wr(ls, ')
+        return text
+
+    def ren(text):
+        return rename(text) if rename else text
+
+    out = []
+    if ref_name and not any(it['k'] == 'sync' for it in items):
+        out.append(f'    if (__builtin_expect(g_spu_pcheck, 0) && spu_pcheck_enter(ctx, {ref_name}, {ref_name}_p)) return;')
+    out.append('    uint8_t* const ls = ctx->ls; (void)ls;')
+    if used:
+        out.append('    u128 ' + ', '.join(f'r{g}' for g in _bits(used)) + ';')
+    for g in _bits(Lin[0]):
+        out.append(f'    r{g} = ctx->gpr[{g}];')
+    lab_at = {}
+    for k, v in labels.items():
+        lab_at.setdefault(v, []).append(k)
+    for i, it in enumerate(items):
+        for lb in lab_at.get(i, []):
+            out.append(lb + ':')
+        k, t = it['k'], it['t']
+        if k == 'alu':
+            out.append('    ' + loc(t))
+        elif k == 'goto':
+            tgt = labels[it['l']]
+            bar = 'SPU_LOOP_BARRIER(); ' if tgt <= i else ''
+            out.append(f"    {bar}{t}")
+        elif k == 'cgoto':
+            tgt = labels[it['l']]
+            m = re.fullmatch(r'if \((.*)\) goto ' + _LBL_RE + ';', t)
+            cond = loc(m.group(1))
+            if tgt <= i:
+                out.append(f"    if ({cond}) {{ SPU_LOOP_BARRIER(); goto {it['l']}; }}")
+            else:
+                out.append(f"    if ({cond}) goto {it['l']};")
+        elif k == 'cexit':
+            m = _CE_RE.match(t)
+            out.append(f"    if ({loc(m.group(1))}) {{")
+            out.extend(flush(Din[i], '        '))
+            out.append('        ' + ren(m.group(2)))
+            out.append('    }')
+        elif k == 'texit':
+            out.append('    {')
+            out.extend(flush(Din[i], '        '))
+            out.append('        ' + ren(t))
+            out.append('    }')
+        else:  # sync
+            out.extend(flush(Din[i]))
+            out.append('    ' + ren(t))
+            lo = 0
+            for j in S[i]:
+                lo |= Lin[j]
+            for g in _bits(lo):
+                out.append(f'    r{g} = ctx->gpr[{g}];')
+    for lb in lab_at.get(n, []):
+        out.append(lb + ':')
+    out.extend(flush(Din[n]))
+    return out
+
+
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -529,6 +785,11 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # --pic-reloc: lqr/stqr addresses carry the run-time delta g_spu_reloc.
+        self.pic_reloc = False
+        # --promote: also emit register-promoted twins (<name>_p) of every function
+        self.promote = False
+        self.pfunctions = []
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -594,6 +855,15 @@ class SPULifter:
                 ]
 
         self.functions.append(func)
+        if self.promote and not self.trace:
+            pre = re.escape(self.prefix)
+            rx = re.compile(r'(' + pre + r'spu_func_[0-9A-Fa-f]{8})\b')
+            pb = promote_body(func.body_lines, lambda t: rx.sub(r'\1_p', t), func.name)
+            if pb is not None:
+                pf = LiftedFunction(name=func.name + "_p", start_addr=func.start_addr,
+                                    end_addr=func.end_addr)
+                pf.body_lines = pb
+                self.pfunctions.append(pf)
         return func
 
     @staticmethod
@@ -855,6 +1125,13 @@ class SPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 return f"spu_ls_write128(ctx, {g(base)}._u32[0] + {disp}, {g(rt())});"
+        # --pic-reloc: lqr/stqr are pc-relative, the lifter folds them to the
+        # absolute LS address of the lift base; add the run-time delta of the
+        # instance actually executing (g_spu_reloc, set by the dynovl reloc hook).
+        if mn == "lqr" and self.pic_reloc:
+            return f"{g(rt())} = spu_ls_read128(ctx, (uint32_t)({_imm(ops[1])}) + g_spu_reloc);"
+        if mn == "stqr" and self.pic_reloc:
+            return f"spu_ls_write128(ctx, (uint32_t)({_imm(ops[1])}) + g_spu_reloc, {g(rt())});"
         if mn in ("lqa", "lqr"):
             return f"{g(rt())} = spu_ls_read128(ctx, {_imm(ops[1])});"
         if mn in ("stqa", "stqr"):
@@ -1094,6 +1371,23 @@ class SPULifter:
                 lines.append("}")
             lines.append("")
 
+        pdefs = {f.start_addr for f in self.pfunctions}
+        if self.promote:
+            lines.append("/* ---- register-promoted twins (--promote): locals instead of ctx->gpr[] ---- */")
+            for t in sorted(pdefs | (self.call_targets | self.branch_targets)):
+                lines.append(f"void {self.prefix}spu_func_{t:08X}_p(spu_context* ctx);")
+            for f in self.pfunctions:
+                lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
+                for b in f.body_lines:
+                    lines.append(b)
+                lines.append("}")
+                lines.append("")
+            # targets the promoter did not cover (or stubs): the _p name forwards to the plain one
+            for t in sorted((self.call_targets | self.branch_targets | defined) - pdefs):
+                lines.append(f"void {self.prefix}spu_func_{t:08X}_p(spu_context* ctx) "
+                             f"{{ {self.prefix}spu_func_{t:08X}(ctx); }}")
+            lines.append("")
+
         lines.append("/* Function table */")
         lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
         lines.append("static const spu_func_entry spu_function_table[] = {")
@@ -1102,8 +1396,23 @@ class SPULifter:
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
+        if self.promote:
+            lines.append("static const spu_func_entry spu_function_table_p[] = {")
+            for f in self.pfunctions:
+                lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
+            for f in self.functions:
+                if f.start_addr not in pdefs:
+                    lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
+            lines.append("    { 0, NULL, NULL }")
+            lines.append("};")
+            lines.append("int spu_promote_enabled(void);")
+            lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
-        lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+        if self.promote:
+            lines.append("    const spu_func_entry* tab = spu_promote_enabled() ? spu_function_table_p : spu_function_table;")
+            lines.append("    for (const spu_func_entry* e = tab; e->func; ++e)")
+        else:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
         lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
         lines.append("")
@@ -1185,7 +1494,23 @@ def main() -> None:
                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
+    p.add_argument("--pic-reloc", action="store_true",
+                   help="Position-independent blob lifted once at a canonical base "
+                        "but run at other LS addresses: lqr/stqr emit their "
+                        "address as `imm + g_spu_reloc` (thread-local delta, "
+                        "spu_helpers.h). Branches are relative/internal already; "
+                        "lqa/stqa/bra/brasl stay absolute, so the caller "
+                        "(tools/lift_dynovl.py) must check the blob has none.")
+    p.add_argument("--promote", action="store_true",
+                   help="Also emit register-promoted twins (<fn>_p, ctx->gpr[] registers held "
+                        "in C locals, LS access without probes) and a second function table; "
+                        "spu_recomp_register picks it when spu_promote_enabled(). Env "
+                        "SPU_LIFT_PROMOTE=1 does the same (for callers that build the command).")
     args = p.parse_args()
+    if os.environ.get("SPU_LIFT_PROMOTE") == "1":
+        args.promote = True
+    if os.environ.get("SPU_LIFT_MERGE") == "1":      # same for --merge-chunks (callers that build the command)
+        args.merge_chunks = True
 
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text
@@ -1299,6 +1624,8 @@ def main() -> None:
     insns = disassemble_spu(data, base)
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter.pic_reloc = args.pic_reloc
+    lifter.promote = args.promote
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

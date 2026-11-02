@@ -73,6 +73,10 @@ extern void spu_halt(spu_context*);
 /* spu_hop (spu_context.h): the slow path is taken when any per-hop debug
  * switch is set, so each of them still behaves as it always has. */
 int g_spu_hop_slow = -1;
+extern int g_spu_fext;
+extern int g_spu_drain_lean;
+extern int g_spu_tailp_on;
+extern uint32_t g_spu_depth_arm;
 void spu_hop_init(void)
 {
     static const char* const sw[] = { "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE",
@@ -80,6 +84,15 @@ void spu_hop_init(void)
     int slow = 0;
     for (unsigned i = 0; i < sizeof sw / sizeof sw[0]; i++) if (getenv(sw[i])) slow = 1;
     g_spu_hop_slow = slow;
+    { const char* e = getenv("SPU_DRAIN_FAST"); g_spu_drain_fast = !(e && e[0] == '0'); }
+    { const char* e = getenv("SPU_DRAIN_LEAN"); g_spu_drain_lean = (e && e[0] == 0x31); }
+    { const char* e = getenv("SPU_HOST_DEPTH_MAX"); uint32_t mx = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+      g_spu_depth_arm = mx > 256u ? mx - 256u : 0u; }
+    { const char* e = getenv("SPU_FEXT"); g_spu_fext = !(e && e[0] == '0'); }
+    { const char* e = getenv("SPU_TAIL"); g_spu_tail_on = (e && e[0] == '1');   /* opt-in: measured +8% per wid7 run (Win64 callee-saved xmm6-15 epilogue), see RIPARTENZA */
+      if (getenv("SPU_PROMOTE_CHECK") || getenv("SPU_JOBTRACE") || getenv("SPU_JOBEXEC")) g_spu_tail_on = 0; }
+    { const char* e = getenv("SPU_TAILP"); g_spu_tailp_on = !(e && e[0] == '0');
+      if (getenv("SPU_PROMOTE_CHECK") || getenv("SPU_JOBTRACE") || getenv("SPU_JOBEXEC")) g_spu_tailp_on = 0; }
 }
 /* A SPURS job returning to LS 0 is finished: spu_task_launch_check's rule. */
 void spu_hop_ls0_end(spu_context* ctx)
@@ -378,7 +391,10 @@ void (*spu_take_interrupt(spu_context* ctx,
     return spu_indirect_branch;
 }
 
-/* See the declaration in spu_context.h. */
+/* See the declaration in spu_context.h. Called (inline check in spu_drain_call) only once host_depth
+ * reaches g_spu_depth_arm = limit - 256, so the ring below holds the drain sites of the last calls before
+ * the trip and a normal run never writes it (the per-call TLS ring cost 11% of wid9). */
+uint32_t g_spu_depth_arm = 1744;
 void spu_depth_guard(spu_context* ctx)
 {
     static uint32_t s_max = 0;
@@ -390,9 +406,12 @@ void spu_depth_guard(spu_context* ctx)
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
+    /* Per thread: a shared ring and counter written on every drain by all
+     * SPU threads kept one cache line bouncing between cores (~19% of the
+     * SPU threads' busy time in metropolis). */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    static SPU_THREAD_LOCAL uint32_t s_ring[RING];
+    static SPU_THREAD_LOCAL uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -441,9 +460,18 @@ int spu_tailret_enabled(void)
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
-void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+#undef spu_drain_call
+int g_spu_drain_fast = 1;
+int g_spu_tail_on = 0;
+int g_spu_tailp_on = 1;
+int g_spu_drain_lean = 0;   /* SPU_DRAIN_LEAN=1 opt-in: 3+3 runs wid9 2176 -> 2128 (-2,2%), inside the noise */
+/* The interrupt-capable drain loop (setjmp frame: a big frame, every callee-saved register spilled).
+ * spu_drain_call below runs the same loop frame-less and hands over to this one only when an interrupt
+ * is to be taken or the loop ends on a pc that is not the return point. `resume` = a transfer already
+ * popped and hopped by the lean loop, still to run (after the interrupt check). */
+static __attribute__((noinline)) void spu_drain_call_full(spu_context* ctx, uint32_t return_pc, void (*resume)(spu_context*))
 {
-    spu_depth_guard(ctx);
+    R35C(R35_DRAIN_FULL);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
@@ -452,17 +480,21 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     f.prev = 0; f.depth = 0; f.image_id = 0;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
-        while (g_spu_trampoline_fn) {
+        while (g_spu_trampoline_fn || resume) {
+            void (*fn)(spu_context*);
+            if (resume) { fn = resume; resume = 0; }
+            else {
             if (g_spu_trampoline_fn == spu_indirect_branch &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();
                 return;
             }
-            void (*fn)(spu_context*) = g_spu_trampoline_fn;
+            fn = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_hop(ctx, fn);
+            }
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
@@ -514,4 +546,161 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
     }
 #undef SPU_DRAIN_POP_IRQ
+}
+
+void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    if (__builtin_expect(ctx->host_depth >= g_spu_depth_arm, 0)) spu_depth_guard(ctx);
+    if (__builtin_expect(g_spu_drain_lean == 0, 0)) { spu_drain_call_full(ctx, return_pc, 0); return; }
+    const uint32_t rpc = return_pc & SPU_LS_MASK;
+    while (g_spu_trampoline_fn) {
+        void (*fn)(spu_context*) = g_spu_trampoline_fn;
+        if (fn == spu_indirect_branch && (ctx->pc & SPU_LS_MASK) == rpc) {
+            g_spu_trampoline_fn = 0;
+            ctx->drain_ret_pc = 0;
+            return;
+        }
+        g_spu_trampoline_fn = 0;
+        ctx->drain_ret_pc = rpc;   /* re-set: a nested drain changed it */
+        spu_hop(ctx, fn);
+        if (__builtin_expect(ctx->int_enable && (ctx->event_status & ctx->event_mask), 0)) {
+            spu_drain_call_full(ctx, return_pc, fn);
+            return;
+        }
+        fn(ctx);
+    }
+    if ((ctx->pc & SPU_LS_MASK) == rpc) { ctx->drain_ret_pc = 0; return; }
+    spu_drain_call_full(ctx, return_pc, 0);
+}
+
+/* Register-promoted lifted tables (spu_lifter.py --promote): on by default when an image carries them
+ * (SPU_PROMOTE=0 keeps the plain lift). Off while an LS diagnostic (watch / low-read / SMC probe) is armed: the promoted code
+ * has no probes. Read when an image registers (startup). */
+int g_spu_pcheck = 0;
+/* SPU_FIXSTATS=1 (see spu_helpers.h spu__x_note_fix) */
+int g_spu_fixstats = -1;
+int g_spu_fext = 1;
+static volatile long long s_fixc[3][3]; static volatile long s_fixn;
+void spu_fix_note(int kind, int reason)
+{
+    if (g_spu_fixstats < 0) { const char* e = getenv("SPU_FIXSTATS"); g_spu_fixstats = e && e[0] == '1'; }
+    if (!g_spu_fixstats) return;
+    __atomic_add_fetch(&s_fixc[kind][reason], 1, __ATOMIC_RELAXED);
+    if ((__atomic_add_fetch(&s_fixn, 1, __ATOMIC_RELAXED) & ((1 << 14) - 1)) == 0)
+        fprintf(stderr, "[fixstats] fa: denorm %lld exp255 %lld other %lld | fm: %lld %lld %lld | fma: %lld %lld %lld\n",
+                s_fixc[0][0], s_fixc[0][1], s_fixc[0][2], s_fixc[1][0], s_fixc[1][1], s_fixc[1][2], s_fixc[2][0], s_fixc[2][1], s_fixc[2][2]);
+}
+int spu_promote_enabled(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("SPU_PROMOTE");
+        s_on = (e ? atoi(e) : 1) != 0;   /* default ON (26/10: -24% wid7, audio/screens equivalent); SPU_PROMOTE=0 = plain lift */
+        if (getenv("SPU_LS_WATCH") || getenv("SPU_LS_LOWREAD") || getenv("SPU_SMC_WATCH") ||
+            getenv("SPU_JOBTRACE") || getenv("SPU_JOBEXEC"))
+            s_on = 0;
+        if (s_on) {
+            const char* c = getenv("SPU_PROMOTE_CHECK");
+            g_spu_pcheck = c ? atoi(c) : 0;
+            fprintf(stderr, "[spu-promote] register-promoted lifted code ON%s\n", g_spu_pcheck ? " (check)" : "");
+        }
+    }
+    return s_on;
+}
+
+/* ---- SPU_PROMOTE_CHECK: promoted vs plain twin of a pure function ------------------------------
+ * Called from the prologue of a promoted function that has no sync statement (no call, channel op,
+ * stop ...). Every g_spu_pcheck-th call: snapshot the context, run the plain twin on one copy and
+ * the promoted function (re-entered, check suppressed) on another, compare registers, the whole
+ * 256 KB LS, pc and the dispatch hand-off. On a mismatch both are re-run from the snapshot to tell a
+ * deterministic difference from a race. Returns 0: the caller then runs the promoted function for
+ * real on the live context. */
+#include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+#define SPU_PC_ALLOC(n) _aligned_malloc((n), 64)
+#else
+#define SPU_PC_ALLOC(n) aligned_alloc(64, ((n) + 63) & ~(size_t)63)
+#endif
+extern char __ImageBase;
+static SPU_THREAD_LOCAL int t_pc_in;
+static SPU_THREAD_LOCAL spu_context* t_pc_s;
+static SPU_THREAD_LOCAL spu_context* t_pc_a;
+static SPU_THREAD_LOCAL spu_context* t_pc_b;
+static SPU_THREAD_LOCAL unsigned t_pc_n;
+static volatile long g_pc_cmp, g_pc_bad, g_pc_nan;
+typedef void (*spu_pc_fn)(spu_context*);
+static void spu_pc_run(spu_context* snap, spu_context* dst, spu_pc_fn fn, spu_pc_fn* tramp)
+{
+    memcpy(dst, snap, sizeof *dst); dst->ls = dst->ls_store;
+    g_spu_trampoline_fn = 0; fn(dst); *tramp = g_spu_trampoline_fn;
+}
+static int spu_pc_diff(spu_context* a, spu_context* b, spu_pc_fn t1, spu_pc_fn t2, int* reg, long* lsd)
+{
+    *reg = -1; *lsd = -1;
+    for (int i = 0; i < 128; i++) if (memcmp(&a->gpr[i], &b->gpr[i], 16)) {
+        /* A lane that differs while BOTH values have an all-ones exponent (NaN/Inf to the host FPU) is
+         * host NaN-payload/sign propagation, which the compiler is free to change when it commutes or
+         * folds a float op (seen: FFFFFFFF vs 7FFFFFFF in lanes 1-3 of a scalar result). Counted apart. */
+        int real = 0;
+        for (int l = 0; l < 4; l++) {
+            const uint32_t x = a->gpr[i]._u32[l], y = b->gpr[i]._u32[l];
+            if (x != y && !((x & 0x7F800000u) == 0x7F800000u && (y & 0x7F800000u) == 0x7F800000u)) real = 1;
+        }
+        if (real) { *reg = i; break; }
+        g_pc_nan++;
+    }
+    if (memcmp(a->ls_store, b->ls_store, SPU_LS_SIZE))
+        for (long i = 0; i < SPU_LS_SIZE; i++) if (a->ls_store[i] != b->ls_store[i]) { *lsd = i; break; }
+    return *reg >= 0 || *lsd >= 0 || a->pc != b->pc || a->status != b->status ||
+           a->host_depth != b->host_depth || (t1 == 0) != (t2 == 0) ||
+           (t1 == spu_indirect_branch) != (t2 == spu_indirect_branch);
+}
+int spu_pcheck_enter(spu_context* ctx, void (*ref)(spu_context*), void (*prom)(spu_context*))
+{
+    if (t_pc_in) return 0;
+    unsigned rate = (unsigned)g_spu_pcheck;
+    if (rate == 0 || (++t_pc_n % rate) != 0) return 0;
+    if (ctx->ls != ctx->ls_store) return 0;                  /* raw SPU: LS is shared guest memory */
+    if (!t_pc_s) {
+        t_pc_s = (spu_context*)SPU_PC_ALLOC(sizeof(spu_context));
+        t_pc_a = (spu_context*)SPU_PC_ALLOC(sizeof(spu_context));
+        t_pc_b = (spu_context*)SPU_PC_ALLOC(sizeof(spu_context));
+        if (!t_pc_s || !t_pc_a || !t_pc_b) { g_spu_pcheck = 0; return 0; }
+    }
+    memcpy(t_pc_s, ctx, sizeof *ctx); t_pc_s->ls = t_pc_s->ls_store;
+    spu_pc_fn save = g_spu_trampoline_fn, t1, t2;
+    t_pc_in = 1;
+    spu_pc_run(t_pc_s, t_pc_a, ref, &t1);
+    spu_pc_run(t_pc_s, t_pc_b, prom, &t2);
+    int reg; long lsd;
+    int bad = spu_pc_diff(t_pc_a, t_pc_b, t1, t2, &reg, &lsd);
+    int rep = -1;
+    if (bad) {   /* repeat from the snapshot: same difference = deterministic */
+        int reg2; long lsd2;
+        spu_pc_run(t_pc_s, t_pc_a, ref, &t1);
+        spu_pc_run(t_pc_s, t_pc_b, prom, &t2);
+        rep = spu_pc_diff(t_pc_a, t_pc_b, t1, t2, &reg2, &lsd2);
+    }
+    g_spu_trampoline_fn = save;
+    t_pc_in = 0;
+    long n = __atomic_add_fetch(&g_pc_cmp, 1, __ATOMIC_RELAXED);
+    if (bad) {
+        long m = __atomic_add_fetch(&g_pc_bad, 1, __ATOMIC_RELAXED);
+        if (m <= 20) {
+            fprintf(stderr, "[pcheck] MISMATCH #%ld img=%d fn_rva=0x%llX pc=0x%05X->0x%05X/0x%05X reg=%d lsdiff=0x%lX "
+                    "repeat=%s status %u/%u depth %u/%u\n", m, ctx->image_id,
+                    (unsigned long long)((char*)ref - &__ImageBase), (unsigned)ctx->pc,
+                    (unsigned)t_pc_a->pc, (unsigned)t_pc_b->pc, reg, lsd, rep ? "STILL-DIFFERS" : "matches-now(race)",
+                    t_pc_a->status, t_pc_b->status, t_pc_a->host_depth, t_pc_b->host_depth);
+            if (reg >= 0)
+                fprintf(stderr, "[pcheck]   in  r%d=%08X %08X %08X %08X\n[pcheck]   ref r%d=%08X %08X %08X %08X\n[pcheck]   prom r%d=%08X %08X %08X %08X\n",
+                        reg, t_pc_s->gpr[reg]._u32[0], t_pc_s->gpr[reg]._u32[1], t_pc_s->gpr[reg]._u32[2], t_pc_s->gpr[reg]._u32[3],
+                        reg, t_pc_a->gpr[reg]._u32[0], t_pc_a->gpr[reg]._u32[1], t_pc_a->gpr[reg]._u32[2], t_pc_a->gpr[reg]._u32[3],
+                        reg, t_pc_b->gpr[reg]._u32[0], t_pc_b->gpr[reg]._u32[1], t_pc_b->gpr[reg]._u32[2], t_pc_b->gpr[reg]._u32[3]);
+        }
+    }
+    if ((n % 2000) == 0)
+        fprintf(stderr, "[pcheck] %ld compared, %ld mismatches (+%ld NaN-class lane diffs ignored)\n", n, (long)g_pc_bad, (long)g_pc_nan);
+    return 0;
 }

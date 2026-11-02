@@ -24,6 +24,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
  * stwcx can break its reservation. With g_resv_store_active off there is
  * nothing to register into. */
 void ppu_resv_register(void* ctx) { (void)ctx; }
+void ppu_resv_break_line(unsigned ea) { (void)ea; }
 
 /* ppu_loader.cpp - the size of the guest address space the loader mapped.
  * This host calloc's its own VM and passes bounds explicitly, so the bounds

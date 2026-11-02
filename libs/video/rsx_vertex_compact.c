@@ -125,6 +125,14 @@ void rsx_vertex_fetch_plan_init(
     for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
         rsx_dsp_get_vertex_attr(rsx, attr, &fetch->desc);
+        /* The RSX adds VERTEX_DATA_BASE_OFFSET to each array offset and wraps
+         * the sum at 512 MB (RPCS3: get_vertex_offset_from_base). Insomniac's
+         * metal shader on metropolis keeps its u8x4 light stream in VRAM at
+         * an offset relative to a main-memory base, e.g. 0x1F4158EA: without
+         * the wrap the sum lands past VRAM, the attribute reads its default
+         * 0, and the vertex light becomes (0,0,c1.z) -- the blue walls and
+         * black floors. Folded here, so every reader sees the real offset. */
+        fetch->desc.offset = (plan->base_offset + fetch->desc.offset) & 0x1FFFFFFFu;
         fetch->elem_size =
             rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
         /* A zero stride is a constant attribute: every vertex reads the one
@@ -145,6 +153,7 @@ void rsx_vertex_fetch_plan_init(
             fetch->default_value[2] = 1.0f;
         }
     }
+    plan->base_offset = 0;   /* folded into each offset above */
 }
 
 u32 rsx_vertex_inline_layout(

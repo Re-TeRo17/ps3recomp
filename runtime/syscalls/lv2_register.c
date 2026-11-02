@@ -719,6 +719,7 @@ static void* spu_exec_thread_proc(void* arg)
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_lifted_thread_result r;
+    { extern void tl_spu_thread(unsigned); tl_spu_thread((unsigned)t->tid); }   /* TOD_TIMELINE */
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
     if (r.group_exit) {
@@ -2107,6 +2108,7 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     const char* ps3_path = (const char*)(vm_base + path_ea);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    ps3_mods_resolve(ps3_path, host_path, sizeof(host_path));   /* mods folder (read-only open) */
 
     FILE* f = fopen(host_path, "rb");
     if (!f) {

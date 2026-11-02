@@ -395,13 +395,27 @@ static void decode_src(u32 w, int abs_bit, Src* s)
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
+static int s_wpos_flip;
+void rsx_fp_set_wpos_flip(int on) { s_wpos_flip = on ? 1 : 0; }
+/* SSR (RSX_SSR): the units that carry the previous frame's scene colour and depth; -1 = off. */
+static int s_ssr_c = -1, s_ssr_d = -1;
+static int s_ssr_dbg;
+static float s_ssr_minup = 0.55f; static int s_ssr_axis = 1;
+void rsx_fp_set_ssr_debug(int on) { s_ssr_dbg = on; }
+void rsx_fp_set_ssr_params(float minup, int axis) { s_ssr_minup = minup; s_ssr_axis = (axis < 0 || axis > 2) ? 2 : axis; }
+void rsx_fp_set_ssr(int col_unit, int dep_unit) { s_ssr_c = col_unit; s_ssr_d = dep_unit; }
+
 static const char* input_expr(u32 input_src)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: /* WPOS: the RSX window origin is the bottom-left (the title computes
+               * height - y to address top-down depth/colour images), D3D's is the
+               * top-left. fp_alpha.y carries the surface height (engine path). */
+        return s_wpos_flip ? "float4(input.position.x, fp_alpha.y - input.position.y, input.position.zw)"
+                           : "input.position";
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
@@ -523,6 +537,16 @@ static void fp_coord2(u32 u, const char* xy, char* out, u32 out_size)
 static int s_sat_alpha;
 void rsx_fp_set_saturate_alpha(int on) { s_sat_alpha = on ? 1 : 0; }
 
+/* holo107 (02/11): RSX_FP_SAFE_RCP (default ON, =0 restores the plain IEEE forms). RCP/DIV/RSQ/DIVSQ of 0: the RSX
+ * never produces the IEEE poison the generated HLSL would -- 1/0 stays a huge FINITE number and 0*huge is 0, not NaN
+ * (the NaN guard at the end of the program then zeroes the channel; seen as Apogee holographic platforms/lasers
+ * losing fill+edge in front of the sky, where the soft-depth fade reads x=0). The denominator magnitude is floored
+ * at 1e-37 (sign kept) so the quotient is at most ~1e37. */
+static int fp_safe_rcp(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_FP_SAFE_RCP"); v = (e && e[0] == '0') ? 0 : 1; } return v; }
+/* integ113: the PSO/manifest cache ids are RSX_CODEGEN_ID (hash of the decompiler SOURCES) and do not see run-time HLSL toggles:
+ * fold the toggle in (0 for the default = the plain codegen id, so default-ON caches are unchanged). */
+unsigned long long rsx_fp_codegen_salt(void) { return fp_safe_rcp() ? 0ull : 0x5afe0cb0f0f0ull; }
+
 /* Per-unit texel conversions for the next decompile; see
  * rsx_fp_set_texel_ops in the header. */
 static u32 s_texop_mask;
@@ -537,6 +561,13 @@ void rsx_fp_set_texel_ops(const u32* ops)
     }
 }
 
+/* shad114: RSX_SHADOW_OOB_LIT (default ON, =0 off), read once; also part of the shader cache key (rsx_draw_engine.c). */
+int rsx_fp_shadow_oob_lit(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_SHADOW_OOB_LIT"); on = (e && e[0] == '0') ? 0 : 1; }   /* default ON: the game asks for wrap BORDER with border 0xFFFFFFFF (depth 1.0 = lit) on every shadow unit; =0 off */
+    return on;
+}
 void rsx_fp_set_shadow_units(u32 mask, const u8* funcs)
 {
     s_shadow_mask = mask & 0xFFFFu;
@@ -551,12 +582,15 @@ static const char* fp_shadow_op(u32 f)
     return op[f & 7u];
 }
 
+static int g_fp_half_exact = -1;   /* RSX_FP_HALF_EXACT, read once */
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     int buffered, char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
     memset(&g_rsx_fp_stats, 0, sizeof g_rsx_fp_stats);
+    if (g_fp_half_exact < 0) { const char* he = getenv("RSX_FP_HALF_EXACT"); g_fp_half_exact = (he && he[0] == '1') ? 1 : 0; }
 
     u32 buffered_constant_count = 0;
     if (buffered) {
@@ -757,7 +791,7 @@ static int rsx_fp_decompile_internal(
         }
 
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[1400];
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -775,7 +809,10 @@ static int rsx_fp_decompile_internal(
          * They had no case: the program went on without them. */
         case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
         case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
-        case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        case OP_RCP:
+            if (fp_safe_rcp()) snprintf(rhs, sizeof(rhs), "(((%s).x < 0.0 ? -1.0 : 1.0) / max(abs((%s).x), 1.0e-37))", a, a);
+            else snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a);
+            break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
          * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
@@ -783,13 +820,19 @@ static int rsx_fp_decompile_internal(
          * pixels, median -0.0078) and poisoned the whole lighting chain — the
          * s25-s27 black/blue character class (scratch/s26_fp_bisect.md s27
          * part 4; two independent shader pairs confirmed). */
-        case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt(abs((%s).x))", a); break;
+        case OP_RSQ:
+            if (fp_safe_rcp()) snprintf(rhs, sizeof(rhs), "rsqrt(max(abs((%s).x), 1.0e-37))", a);
+            else snprintf(rhs, sizeof(rhs), "rsqrt(abs((%s).x))", a);
+            break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
-        case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+        case OP_DIV:
+            if (fp_safe_rcp()) snprintf(rhs, sizeof(rhs), "(%s) / (((%s).x < 0.0 ? -1.0 : 1.0) * max(abs((%s).x), 1.0e-37))", a, b, b);
+            else snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b);
+            break;
         /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
          * reused by _builtin_divsq) AND forces the result to exactly 0,
@@ -802,7 +845,8 @@ static int rsx_fp_decompile_internal(
          * on why it can't use a blend here. */
         case OP_DIVSQ:
             snprintf(rhs, sizeof(rhs),
-                     "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
+                     fp_safe_rcp() ? "(abs(%s) > 0.0 ? (%s) / sqrt(max(abs((%s).x), 1.0e-37)) : (float4)0.0)"
+                                   : "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
                      a, a, b);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
@@ -892,6 +936,12 @@ static int rsx_fp_decompile_internal(
             const int cube = (tex_cube_mask >> tex_unit) & 1u;
             char tn[32];
             snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            if (cube && opcode == OP_TXL && s_ssr_c >= 0 && s_ssr_d >= 0) {
+                /* RSX_SSR: the reflection probe, a screen-space ray first (prelude: rsx_envL). */
+                snprintf(rhs, sizeof(rhs), "rsx_envL(rsx_tex%u, rsx_samp[%u], (%s).xyz, (%s).x, input.position)",
+                         tex_unit, tex_unit, a, b);
+                break;
+            }
             snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
                      opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
                      cube ? "xyz" : "xy", b);
@@ -984,6 +1034,18 @@ static int rsx_fp_decompile_internal(
                     else if (prec == 1 && dst_half) sat = " _v = clamp(_v, -65504.0, 65504.0);";
                 }
             }
+            /* RSX_FP_HALF_EXACT=1 (default off): every write into an H register is
+             * rounded to the FP16 value the RSX would store (10-bit mantissa,
+             * round to nearest even), denormals (< 2^-14) flushed to zero and the
+             * range clamped to +-65504. The condition codes are taken from the
+             * stored register value, so a predicate such as "pow() != 0" sees
+             * the same zero the hardware sees. Applies to H destinations whatever
+             * the instruction precision field (it only picks the ALU format). */
+            char sat_h[160];
+            if (g_fp_half_exact && dst_half) {
+                snprintf(sat_h, sizeof sat_h, "%s _v = rsx_h16(_v);", sat);
+                sat = sat_h;
+            }
             /* NV40 per-instruction result-scale modifier (SRC1 word bits
              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
              * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
@@ -1003,14 +1065,14 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[2000];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[2400];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
@@ -1153,6 +1215,121 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
+    /* RSX_SSR: reflection probes try a screen-space ray first. The previous frame's scene colour and depth arrive on
+     * two free units; the camera is the frame's world-to-clip matrix in c[8..11] (b0 is visible to this stage). */
+    if (s_ssr_c >= 0 && s_ssr_d >= 0 && tex_cube_mask) {
+        char cn[200];
+        snprintf(cn, sizeof cn, "#define SSR_COL rsx_tex%d\n#define SSR_COLS rsx_samp[%d]\n#define SSR_DEP rsx_tex%d\n", s_ssr_c, s_ssr_c, s_ssr_d);
+        out_puts(&p, cn);
+        if (s_ssr_dbg) out_puts(&p, "#define SSR_DBG 1\n");
+        /* RSX_ENV_LOD0=1: sample the environment cube map at mip 0 whatever LOD the program asks (diagnostic:
+         * Fastoon's water/tank reflection came out black while the cube map bytes in guest memory are teal). */
+        { static int l0 = -1; if (l0 < 0) { const char* e = getenv("RSX_ENV_LOD0"); l0 = (e && e[0] == '1') ? 1 : 0; }
+          out_puts(&p, l0 ? "#define ENV_LOD(l) 0.0\n" : "#define ENV_LOD(l) (l)\n"); }
+        { char pm[128]; snprintf(pm, sizeof pm, "#define SSR_MINUP %.4f\n#define SSR_UPAXIS %d\n", s_ssr_minup, s_ssr_axis); out_puts(&p, pm); }
+        out_puts(&p,
+        "cbuffer VPConstSSR : register(b0) { float4 vpc[512]; float4 vpps; float4 vppo; float4 vppv[4]; };\n"
+        /* vpc[8..11] = this frame's world-to-clip; vppv = the matrix the scene colour/depth (frame N-1) was drawn with. */
+        "float4 ssr_clip(float3 P) { return float4(dot(vppv[0].xyz,P)+vppv[0].w, dot(vppv[1].xyz,P)+vppv[1].w, dot(vppv[2].xyz,P)+vppv[2].w, dot(vppv[3].xyz,P)+vppv[3].w); }\n"
+        "float3 ssr_ndc(float4 c) { return (c.xyz * vpps.xyz + c.w * vppo.xyz) / c.w; }\n"
+        "float ssr_wd(float2 uv, int2 dd, uint dw, uint dh, float za, float zb) {\n"
+        "    int2 px = clamp((int2)(uv * float2(dw, dh)) + dd, int2(0,0), int2(dw - 1, dh - 1));\n"
+        "    float zs = SSR_DEP.Load(int3(px, 0)).x;\n"
+        "    return zb / (((zs - vppo.z) / vpps.z) - za);\n"
+        "}\n"
+        "float4 rsx_envL(TextureCube tc, SamplerState sm, float3 dir, float lod, float4 sp) {\n"
+        "    float4 base = tc.SampleLevel(sm, dir, ENV_LOD(lod));\n"
+        "    uint cw, ch; SSR_COL.GetDimensions(cw, ch);\n"
+        "    uint dw, dh; SSR_DEP.GetDimensions(dw, dh);\n"
+        "#ifdef SSR_DBG\n"
+        "    float4 miss = float4(1.0, 0.0, 0.0, 1.0);\n"
+        "#else\n"
+        "    float4 miss = base;\n"
+        "#endif\n"
+        "    if (cw <= 1 || dw <= 1 || !(dot(dir,dir) > 1e-8)) return miss;\n"
+        "    float2 dims = float2(cw, ch);\n"
+        "    float2 uv0 = sp.xy / dims;\n"
+        "    float3 ndc0 = float3(uv0.x * 2.0 - 1.0, 1.0 - uv0.y * 2.0, sp.z);\n"
+        "    float3 q = (ndc0 - vppo.xyz) / vpps.xyz;\n"
+        "    float4 r0 = vpc[8], r1 = vpc[9], r2 = vpc[10], r3 = vpc[11];\n"
+        "    float3 a0 = r0.xyz - q.x * r3.xyz, a1 = r1.xyz - q.y * r3.xyz, a2 = r2.xyz - q.z * r3.xyz;\n"
+        "    float3 bb = float3(q.x * r3.w - r0.w, q.y * r3.w - r1.w, q.z * r3.w - r2.w);\n"
+        "    float3 c12 = cross(a1, a2), c20 = cross(a2, a0), c01 = cross(a0, a1);\n"
+        "    float det = dot(a0, c12);\n"
+        "    float3 P0 = (bb.x * c12 + bb.y * c20 + bb.z * c01) / (abs(det) < 1e-12 ? 1e-12 : det);\n"
+        "    float3 Rn = normalize(dir);\n"
+        /* Surface orientation from the screen-space derivatives of the world position: only surfaces that face up
+         * (water, shiny floors) take the screen-space reflection; walls and ceilings keep the cube map. */
+        "    float3 Ng = cross(ddx(P0), ddy(P0));\n"
+        "    float nl = length(Ng);\n"
+        "    float upw = 0.0;\n"
+        "    if (nl > 1e-14) { Ng /= nl; if (dot(Ng, Rn) < 0.0) Ng = -Ng; upw = smoothstep(SSR_MINUP, SSR_MINUP + 0.2, Ng[SSR_UPAXIS]); }\n"
+        "    if (abs(det) < 1e-12 || upw <= 0.0) {\n"
+        "#ifdef SSR_DBG\n"
+        "        return float4(0.0, 0.0, 1.0, 1.0);\n"
+        "#else\n"
+        "        return base;\n"
+        "#endif\n"
+        "    }\n"
+        "    float za = dot(vppv[2].xyz, vppv[3].xyz) / max(dot(vppv[3].xyz, vppv[3].xyz), 1e-12);\n"
+        "    float zb = vppv[2].w - za * vppv[3].w;\n"
+        "    const int NS = 48; const float T0 = 0.06, LMAX = 60.0;\n"
+        "    float tprev = 0.0; float conf = 0.0; float2 huv = float2(0.0, 0.0); float wprev = 0.0;\n"
+        "    [loop] for (int i = 1; i <= NS; i++) {\n"
+        "        float t = T0 * pow(LMAX / T0, (float)i / (float)NS);\n"
+        "        float4 c = ssr_clip(P0 + Rn * t);\n"
+        "        if (c.w < 0.05) break;\n"
+        "        float3 n = ssr_ndc(c);\n"
+        "        float2 uv = float2(n.x * 0.5 + 0.5, 0.5 - n.y * 0.5);\n"
+        "        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;\n"
+        "        float zs = SSR_DEP.Load(int3((int2)(uv * float2(dw, dh)), 0)).x;\n"
+        "        if (zs < 0.99999) {\n"
+        "            float qz = (zs - vppo.z) / vpps.z;\n"
+        "            float ws = zb / (qz - za);\n"
+        "            float d = c.w - ws;\n"
+        /* thickness: a few percent of the depth plus what the ray itself advances in depth per step */
+        "            float thick = 0.03 * c.w + 0.25 + abs(c.w - wprev);\n"
+        "            if (d > 0.0 && d < thick && i > 1) {\n"
+        "                float lo = tprev, hi = t; huv = uv;\n"
+        "                [unroll] for (int k = 0; k < 5; k++) {\n"
+        "                    float m = 0.5 * (lo + hi);\n"
+        "                    float4 cm = ssr_clip(P0 + Rn * m);\n"
+        "                    float3 nm = ssr_ndc(cm);\n"
+        "                    float2 um = float2(nm.x * 0.5 + 0.5, 0.5 - nm.y * 0.5);\n"
+        "                    float zm = SSR_DEP.Load(int3((int2)(saturate(um) * float2(dw - 1, dh - 1)), 0)).x;\n"
+        "                    float wm = zb / (((zm - vppo.z) / vpps.z) - za);\n"
+        "                    if (cm.w - wm > 0.0) { hi = m; huv = um; } else lo = m;\n"
+        "                }\n"
+        /* depth-discontinuity rejection: a hit on a silhouette edge (second difference of depth) smears */
+        "                float wc = ssr_wd(huv, int2(0,0), dw, dh, za, zb);\n"
+        "                float e2 = max(abs(ssr_wd(huv, int2(-2,0), dw, dh, za, zb) + ssr_wd(huv, int2(2,0), dw, dh, za, zb) - 2.0 * wc),\n"
+        "                               abs(ssr_wd(huv, int2(0,-2), dw, dh, za, zb) + ssr_wd(huv, int2(0,2), dw, dh, za, zb) - 2.0 * wc));\n"
+        "                float edge = 1.0 - saturate(e2 / (0.02 * wc + 0.05));\n"
+        "                float2 e = min(huv, 1.0 - huv);\n"
+        "                conf = saturate(min(e.x, e.y) * 8.0) * (1.0 - pow((float)i / (float)NS, 4.0)) * edge * upw;\n"
+        "                break;\n"
+        "            }\n"
+        "        }\n"
+        "        tprev = t; wprev = c.w;\n"
+        "    }\n"
+        "    if (conf <= 0.0) return miss;\n"
+        "#ifdef SSR_DBG\n"
+        "    return float4(0.0, 1.0, 0.0, 1.0);\n"
+        "#endif\n"
+        "    float3 hc = SSR_COL.SampleLevel(SSR_COLS, huv, 0).rgb;\n"
+        "    return float4(lerp(base.rgb, hc, conf), base.w);\n"
+        "}\n");
+    }
+    if (g_fp_half_exact)
+        out_puts(&p,
+            "float4 rsx_h16(float4 x) {\n"
+            "    uint4 b = asuint(x);\n"
+            "    float4 y = asfloat((b + 0x0FFFu + ((b >> 13) & 1u)) & 0xFFFFE000u);\n"
+            "    float4 a = abs(x);\n"
+            "    y = (a < 6.103515625e-5) ? (float4)0 : y;\n"
+            "    y = (a > 65504.0) ? sign(x) * 65504.0 : y;\n"
+            "    return (x != x) ? x : y;\n"
+            "}\n");
     /* Shadow-map units: a depth texture whose unit has a compare function
      * returns, on the RSX, the fraction of the 2x2 footprint whose depth
      * passes "reference OP texel" (percentage-closer filtering), replicated
@@ -1160,9 +1337,14 @@ static int rsx_fp_decompile_internal(
      * float snapshot in .r, so compare the four gathered texels and filter
      * the results bilinearly. Sampled as plain depth, Drakengard 3's shadow
      * projections came out as solid dark rectangles, and whole floors black. */
+    /* shad114 RSX_SHADOW_OOB_LIT (default ON, =0 off): a lookup whose projected xy falls outside the map [0,1] is LIT (1.0) instead of
+     * reading the clamped edge texel, which holds the caster's depth: that stretched the tight per-object character shadow map
+     * (64x64) past its border -- a probable cause of the dark box around Ratchet's shadow. The idea (white border colour = lit)
+     * comes from a study of another PS3 recompilation project; no code taken. */
+    const int oob_lit = rsx_fp_shadow_oob_lit();
     for (u32 u = 0; u < 16; u++) {
         if (!((s_shadow_mask >> u) & 1u) || ((tex_cube_mask >> u) & 1u)) continue;
-        char tn[24], fn[1400];
+        char tn[24], fn[1600];
         snprintf(tn, sizeof tn, tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", u);
         const char* op = fp_shadow_op(s_shadow_func[u]);
         /* RSX_SHADOW_FORWARD=1: the GL order, "reference OP texel". The
@@ -1187,6 +1369,7 @@ static int rsx_fp_decompile_internal(
              * occluder compares equal instead of flipping on float noise. */
             snprintf(fn, sizeof fn,
                 "float4 rsx_shadow%u(float3 c) {\n"
+                "%s"
                 "    float w, h; %s.GetDimensions(w, h);\n"
                 "    float2 st = c.xy * float2(w, h) - 0.5;\n"
                 "    float2 f = frac(st);\n"
@@ -1201,7 +1384,8 @@ static int rsx_fp_decompile_internal(
                 "                      rq %s dq.z ? 1.0 : 0.0, rq %s dq.w ? 1.0 : 0.0);\n"
                 "    float v = lerp(lerp(p.x, p.y, f.x), lerp(p.z, p.w, f.x), f.y);\n"
                 "    return (float4)v;\n"
-                "}\n", u, tn, tn, tn, tn, tn, op, op, op, op);
+                "}\n", u, oob_lit ? "    if (c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0) return (float4)1.0;\n" : "",
+                tn, tn, tn, tn, tn, op, op, op, op);
         out_puts(&p, fn);
     }
     /* Texel conversions the RSX applies to a sample after the channel remap
@@ -1451,6 +1635,15 @@ int rsx_fp_apply_alpha_test_buffered(
 /* Walk a program the same way the decompiler does and copy out its inline
  * constants in the SAME order the decompiler assigns fp_k[] indices. The backend
  * calls this per draw, so re-patched constants take effect without recompiling. */
+/* RSX_FP_BRANCH_K_OLD=1: the walks below skip no constant slot after a BRANCH,
+ * as before 31d0609 (A/B for the shadow flicker report). */
+static int fp_branch_k_old(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_FP_BRANCH_K_OLD"); v = (e && e[0] == '1'); }
+    return v;
+}
+
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out)
 {
     if (!ucode || !out) return 0;
@@ -1462,7 +1655,8 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
         int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
+        /* a branch carries a constant slot too, as in rsx_fp_decompile */
+        int has_k = (!is_branch || !fp_branch_k_old()) &&
             ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
@@ -1506,8 +1700,11 @@ u32 rsx_fp_texture_mask(const u8* ucode, u32 max_bytes)
             if (op == OP_TEX || op == OP_TXP || op == OP_TXD || op == OP_TXL || op == OP_TXB ||
                 op == 0x32u || op == 0x33u)
                 mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
-            if (fp_instruction_has_constant(w1, w2, w3)) off += 16;
         }
+        /* A branch's constant slot is skipped too, as rsx_fp_decompile and
+         * rsx_fp_scan do: walking into it as an instruction lost the units
+         * sampled after it (left unbound, read as zero). */
+        if ((!is_branch || !fp_branch_k_old()) && fp_instruction_has_constant(w1, w2, w3)) off += 16;
         if (w0 & FP_END) return mask;
     }
     return 0xFFFFu;
@@ -1531,7 +1728,8 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
         for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
         off += 16;
         int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
+        /* a branch carries a constant slot too, as in rsx_fp_decompile */
+        int has_k = (!is_branch || !fp_branch_k_old()) &&
             ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));

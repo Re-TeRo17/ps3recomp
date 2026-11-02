@@ -132,6 +132,7 @@
 #define DMA_HANDLE_LOCAL        0xFEED0000u
 #define DMA_HANDLE_MAIN         0xFEED0001u
 
+u32 g_dsp_mcnt_on, g_dsp_hist_slow[0x800], g_dsp_hist_plain[0x800];   /* RSX_MCNT=1: per-method call counts */
 static u32 dma_to_location(u32 handle)
 {
     return handle == DMA_HANDLE_MAIN ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
@@ -143,8 +144,20 @@ static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
         rsx->klass[(method >> 2) + i] = klass;
 }
 
+/* RSX_VCKEY_MEMO: counts the changes of every register that eng_vc_key's plan and key read (the vertex array
+ * offsets and formats, data base offset and element base, the constant attribute values, the index array,
+ * restart index, divider mask). A write of the value a register holds does not count. Anything that writes
+ * those registers behind rsx_dispatch_method (the immediate-mode fold and its VTXFMT swap, init) bumps it too. */
+u32 g_rsx_dsp_vtx_gen;
+static inline int dsp_vtx_tracked(u32 m)
+{
+    return (m >= 0x1680u && m < 0x16C0u) || (m >= 0x1738u && m < 0x1780u) || (m >= 0x1C00u && m < 0x1D00u) ||
+           m == 0x181Cu || m == 0x1820u || m == 0x1DACu || m == 0x1DB0u || m == 0x1FC0u;
+}
+
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
+    g_rsx_dsp_vtx_gen++;
     memset(rsx, 0, sizeof(*rsx));
     if (sink)
         rsx->sink = *sink;
@@ -262,6 +275,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
     rsx->const_gen++;
+    rsx->const_lo = 0; rsx->const_hi = RSX_DSP_NUM_CONSTANTS - 1u;
     rsx->canvas_mark_at = 0;
     if (g_rsx_canvas_mark)
         for (u32 i = 0; i < count; i++) dsp_canvas_mark(rsx, i >> 2, i & 3u, words[i]);
@@ -315,9 +329,108 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Immediate-mode vertices.
+ *
+ * A title that never sets up a vertex array can draw straight out of the
+ * "current attribute" registers: BEGIN_END(prim), then per vertex a few
+ * SET_VERTEX_DATA{1F,2F,3F,4F,2S,4S,4UB} writes ending with the one that
+ * completes attribute 0 (the position), which is what makes the hardware emit
+ * a vertex -- a snapshot of every current attribute at that moment -- then
+ * BEGIN_END(0). Ratchet & Clank: Tools of Destruction draws every Bink movie
+ * frame this way (a full-screen QUADS with 2S position/texcoord and 4F colour
+ * writes), so the dispatcher saw begin/end with nothing between them and the
+ * movie never reached the screen.
+ *
+ * At END the snapshots are packed into the INLINE_ARRAY stream the sinks
+ * already understand (float4 per attribute written during the primitive, in
+ * ascending attribute order) and the VTXFMT registers are overridden to
+ * describe exactly that stream until the sink has drawn it.
+ *
+ * The buffer is module-static: one dispatcher draws at a time.
+ * -----------------------------------------------------------------------*/
+#define IMM_MAX_VERTS 2048
+static float s_imm_vtx[IMM_MAX_VERTS][RSX_DSP_NUM_VERTEX_ATTR][4];
+static u32   s_imm_n;
+static u32   s_imm_touched;       /* attributes written during this primitive */
+static u32   s_imm_overflow;
+static u32   s_imm_batches;       /* VB_VERTEX/INDEX_BATCH draws during this primitive */
+
+static void imm_reset(void) { s_imm_n = 0; s_imm_touched = 0; s_imm_overflow = 0; s_imm_batches = 0; }
+
+/* Which attribute a DATA* method writes, and whether this word completes it. */
+static int imm_classify(u32 m, u32* attr, int* completes)
+{
+    if (m >= 0x1E40 && m < 0x1E80) { *attr = (m - 0x1E40) >> 2; *completes = 1; return 1; }                 /* 1F  */
+    if (m >= 0x1880 && m < 0x1900) { *attr = (m - 0x1880) >> 3; *completes = (m & 4) != 0; return 1; }      /* 2F  */
+    if (m >= 0x1500 && m < 0x1600) { *attr = (m - 0x1500) >> 4; *completes = ((m >> 2) & 3) == 2; return 1; } /* 3F  */
+    if (m >= 0x1C00 && m < 0x1D00) { *attr = (m - 0x1C00) >> 4; *completes = ((m >> 2) & 3) == 3; return 1; } /* 4F  */
+    if (m >= 0x1900 && m < 0x1940) { *attr = (m - 0x1900) >> 2; *completes = 1; return 1; }                 /* 2S  */
+    if (m >= 0x1940 && m < 0x1980) { *attr = (m - 0x1940) >> 2; *completes = 1; return 1; }                 /* 4UB */
+    if (m >= 0x1980 && m < 0x1A00) { *attr = (m - 0x1980) >> 3; *completes = (m & 4) != 0; return 1; }      /* 4S  */
+    if (m >= 0x0A80 && m < 0x0B00) { *attr = (m - 0x0A80) >> 3; *completes = (m & 4) != 0; return 1; }      /* scaled 4S */
+    return 0;
+}
+
+static void imm_note(rsx_dispatch* rsx, u32 m)
+{
+    u32 attr; int completes;
+    if (!imm_classify(m, &attr, &completes) || attr >= RSX_DSP_NUM_VERTEX_ATTR) return;
+    s_imm_touched |= 1u << attr;
+    if (attr != 0 || !completes) return;
+    if (s_imm_n >= IMM_MAX_VERTS) { s_imm_overflow = 1; return; }
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        u32 w[4];
+        for (u32 c = 0; c < 4; c++) w[c] = rsx->regs[(M_VTX_ATTR_4F + a * 0x10 + c * 4) >> 2];
+        if (!(w[0] | w[1] | w[2] | w[3])) { w[3] = 0x3F800000u; }   /* never written: (0,0,0,1) */
+        memcpy(s_imm_vtx[s_imm_n][a], w, 16);
+    }
+    s_imm_n++;
+}
+
+/* Pack the snapshots into rsx->inline_data and override VTXFMT to match.
+ * Returns 1 when the registers were overridden (caller restores `saved`). */
+static int imm_flush(rsx_dispatch* rsx, u32 saved[RSX_DSP_NUM_VERTEX_ATTR])
+{
+    static int log = -1; if (log < 0) log = getenv("RSX_IMM_LOG") ? 1 : 0;
+    if (!s_imm_n || rsx->inline_len) return 0;
+    /* The primitive drew from its arrays: the DATA writes only set current
+     * values. Whether attribute 0 has an array declared says nothing -- ToD's
+     * Anark HUD never touches VTXFMT, so the 3D scene's declaration is still
+     * there, and testing it dropped every HUD quad drawn after a 3D pass
+     * (which panel showed depended on what drew before it). */
+    if (s_imm_batches) return 0;
+    u32 att[RSX_DSP_NUM_VERTEX_ATTR], nt = 0;
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
+        if (s_imm_touched & (1u << a)) att[nt++] = a;
+    if (!nt) return 0;
+    if (s_imm_overflow || (u64)s_imm_n * nt * 16u > RSX_DSP_INLINE_MAX_BYTES) { rsx->inline_dropped++; return 0; }
+    u32 off = 0;
+    for (u32 k = 0; k < s_imm_n; k++)
+        for (u32 t = 0; t < nt; t++) {
+            u32 w[4]; memcpy(w, s_imm_vtx[k][att[t]], 16);
+            for (u32 c = 0; c < 4; c++, off += 4) {
+                rsx->inline_data[off + 0] = (u8)(w[c] >> 24); rsx->inline_data[off + 1] = (u8)(w[c] >> 16);
+                rsx->inline_data[off + 2] = (u8)(w[c] >> 8);  rsx->inline_data[off + 3] = (u8)w[c];
+            }
+        }
+    rsx->inline_len = off;
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        saved[a] = rsx->regs[(M_VTXFMT >> 2) + a];
+        /* type 2 (float), size 4, stride 0 = tightly packed; 0x2 = disabled */
+        rsx->regs[(M_VTXFMT >> 2) + a] = (s_imm_touched & (1u << a)) ? 0x42u : 0x2u;
+    }
+    g_rsx_dsp_vtx_gen++;
+    if (log) { static int n = 0; if (n < 40 && ++n)
+        fprintf(stderr, "[imm] prim=%u verts=%u attrs=0x%04X bytes=%u v0=(%g %g %g %g)\n", rsx->current_primitive,
+                s_imm_n, s_imm_touched, off, s_imm_vtx[0][0][0], s_imm_vtx[0][0][1], s_imm_vtx[0][0][2], s_imm_vtx[0][0][3]); }
+    return 1;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
+    if (g_dsp_mcnt_on) g_dsp_hist_slow[(method >> 2) & 0x7FF]++;
     const u32 idx = method >> 2;
     /* regs[] covers methods 0..0xFFFC (subchannel bits included). A larger
      * value is not a method -- and indexing with it wrote past regs[] into
@@ -331,10 +444,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                     method, arg);
         return;
     }
+    if (dsp_vtx_tracked(method) && rsx->regs[idx] != arg) g_rsx_dsp_vtx_gen++;
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
-        (method >= 0x0A80 && method < 0x0B00))
+        (method >= 0x0A80 && method < 0x0B00)) {
         vtx_const_fold(rsx, method, arg);
+        g_rsx_dsp_vtx_gen++;
+    }
+    if (rsx->in_begin_end) imm_note(rsx, method);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
@@ -361,6 +478,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
             rsx->const_gen++;
+            if (slot < rsx->const_lo) rsx->const_lo = slot;
+            if (slot > rsx->const_hi) rsx->const_hi = slot;
             if (g_rsx_canvas_mark) dsp_canvas_mark(rsx, slot, word & 3, arg);
         }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
@@ -393,10 +512,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            imm_reset();
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
             rsx->in_begin_end = 0;
+            /* Immediate-mode vertices become an inline stream (see imm_flush). */
+            u32 imm_saved[RSX_DSP_NUM_VERTEX_ATTR];
+            const int imm = imm_flush(rsx, imm_saved);
             /* Hand an inline stream over BEFORE end: the sink reads end as
              * "draw what you have", so a batch delivered after it would be
              * drawn one primitive late, or not at all. */
@@ -406,6 +529,13 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->inline_len = 0;
             if (rsx->sink.end)
                 rsx->sink.end(rsx->sink.user, rsx);
+            if (imm)
+                {
+                    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
+                        rsx->regs[(M_VTXFMT >> 2) + a] = imm_saved[a];
+                    g_rsx_dsp_vtx_gen++;
+                }
+            imm_reset();
         }
         break;
 
@@ -438,12 +568,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         break;
 
     case M_VB_VERTEX_BATCH:
+        s_imm_batches++;
         if (rsx->sink.draw_arrays)
             rsx->sink.draw_arrays(rsx->sink.user, rsx,
                                   arg & 0xFFFFFF, (arg >> 24) + 1);
         break;
 
     case M_VB_INDEX_BATCH:
+        s_imm_batches++;
         if (rsx->sink.draw_index_array)
             rsx->sink.draw_index_array(rsx->sink.user, rsx,
                                        arg & 0xFFFFFF, (arg >> 24) + 1);
@@ -488,6 +620,8 @@ int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* 
             if (slot < RSX_DSP_NUM_CONSTANTS) {
                 rsx->constants[slot][word & 3] = v;
                 written++;
+                if (slot < rsx->const_lo) rsx->const_lo = slot;
+                if (slot > rsx->const_hi) rsx->const_hi = slot;
                 if (mark) dsp_canvas_mark(rsx, slot, word & 3, v);
             }
         }
@@ -511,6 +645,104 @@ int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* 
         return 1;
     }
     return 0;
+}
+
+/* RSX_FIFO_FAST=1: a run of consecutive words into registers that the dispatcher only stores -- the texture
+ * units (0x1A00-0x1BFF: offset, format, address, control, filter, rect, border), the vertex array offsets
+ * (0x1680-0x16BF) and formats (0x1740-0x177F). rsx_dispatch_method does nothing else for them: no fold
+ * (none of the branches of vtx_const_fold matches these addresses), no upload window,
+ * no case of the switch; imm_note only inside BEGIN/END, which is why a run in one is refused. What the engine
+ * does with a texture or an array is at the draw, from regs[]. 0: not such a run, the caller does it word by word. */
+int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
+{
+    if (!count || rsx->in_begin_end) return 0;
+    const u32 end = method + count * 4u;
+    if (!((method >= 0x1A00u && end <= 0x1C00u) || (method >= 0x1680u && end <= 0x16C0u) ||
+          (method >= 0x1740u && end <= 0x1780u)))
+        return 0;
+    u32* r = &rsx->regs[method >> 2];
+    for (u32 i = 0; i < count; i++) {
+        const u32 v = dsp_be32(be + i * 4u);
+        if (dsp_vtx_tracked(method + i * 4u) && r[i] != v) g_rsx_dsp_vtx_gen++;
+        r[i] = v;
+    }
+    return 1;
+}
+
+/* RSX_FIFO_BLOCK / RSX_FIFO_RUN: methods that rsx_dispatch_method (and the engine's rsx_draw_engine_method in front of
+ * it) does nothing for but store the word and count a change of a vertex-tracked register: not a constant fold,
+ * not an upload window, not a case of the switch, not an engine-side special (queries, semaphore release,
+ * snapshot stats, branch bits). Built once; a run of them outside BEGIN/END is stored in one loop. */
+static unsigned char s_plain[0x800];
+static int s_plain_ready;
+static void dsp_plain_build(void)
+{
+    for (u32 i = 0; i < 0x800; i++) {
+        const u32 m = i << 2;
+        int ok = 1;
+        if (m >= 0x1500u && m < 0x1600u) ok = 0;
+        if (m >= 0x1880u && m < 0x1A00u) ok = 0;
+        if (m >= 0x1E40u && m < 0x1E80u) ok = 0;
+        if (m >= 0x0A80u && m < 0x0B00u) ok = 0;
+        if (m >= 0x0B80u && m < 0x0C00u) ok = 0;       /* VP program upload */
+        if (m >= 0x1F00u && m < 0x1F80u) ok = 0;       /* VP constant upload */
+        switch (m) {
+        case 0x1808: case 0x1814: case 0x1818: case 0x1824: case 0x1D94:      /* begin/end, batches, inline, clear */
+        case 0x17C8: case 0x1800: case 0x1D70: case 0x1D84: case 0x1FD8: case 0x1FF8:   /* engine specials */
+        case 0x1D6C: case 0x1D74: case 0x1A8:
+            ok = 0; break;
+        default: break;
+        }
+        if (m < 0x70u) ok = 0;                         /* NV406E (reference, semaphores) */
+        s_plain[i] = (unsigned char)(ok ? (dsp_vtx_tracked(m) ? 2 : 1) : 0);
+    }
+    s_plain_ready = 1;
+}
+
+/* Stores the leading plain words of the run into regs[]; returns how many it took (0..count). A run inside
+ * BEGIN/END is refused (imm_note wants to see each word). */
+u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, const u8* be)
+{
+    if (rsx->in_begin_end) return 0;
+    if (!s_plain_ready) dsp_plain_build();
+    u32 i = 0;
+    if (incr) {
+        /* one pass over a consecutive run: class byte per register (1 plain, 2 plain + vertex-tracked) */
+        if (method >= 0x2000u || method + count * 4u > 0x2000u) {
+            for (; i < count; i++) {
+                const u32 m = method + i * 4u;
+                if (m >= 0x2000u || !s_plain[m >> 2]) break;
+                const u32 v = dsp_be32(be + i * 4u);
+                u32* r = &rsx->regs[m >> 2];
+                if (dsp_vtx_tracked(m) && *r != v) g_rsx_dsp_vtx_gen++;
+                *r = v;
+            }
+            return i;
+        }
+        const unsigned char* cl = &s_plain[method >> 2];
+        u32* r = &rsx->regs[method >> 2];
+        u32 chg = 0;
+        for (; i < count; i++) {
+            const unsigned c = cl[i];
+            if (!c) break;
+            u32 v; memcpy(&v, be + i * 4u, 4);
+            v = __builtin_bswap32(v);
+            chg += (c == 2u) & (r[i] != v);
+        if (g_dsp_mcnt_on) g_dsp_hist_plain[((method >> 2) + i) & 0x7FF]++;
+            r[i] = v;
+        }
+        if (chg) g_rsx_dsp_vtx_gen++;
+        return i;
+    }
+    for (; i < count; i++) {
+        const u32 m = method;
+        if (m >= 0x2000u || !s_plain[m >> 2]) break;
+        const u32 v = dsp_be32(be + i * 4u);
+        u32* r = &rsx->regs[m >> 2];
+        if (dsp_vtx_tracked(m) && *r != v) g_rsx_dsp_vtx_gen++;
+        *r = v;
+    }
+    return i;
 }
 
 /* ---- getters ----------------------------------------------------------- */
@@ -711,3 +943,29 @@ void rsx_dsp_get_index_array(const rsx_dispatch* rsx, rsx_dsp_index_array* out)
     out->location = fmt & 0xF;               /* location index directly     */
     out->is_u32   = ((fmt >> 4) & 0xFF) == 0; /* type 0 = u32, 1 = u16      */
 }
+
+
+/* ---- 27/10 walkF2: register-read tracing (see rsx_dsp_reg in rsx_dispatch.h) ---------------------------------
+ * rsx_dsp_trace_set(target, live): reads through `target` are recorded in a per-register bitmap (bit 0 = read,
+ * bit 1 = the value differed from `live`, bit 2 = it was the snapshot poison). live may be NULL. */
+volatile u32 g_rsx_dsp_trace;
+static const rsx_dispatch* s_tr_target;
+static const rsx_dispatch* s_tr_live;
+static u8 s_tr_bm[RSX_DSP_NUM_REGS];
+static u32 s_tr_diffs;
+
+void rsx_dsp_trace_set(const rsx_dispatch* target, const rsx_dispatch* live)
+{
+    s_tr_target = target; s_tr_live = live; g_rsx_dsp_trace = target ? 1u : 0u;
+}
+void rsx_dsp_trace_read(const rsx_dispatch* rsx, u32 idx)
+{
+    if (rsx != s_tr_target || idx >= RSX_DSP_NUM_REGS) return;
+    u8 f = 1;
+    if (s_tr_live && rsx->regs[idx] != s_tr_live->regs[idx]) { f |= 2; s_tr_diffs++; }
+    if (rsx->regs[idx] == 0xDEADBEEFu) { f |= 4; s_tr_diffs++; }
+    s_tr_bm[idx] |= f;
+}
+const u8* rsx_dsp_trace_bitmap(void) { return s_tr_bm; }
+void rsx_dsp_trace_clear(void) { memset(s_tr_bm, 0, sizeof s_tr_bm); s_tr_diffs = 0; }
+u32 rsx_dsp_trace_diffs(void) { return s_tr_diffs; }

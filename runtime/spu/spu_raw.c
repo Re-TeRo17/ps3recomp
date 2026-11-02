@@ -37,6 +37,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>   /* _mm_setcsr: SPU_RZ_FP */
+#endif
 #include <time.h>      /* nanosleep, in the POSIX half of spu_intr.inc */
 
 #ifdef _WIN32
@@ -86,6 +89,9 @@ typedef struct raw_spu {
     uint32_t     int_mask;
     uint32_t     int_stat;
     volatile long started;      /* the host thread is live */
+    volatile long aborting;     /* a PPU stop/restart is unwinding the host thread:
+                                 * it ends as a plain stop, not stop-and-signal */
+    int          image_id;      /* image resolved for the last run (restart without reload) */
     /* Contiguous LS runs filled by proxy GETs since the last start: a program
      * streamed in this way is resolved by fingerprinting a run (raw_spu_start). */
     uint32_t     get_lo[8], get_hi[8];
@@ -235,6 +241,23 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
     raw_spu* s = (raw_spu*)arg;
     spu_context* c = s->ctx;
 
+    { wchar_t nm[32]; swprintf(nm, 32, L"raw spu %u", (unsigned)(s - s_spu)); SetThreadDescription(GetCurrentThread(), nm); }
+    { extern void tl_spu_thread(unsigned); tl_spu_thread((unsigned)(s - s_spu)); }   /* TOD_TIMELINE */
+    { extern void ps3_ccx_role(int); ps3_ccx_role(6); }   /* TOD_CCX_PIN (role 6 = raw SPU) */
+    /* PS3_SAMPLE_RAWSPU=1: the sampler's PS3_SAMPLE_SPU mode takes the raw SPU threads (ToD's collision) instead of SPURS lanes */
+    { const char* e = getenv("PS3_SAMPLE_RAWSPU"); if (e && e[0] == '1') { extern void ps3_sampler_tag_thread(void); ps3_sampler_tag_thread(); } }
+    /* SPU_RZ_FP (default on, =0 off): the two raw collision images (110 igCollBroadSpu, 111 igcollspu) are built with
+     * SPU_RZ_FP_TLS, whose fa/fs/fm/fma/fms/fnms are the host's float ops when this thread runs with MXCSR = round toward
+     * zero + DAZ + FTZ (= the SPU's truncation and denormal handling, bit-exact; spu_helpers.h). The mode is per thread
+     * and this thread only runs SPU code (channels, DMA and the exact-path redo restore the default where they need it). */
+#if defined(__x86_64__) || defined(_M_X64)
+    { extern SPU_THREAD_LOCAL int g_spu_rz;
+      const char* e = getenv("SPU_RZ_FP");
+      if ((c->image_id == 110 || c->image_id == 111) && !(e && e[0] == '0')) {
+          _mm_setcsr(0xFFC0u); g_spu_rz = 1;
+          fprintf(stderr, "[spu-rz] spu%u image %d: host float ops in RZ|DAZ|FTZ mode\n", (unsigned)(s - s_spu), c->image_id);
+      } }
+#endif
     c->status = SPU_STATUS_RUNNING;
     publish(s);
 
@@ -243,6 +266,18 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
     /* A raw SPU that returns has executed `stop`. Report it the way hardware
      * does -- run bit clear, stop bit set, stop code in the high half -- so the
      * PPU's status poll sees a real termination instead of a stuck 'running'. */
+    if (s->aborting) {
+        /* RunCntl=0 (or a restart) pulled the SPU out of whatever it was doing:
+         * hardware just clears the run bit. No stop-and-signal, no interrupt. */
+        c->status = SPU_STATUS_STOPPED;
+        publish(s);
+        InterlockedExchange(&s->started, 0);
+        fprintf(stderr, "[spu-raw] spu%u aborted by PPU stop: pc=0x%05X steps=%llu\n",
+                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK),
+                (unsigned long long)c->steps);
+        fflush(stderr);
+        return 0;
+    }
     c->status = SPU_STATUS_STOPPED_BY_STOP | (c->stop_code << 16);
     /* Stop-and-signal is an INTERRUPT, not just a status change. This is how a
      * raw SPU asks the PPU for something: `stop <code>`, the PPU takes the
@@ -269,31 +304,119 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
 }
 #endif
 
+/* Stop the host thread of a raw SPU (SPU_RunCntl = 0) and wait until it is gone.
+ *
+ * Hardware pauses the SPU; the games that matter reload the program and restart
+ * it from NPC, so a pause and a kill are indistinguishable to them -- but the
+ * host thread MUST be gone before local store is overwritten and the context
+ * re-initialised, or two threads would run in one LS. The request is cooperative
+ * (spu_abort_request: honoured at the SPU's next channel access, which also
+ * covers a program parked on an empty mailbox). The re-post loop covers the
+ * request being consumed by a racing nested run; after a generous timeout the
+ * thread is terminated as a last resort (spinning pure-compute loop). */
+extern int spu_raw_stop_fast(void);
+static void raw_spu_stop(raw_spu* s)
+{
+#ifdef _WIN32
+    if (!s->thread) return;
+    LARGE_INTEGER hq0, hq1, hqf; QueryPerformanceCounter(&hq0); QueryPerformanceFrequency(&hqf);
+    int hreq = 0, hwasrun = InterlockedCompareExchange(&s->started, 0, 0);
+    if (InterlockedCompareExchange(&s->started, 0, 0)) {
+        s->aborting = 1;
+        ULONGLONG t0 = GetTickCount64();
+        /* hitch116 02/11, SPU_RAW_STOP_FAST (default on, =0 old behaviour): the request used to be posted only AFTER the first
+         * 20 ms wait timed out, so every stop of a running raw SPU cost >= 20 ms (autosave: 2 stops = ~41 ms, measured in
+         * log\hitch104\S1.err). Post it first; the thread-exit signal then ends the wait at once. The re-post cadence (covers a
+         * request eaten by a racing nested run) drops from 20 to 2 ms. Same completion guarantee: the host thread is gone on return. */
+        const int fast = spu_raw_stop_fast();
+        if (fast) { spu_abort_request(s->ctx); hreq++; }
+        while (WaitForSingleObject(s->thread, fast ? 2 : 20) == WAIT_TIMEOUT) {
+            spu_abort_request(s->ctx); hreq++;
+            if (GetTickCount64() - t0 > 5000) {
+                fprintf(stderr, "[spu-raw] spu%u did not honour stop in 5s "
+                                "(pc=0x%05X); terminating its host thread\n",
+                        (unsigned)(s - s_spu), (unsigned)(s->ctx->pc & SPU_LS_MASK));
+                fflush(stderr);
+                TerminateThread(s->thread, 0);
+                break;
+            }
+        }
+        InterlockedExchange(&s->started, 0);
+    }
+    spu_abort_cancel(s->ctx);
+    CloseHandle(s->thread);
+    s->thread = NULL;
+    s->aborting = 0;
+    if (s->ctx) spu_mfc_release(s->ctx);   /* drop the dead run's private MFC engine */
+    QueryPerformanceCounter(&hq1);
+    { double ms = (double)(hq1.QuadPart - hq0.QuadPart) * 1000.0 / (double)hqf.QuadPart;
+      if (ms >= 2.0) { fprintf(stderr, "[spu-raw] spu%u stop took %.1f ms (was running %d, abort re-posts %d)\n",
+                              (unsigned)(s - s_spu), ms, hwasrun, hreq); fflush(stderr); } }
+#else
+    (void)s;
+#endif
+}
+
+/* hitch116: phase stamps of the last raw_spu_start (QPC), printed by the RunCntl=1 line when it was slow: resolve | stop/reap | ctx init |
+ * START print | CreateThread. RunCntl=1 took 14-27 ms in log\hitch104\S1.err and nothing says which phase. */
+static LONGLONG s_ph[6];
+static inline void ph_mark(int i) { LARGE_INTEGER q; QueryPerformanceCounter(&q); s_ph[i] = q.QuadPart; }
 static void raw_spu_start(raw_spu* s)
 {
+    ph_mark(0);
     uint32_t n = (uint32_t)(s - s_spu);
+    /* Resolve into LOCALS: s_pending_* belongs to the import path and persists, so
+     * writing a proxy-load match into it made every later raw SPU (e.g. the
+     * narrow phase after the broad phase) run the first program's code. */
+    spu_lifted_entry_fn entry = s_pending_entry;
+    int image_id = s_pending_image_id;
+
     /* No image was imported: the PPU streamed the program in by proxy DMA.
      * Ports register each image's executable segment too (build_spu_workloads
-     * .text fingerprint), so one of the GET runs matches it. */
-    for (int r = 0; !s_pending_entry && r < s->get_runs; r++) {
-        uint64_t fp = spu_workload_fingerprint(vm_base + s->base + s->get_lo[r],
-                                               s->get_hi[r] - s->get_lo[r]);
-        s_pending_entry = spu_workload_find_img(fp, &s_pending_image_id);
+     * .text fingerprint), so one of the GET runs matches it. Exact fingerprint
+     * first; then the prefix registry, for programs whose trailing parameter
+     * block the guest rewrites before every load (spu_workload_register_prefix). */
+    for (int r = 0; !entry && r < s->get_runs; r++) {
+        const uint8_t* run = vm_base + s->base + s->get_lo[r];
+        size_t run_len = s->get_hi[r] - s->get_lo[r];
+        uint64_t fp = spu_workload_fingerprint(run, run_len);
+        entry = spu_workload_find_img(fp, &image_id);
+        const char* how = "exact";
+        if (!entry) { entry = spu_workload_find_prefix(run, run_len, &image_id); how = "prefix"; }
         fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX -> %s\n",
                 n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
-                s_pending_entry ? "lifted entry registered" : "no match");
+                entry ? (how[0] == 'e' ? "lifted entry registered" : "lifted entry registered (prefix)")
+                      : "no match");
     }
+    const int reloaded = s->get_runs > 0;
     s->get_runs = 0;
-    if (!s_pending_entry) {
+    if (!entry && !reloaded && s->entry) {       /* restart without a reload */
+        entry = s->entry; image_id = s->image_id;
+    }
+    if (!entry) {
         fprintf(stderr, "[spu-raw] spu%u run requested but no lifted image is "
                         "registered -- the SPU cannot run. Lift the image and "
                         "register it (see a port's src/spu_images.c).\n", n);
         fflush(stderr);
         return;
     }
+    ph_mark(1);
 #ifdef _WIN32
-    if (InterlockedCompareExchange(&s->started, 1, 0) != 0) return;  /* already up */
+    if (InterlockedCompareExchange(&s->started, 0, 0)) {
+        /* RunCntl=1 on a SPU that is still running. Hardware: a no-op. But if the
+         * program was reloaded since (proxy GETs), the guest meant a restart and
+         * the stop write was lost or never issued -- the running thread is
+         * executing a stale image over a rewritten LS, so replace it. */
+        if (!reloaded) return;
+        fprintf(stderr, "[spu-raw] spu%u restart while running (LS reloaded): "
+                        "stopping the old run\n", n);
+        raw_spu_stop(s);
+    } else {
+        raw_spu_stop(s);          /* reap a finished run's handle and MFC state */
+    }
+    InterlockedExchange(&s->started, 1);
 #endif
+    ph_mark(2);
 
     if (!s->ctx) {
         s->ctx = (spu_context*)malloc(sizeof(spu_context));
@@ -304,14 +427,16 @@ static void raw_spu_start(raw_spu* s)
     /* THE point of this whole file: local store is the guest window, not a copy.
      * The PPU keeps writing command buffers into it while the SPU runs. */
     s->ctx->ls       = vm_base + s->base;
-    s->ctx->image_id = s_pending_image_id;
-    s->entry         = s_pending_entry;
+    s->ctx->image_id = image_id;
+    s->image_id      = image_id;
+    s->entry         = entry;
     s->ctx->gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;      /* SPU ABI stack top */
 
     uint32_t npc = be32_load(s->base + SPU_RAW_NPC) & ~3u;
-    s->ctx->pc = npc ? npc : s_pending_elf_entry;
+    s->ctx->pc = npc ? npc : (entry == s_pending_entry ? s_pending_elf_entry : 0x100);
 
     g_spu_force_ch_block = 1;   /* an empty RdInMbox must park, not fabricate 0 */
+    ph_mark(3);
 
     /* Local store content at the start of the run. An all-zero LS means nobody
      * loaded the image -- the SPU would branch straight into zeros and halt at
@@ -327,11 +452,13 @@ static void raw_spu_start(raw_spu* s)
               l[0],l[1],l[2],l[3],l[4],l[5],l[6],l[7],
               l[pc],l[pc+1],l[pc+2],l[pc+3], nz); }
     fflush(stderr);
+    ph_mark(4);
 
 #ifdef _WIN32
     s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
     if (!s->thread) InterlockedExchange(&s->started, 0);
 #endif
+    ph_mark(5);
 }
 
 /* ---------------------------------------------------------------------------
@@ -350,8 +477,22 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
 
     switch (off) {
     case SPU_RAW_RUNCNTL:
+        { LARGE_INTEGER hq0, hq1, hqf; QueryPerformanceCounter(&hq0); QueryPerformanceFrequency(&hqf);
         if (val == RUNCNTL_RUN) raw_spu_start(s);
-        else if (s->ctx)        s->ctx->status = SPU_STATUS_STOPPED;
+        else {
+            /* RunCntl=0: really stop the host thread (the guest then reloads
+             * local store and restarts, e.g. igCollBroadSpu at PPU 0x49DAC8). */
+            raw_spu_stop(s);
+            if (s->ctx) s->ctx->status = SPU_STATUS_STOPPED;
+        }
+        QueryPerformanceCounter(&hq1);
+        { double ms = (double)(hq1.QuadPart - hq0.QuadPart) * 1000.0 / (double)hqf.QuadPart;
+          if (ms >= 2.0) { fprintf(stderr, "[spu-raw] spu%u RunCntl=%u took %.1f ms\n", (unsigned)(s - s_spu), (unsigned)val, ms);
+          if (val == RUNCNTL_RUN) { double k = 1000.0 / (double)hqf.QuadPart;
+              fprintf(stderr, "[spu-raw] spu%u   start phases ms: resolve %.1f stop/reap %.1f ctx-init %.1f start-print %.1f CreateThread %.1f\n",
+                      (unsigned)(s - s_spu), (s_ph[1]-s_ph[0])*k, (s_ph[2]-s_ph[1])*k, (s_ph[3]-s_ph[2])*k, (s_ph[4]-s_ph[3])*k, (s_ph[5]-s_ph[4])*k); }
+          fflush(stderr); } }
+        }
         break;
 
     case SPU_RAW_IN_MBOX:
@@ -444,6 +585,12 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
         if (lsa + size > SPU_LS_SIZE) size = SPU_LS_SIZE - lsa;
         uint8_t* ls = vm_base + s->base + lsa;
         if (cmd & 0x40u) {                                      /* GET: EA -> LS */
+            { static int s_ctw = -1; if (s_ctw < 0) { const char* e = getenv("SPU_COLLTAB_WATCH"); s_ctw = (e && e[0] && e[0] != '0') ? 1 : 0; }
+              if (s_ctw && lsa < 0x6D50u && lsa + size > 0x6D20u) {   /* SPU_COLLTAB_WATCH: the PPU reloads the dispatch table */
+                  const uint8_t* t = vm_base + s->base + 0x6D20; const uint8_t* q = vm_base + ea + (0x6D20 > lsa ? 0x6D20 - lsa : 0);
+                  fprintf(stderr, "[colltab] PPU PROXY GET spu%u lsa=0x%05X ea=0x%08X size=0x%X started=%ld; table now %02X%02X%02X%02X %02X%02X%02X%02X, source %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                          (unsigned)(s - s_spu), lsa, ea, size, (long)s->started, t[0],t[1],t[2],t[3],t[4],t[5],t[6],t[7], q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7]);
+              } }
             memcpy(ls, vm_base + ea, size);
             int r = 0;
             while (r < s->get_runs && s->get_hi[r] != lsa) r++;

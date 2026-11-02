@@ -66,6 +66,8 @@ typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
     float min_lod, max_lod;
+    float lod_bias;    /* SET_TEXTURE_FILTER [12:0] (s4.8) + RSX_TEX_LOD_BIAS; 0 without mips */
+    u32 border_argb;   /* SET_TEXTURE_BORDER_COLOR, A8R8G8B8: what the border modes return */
 } rsx_be_sampler_desc;
 
 /* The NV4097 render state a pipeline is built from: rsx_live_draw.c's
@@ -83,6 +85,7 @@ typedef struct rsx_be_render_state {
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    u32 poly_offset_fill, poly_offset_scale, poly_offset_bias;   /* 0x0A68, 0x0A78/0x0A7C (float bits) */
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
@@ -103,7 +106,7 @@ typedef struct rsx_be_render_state {
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
  * where the boundary is rather than assuming a number. */
-#define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE 4096
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -158,6 +161,13 @@ typedef struct rsx_draw_backend {
      * when the backend cannot. The engine binds the copy, with the unit's
      * crossbar, in place of the live target. */
     u32  (*color_snapshot)(void* user, u32 surface);
+    /* Copy the sw x sh rectangle (guest pixels) of colour target src at sx,sy
+     * into the dw x dh one of colour target dst at dx,dy, stretched, at this
+     * point of the stream: an NV3089 blit out of a target that exists only on
+     * the GPU. Each side at its own scale. 0 when the backend cannot. May be
+     * NULL. */
+    int  (*color_copy_rect)(void* user, u32 src, u32 sx, u32 sy, u32 sw, u32 sh,
+                            u32 dst, u32 dx, u32 dy, u32 dw, u32 dh);
     /* Occlusion queries (NV4097 ZPASS reports). query_begin returns a fresh
      * zeroed sample counter (0 when the backend has none); query_set routes
      * the samples that pass the depth/stencil tests in the following draws
@@ -209,6 +219,8 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
+    /* Optional: the blend constant (CONSTANT_COLOR/ALPHA factors), RGBA 0..1. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
@@ -247,6 +259,13 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+    /* Optional (RT_AO, rsx_rt.h): an ambient-occlusion pass over colour target `surface` (reading the
+     * depth target `depth`) at this point of the stream. `job` names the camera the module froze. */
+    void (*rt_ao_inject)(void* user, u32 surface, u32 depth, u32 job);
+    /* Optional (RT_AO): an opaque depth-writing draw into the scene target was just issued: the AO record goes after it. */
+    void (*rt_ao_mark)(void* user);
+    /* Optional (RT_AO): the NEXT draw is a transparent one (blended, depth-tested, not a fur shell): the AO record moves it after itself. */
+    void (*rt_ao_defer)(void* user);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -294,6 +313,9 @@ extern volatile unsigned g_rsx_video_plane_uploads;
  * each change of what is shown. Any thread. */
 void rsx_present_set_content_aspect(float aspect);
 void rsx_present_set_screen_aspect(float aspect);
+/* Ultrawide (TOD_ASPECT): show the whole frame stretched to this shape (width / height), fitted in the middle of the
+ * window, except while a movie plays (that keeps the frame's own 16:9). 0: off. Any thread. */
+void rsx_present_set_frame_shape(float aspect);
 
 /* Draws a host marks to be moved on the target, with nothing else their
  * programs compute changed: a draw whose transform constants hold the bit
@@ -346,12 +368,24 @@ void rsx_draw_engine_texture_standins_changed(void);
 /* A backend's occlusion-query result: the samples that passed for the query
  * that GET_REPORT named report_index. Forwarded to the GCM report table. */
 void rsx_draw_engine_query_result(u32 report_index, u64 count);
+/* RSX_DRAW_SPLIT=2 (draw executor thread B2): wait until every draw queued so far has run / until draw number `seq` has. No-ops otherwise. */
+void rsx_draw_engine_b2_drain_at(const char* file, int line);
+#define rsx_draw_engine_b2_drain() rsx_draw_engine_b2_drain_at(__FILE__, __LINE__)
+/* RSX_DRAW_SPLIT=2 control jobs (27/10 walkF3b): a guest write (label / get) that must become visible only after the draws queued
+ * before it ran. On the walker thread with B2 active it is queued (no blocking drain); otherwise drain + vm_write32. */
+void rsx_draw_engine_b2_ordered_write32(unsigned addr, unsigned val);
+unsigned long long rsx_draw_engine_b2_seq(void);
+void rsx_draw_engine_b2_wait(unsigned long long seq);
 /* Seed the dispatcher from captured state (tools/rsx_replay). Word counts. */
 void rsx_draw_engine_seed_state(const u32* regs, u32 nregs, const u32* vp, u32 nvp,
                                 const u32* constants, u32 nconst_words);
 
 int  rsx_draw_engine_init(u32 width, u32 height);
 void rsx_draw_engine_shutdown(void);
+/* Trace every draw of the four frames starting `after` presents from now. */
+void rsx_draw_engine_trace_after(long after);
+/* Report every draw that changes pixel (x, y) of the 1280x720 picture, `after` presents from now. */
+void rsx_draw_engine_pick_after(int x, int y, long after);
 
 /* One FIFO method, with its subchannel bits still on: the engine masks them
  * out itself, as rsx_live_draw_method (6902-6976) does, because a title whose
@@ -365,6 +399,7 @@ void rsx_draw_engine_method(u32 method, u32 arg);
  * rsx_draw_engine_method on each word. */
 int  rsx_draw_engine_upload_window(u32 method, u32 count);
 void rsx_draw_engine_upload_run(u32 method, u32 count, const u8* be);
+void rsx_draw_engine_method_run(u32 method, u32 count, int incr, const u8* be);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
@@ -377,6 +412,10 @@ void rsx_draw_engine_flush(void);
 /* Finish the GPU work behind any occlusion reports handed to the backend and
  * write their counts into the report area now (no-op when none are out). */
 void rsx_draw_engine_sync_queries(void);
+/* An NV3089 blit (sw x sh source texels -> w x h) out of a colour target the engine drew, done on the GPU
+ * (see rsx_draw_engine.c). 1 when handled; the guest-memory copy still runs. */
+int rsx_draw_engine_blit(u32 src_loc, u32 src_off, u32 src_pitch, u32 sw, u32 sh,
+                         u32 dst_loc, u32 dst_off, u32 dst_pitch, u32 w, u32 h);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */

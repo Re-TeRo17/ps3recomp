@@ -2,6 +2,7 @@
  * ps3recomp - write-watch on guest memory (see include/ps3emu/vm_watch.h)
  */
 #include "ps3emu/vm_watch.h"
+#include "ps3emu/beacon.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,7 +56,10 @@ static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
      * not know it as the watch's. */
     for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 1;
     DWORD old;
-    if (!VirtualProtect(a, n, PAGE_READONLY, &old)) {
+    BEACON_WAIT("vm_watch_protect");
+    const BOOL pok = VirtualProtect(a, n, PAGE_READONLY, &old);
+    BEACON_POP();
+    if (!pok) {
         for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 0;
         return 0;
     }
@@ -113,7 +117,10 @@ int vm_watch_fault(uintptr_t addr, int is_write)
     if (p >= WP_COUNT || !s_prot[p]) return 0;
     (void)is_write;   /* a read cannot fault on a read-only page; whatever it was, open it */
     DWORD old;
-    if (!VirtualProtect(s_base + ((uint64_t)p << WP_SHIFT), 1u << WP_SHIFT, PAGE_READWRITE, &old)) return 0;
+    BEACON_WAIT("vm_watch_fault");
+    const BOOL fok = VirtualProtect(s_base + ((uint64_t)p << WP_SHIFT), 1u << WP_SHIFT, PAGE_READWRITE, &old);
+    BEACON_POP();
+    if (!fok) return 0;
     s_prot[p] = 0;
     InterlockedIncrement(&s_gen[p]);
     { const uint32_t now = (uint32_t)GetTickCount64(); s_quar[p] = now ? now : 1u; }
@@ -290,3 +297,67 @@ void vm_watch_stats(uint64_t* faults, uint64_t* pages_protected)
 int vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
 
 #endif
+
+/* ---- phase beacons (include/ps3emu/beacon.h) --------------------------- */
+#include <stdio.h>
+#ifdef _MSC_VER
+#define BEACON_TLS __declspec(thread)
+#else
+#define BEACON_TLS __thread
+#endif
+
+ps3_beacon_t g_ps3_beacon[BEACON_SLOTS];
+volatile unsigned long long g_ps3_recycle_wait_since;
+static BEACON_TLS int tl_slot = -1;
+static int s_beacon_on = -1;
+static unsigned long long s_beacon_log_ms = 500;
+
+unsigned long long ps3_beacon_ms(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+}
+
+void ps3_beacon_thread(int slot)
+{
+    if (s_beacon_on < 0) {
+        const char* e = getenv("BEACON"); s_beacon_on = !(e && *e == '0');
+        const char* l = getenv("BEACON_LOG_MS"); if (l && atoi(l) > 0) s_beacon_log_ms = (unsigned long long)atoi(l);
+    }
+    if (!s_beacon_on || slot < 0 || slot >= BEACON_SLOTS) return;
+    tl_slot = slot;
+#ifdef _WIN32
+    g_ps3_beacon[slot].tid = (unsigned long)GetCurrentThreadId();
+#endif
+    g_ps3_beacon[slot].depth = 0;
+}
+
+void ps3_beacon_push(const char* name, int timed)
+{
+    const int s = tl_slot;
+    if (s < 0) return;
+    ps3_beacon_t* b = &g_ps3_beacon[s];
+    const int d = b->depth;
+    if (d >= BEACON_DEPTH) { b->depth = d + 1; return; }     /* too deep: counted, not recorded */
+    b->name[d] = name; b->t0[d] = ps3_beacon_ms(); b->timed[d] = (unsigned char)timed;
+    b->depth = d + 1;
+}
+
+void ps3_beacon_pop(void)
+{
+    const int s = tl_slot;
+    if (s < 0) return;
+    ps3_beacon_t* b = &g_ps3_beacon[s];
+    int d = b->depth - 1;
+    if (d < 0) return;
+    if (d < BEACON_DEPTH && b->timed[d]) {
+        const unsigned long long el = ps3_beacon_ms() - b->t0[d];
+        if (el >= s_beacon_log_ms)
+            fprintf(stderr, "[beacon] %s took %llu ms (%s)\n", b->name[d], el, s ? "presenter" : "walker");
+    }
+    b->depth = d;
+}
