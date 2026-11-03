@@ -3805,6 +3805,14 @@ extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
+/* AUDIO_TICK_DIAG (aud104): the guest thread whose blocking calls the title wants timed (the synth tick thread); 0 = none.
+ * Every lv2 syscall (here) and HLE call (ppu_hle.cpp) of that thread reports (kind 0 = syscall / 1 = HLE, number or NID,
+ * guest lr, QPC start, QPC end) to g_blk_diag_fn. One global load per call when off. */
+extern "C" volatile unsigned g_blk_diag_tid = 0;
+extern "C" volatile double g_blk_diag_cpus = 1.0;      /* the watched thread's cycle counter ticks per us (set by the title) */
+extern "C" volatile unsigned g_syn_boost_tid = 0;       /* AUDIO_SYN_LOCK_BOOST: the guest thread whose lwmutex waits make the holder run at HIGHEST */
+extern "C" void (*g_blk_diag_fn)(unsigned kind, unsigned num, uint32_t lr, long long q0, long long q1) = nullptr;
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
@@ -3851,6 +3859,10 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         _TlGuard(ppu_context* c, uint32_t n) : num(n), tid((uint32_t)c->thread_id), on((uint8_t)g_tl_on) { if (on) tl_ppu_ev(0, 0x80000000u | n, c->gpr[3], c->lr, tid); }
         ~_TlGuard() { if (on) tl_ppu_ev(1, 0x80000000u | num, 0, 0, tid); }
     } _tg{ ctx, (uint32_t)num };
+    struct _BlkGuard { uint32_t num, lr; long long q0;
+        ~_BlkGuard() { if (q0) { LARGE_INTEGER q; QueryPerformanceCounter(&q); if (g_blk_diag_fn) g_blk_diag_fn(0, num, lr, q0, q.QuadPart); } }
+    } _bg{ (uint32_t)num, (uint32_t)ctx->lr, 0 };
+    if (__builtin_expect(g_blk_diag_tid != 0, 0) && g_blk_diag_tid == (unsigned)ctx->thread_id) { LARGE_INTEGER q; QueryPerformanceCounter(&q); _bg.q0 = q.QuadPart; }
     /* PPU_WAITPROF (ppu_hle.cpp): time inside this syscall, by call site. */
     const int _wpo = ppu_waitprof_on();
     const unsigned _site = _wpo ? ppu_prof_resolve_host(__builtin_return_address(0)) : 0;

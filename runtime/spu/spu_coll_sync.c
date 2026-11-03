@@ -38,6 +38,7 @@
 #else
 #define COLL_NR
 #endif
+#include "spu_coll_hand.inc"   /* coll102: F_FB a mano (TOD_COLL_HAND=1), codice nostro */
 #include "spu_coll_l2_nc.h"
 #include "spu_coll_l2_gen_all.inc"
 #include "spu_coll_l2_gen_pro.inc"
@@ -154,6 +155,7 @@ int spu_coll_sync_mode(void)
         if (getenv("SPU_LS_WATCH") || getenv("SPU_LS_LOWREAD") || getenv("SPU_SMC_WATCH") || getenv("SPU_COLLTAB_WATCH") || getenv("SPU_JOBTRACE") || getenv("SPU_JOBEXEC")) m = 0;
         const char* w = getenv("SPU_COLL_SYNC_WAITMS"); if (w && *w) s_waitms = (unsigned)atoi(w);
         s_mode = m;
+        coll_hand_init();
         if (m) fprintf(stderr, "[coll-sync] SPU_COLL_SYNC=%d (%s)\n", m, m == 2 ? "DOPPIO: nativo su copia + raw SPU vere + confronto" : "NATIVO con fallback alle raw SPU");
     }
     return s_mode;
@@ -473,6 +475,7 @@ static void sync_print_stats(const char* why)
     if (s_ns_n) fprintf(stderr, "[coll-sync]   fasi (us/ticket): prepare %.2f (n=%ld) | stadio110 %.2f | stadio111 %.2f | apply %.2f (n=%ld) | PUT/ticket %.1f | voci hist [0,1-2,3-4,5-8,9-16,17-32,33-64,65+] = %ld %ld %ld %ld %ld %ld %ld %ld\n", s_n_prep ? s_t_prep / s_n_prep / 1000.0 : 0, s_n_prep, s_t_pro / s_ns_n / 1000.0, s_t_111 / s_ns_n / 1000.0, s_n_apply ? s_t_apply / s_n_apply / 1000.0 : 0, s_n_apply, (double)s_nw_sum / s_ns_n, s_ent_hist[0], s_ent_hist[1], s_ent_hist[2], s_ent_hist[3], s_ent_hist[4], s_ent_hist[5], s_ent_hist[6], s_ent_hist[7]);
     if (s_ns_n) fprintf(stderr, "[coll-sync]   GET memoria/ticket %.1f (%.0f B) in %.2f us; GET da LS(alias)/ticket %.1f\n", (double)s_n_get / s_ns_n, (double)s_b_get / s_ns_n, s_t_get / s_ns_n / 1000.0, (double)s_n_lsget / s_ns_n);
     fprintf(stderr, "[coll-sync]   DIFF RILEVANTI (byte letti dal PPU) %ld su %ld confronti (t0 %ld t1 %ld t2 %ld)\n", c_rel, tot, c_rel_ty[0], c_rel_ty[1], c_rel_ty[2]);
+    coll_hand_report();
     if (s_fast > 0) fprintf(stderr, "[coll-sync]   FAST: sync incrementali %ld, completi %ld (K=%u), blocchi in S %ld, scoperte tardive %ld\n", c_fast_inc, c_fast_full, s_K, c_Sn, c_late);
     if (s_m1view > 0) fprintf(stderr, "[coll-sync]   M1VIEW attivo: blocchi aggiornati da scritture esterne (PPU) %ld\n", c_m1_upd);
     if (s_n_fullcopy) fprintf(stderr, "[coll-sync]   FULL copy veloce: %ld copie (fast %ld, forzate %ld), %.2f us/copia; nosync=%d chk=%u\n", s_n_fullcopy, c_full_fast, c_full_forced, s_t_fullcopy / s_n_fullcopy / 1000.0, s_nosync, s_chk);

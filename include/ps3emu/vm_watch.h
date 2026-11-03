@@ -45,6 +45,10 @@ void     vm_watch_touch(uint32_t ea, uint32_t len);
  * 1 when it was a watched page (now writable, marked written). */
 int      vm_watch_fault(uintptr_t addr, int is_write);
 void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected);
+/* metro131: one write counter per 1 MB chunk of the guest space (4096 of them), bumped whenever a page of the chunk is written (fault or
+ * vm_watch_touch). NULL where there is none. An entry that was validated with every page watched and finds the counters of the chunks it
+ * lies in unchanged has not been written since: no page walk needed. */
+volatile long* vm_watch_chunk_gens(void);
 /* Commit the RESERVED pages of host range [p, p+n) read-write and leave the
  * committed ones alone; 1 on success. Every commit of guest memory goes
  * through this: on Windows, MEM_COMMIT over a page that is already committed

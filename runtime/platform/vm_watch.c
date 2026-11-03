@@ -24,6 +24,7 @@ static volatile LONG* s_gen;      /* writes seen, per page                     *
 static uint8_t*       s_prot;     /* 1: read-only now                          */
 static uint32_t*      s_quar;     /* GetTickCount64 of the last write, or 0    */
 static volatile LONGLONG s_faults, s_protected;
+static volatile LONG s_cgen[4097];   /* [4096] = prof102: global write epoch (every page write) */
 
 void vm_watch_init(uint8_t* base, uint64_t size)
 {
@@ -37,6 +38,7 @@ void vm_watch_init(uint8_t* base, uint64_t size)
 }
 
 int vm_watch_available(void) { return s_on; }
+volatile long* vm_watch_chunk_gens(void) { return s_on ? (volatile long*)s_cgen : NULL; }
 
 static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
 {
@@ -106,6 +108,7 @@ void vm_watch_touch(uint32_t ea, uint32_t len)
             s_prot[p] = 0;
         }
         InterlockedIncrement(&s_gen[p]);
+        InterlockedIncrement(&s_cgen[p >> 8]); InterlockedIncrement(&s_cgen[4096]);
         s_quar[p] = now ? now : 1u;
     }
 }
@@ -123,6 +126,7 @@ int vm_watch_fault(uintptr_t addr, int is_write)
     if (!fok) return 0;
     s_prot[p] = 0;
     InterlockedIncrement(&s_gen[p]);
+    InterlockedIncrement(&s_cgen[p >> 8]); InterlockedIncrement(&s_cgen[4096]);
     { const uint32_t now = (uint32_t)GetTickCount64(); s_quar[p] = now ? now : 1u; }
     InterlockedIncrement64(&s_faults);
     return 1;
@@ -203,6 +207,7 @@ void vm_watch_init(uint8_t* base, uint64_t size)
 }
 
 int vm_watch_available(void) { return s_on; }
+volatile long* vm_watch_chunk_gens(void) { return NULL; }   /* metro131: not on this host */
 
 static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
 {

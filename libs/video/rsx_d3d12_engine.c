@@ -948,9 +948,11 @@ static void fence_wait_at2(u64 v, int line);
 static void fence_wait_at(u64 v, int line)
 {
     if (!v || CALL0(s_fence, GetCompletedValue) >= v) return;
+    RSX_B2P_ENTER(B2P_WFENCE); RSX_B2P_ADD(B2C_FENCEBLK, 1);
     BEACON_WAIT("fence_wait");
     fence_wait_at2(v, line);
     BEACON_POP();
+    RSX_B2P_LEAVE();
 }
 static void fence_wait_at2(u64 v, int line)
 {
@@ -1304,7 +1306,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
              * and wait rather than drop the rest of the frame. */
             if (s_enc_pending && !t_on_enc) { eng_enc_join_why("stage_full", 0); continue; }   /* a held chunk may be free by now */
             if (!s_rec_count) return 0;
+            RSX_B2P_ENTER(B2P_WSUBMIT); RSX_B2P_ADD(B2C_SUBMIT, 1);
             eng_submit(0, 1);
+            RSX_B2P_LEAVE();
             continue;
         }
         s = &s_stage[i];
@@ -1326,8 +1330,10 @@ static u8* eng_stage_ptr(u32 off)
 static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 {
     if (!bytes) { *out_off = 0; return 1; }
-    if (!eng_stage_reserve(bytes, out_off)) return 0;
+    RSX_B2P_ENTER(B2P_STAGE); RSX_B2P_ADD(B2C_STAGE, 1); RSX_B2P_ADD(B2C_STAGEB, bytes);
+    if (!eng_stage_reserve(bytes, out_off)) { RSX_B2P_LEAVE(); return 0; }
     memcpy(eng_stage_ptr(*out_off), src, bytes);
+    RSX_B2P_LEAVE();
     return 1;
 }
 
@@ -2152,8 +2158,25 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     return handle;
 }
 
+/* 03/11 encjoin: RSX_SURFVIEW_LAZYJOIN=1 looks the view up BEFORE the join. s_view[], s_view_count and the surface's o->res are
+ * written only by walker-thread entries that join first (eng_obj_release, eng_rescale, eng_collect_retired, creation below); the
+ * encode thread never writes them (it only reads o->res; eng_aa_target there releases the host-only AA object, which has no view). */
+static int eng_surfview_lazy(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_SURFVIEW_LAZYJOIN"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
 static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
 {
+    if (eng_surfview_lazy()) {
+        EngObj* lo = eng_obj(surface);
+        if (lo && lo->res)
+            for (u32 i = 0; i < s_view_count; i++)
+                if (s_view[i].surface == surface && s_view[i].remap == remap && s_view[i].format == rsx_format)
+                    return s_view[i].view;
+    }
     ENG_JOIN("surface_view");
     (void)user;
     EngObj* o = eng_obj(surface);
@@ -3069,7 +3092,15 @@ static int eng_aniso_tex(u32 handle)
     const EngObj* o = eng_obj(handle);
     return o && o->kind == OBJ_TEXTURE && o->mips > 1;
 }
+static int eng_sampler_slot_impl(const rsx_be_sampler_desc* d, int aniso_ok);
 static int eng_sampler_slot(const rsx_be_sampler_desc* d, int aniso_ok)
+{
+    RSX_B2P_ENTER(B2P_SAMPLER);
+    const int v = eng_sampler_slot_impl(d, aniso_ok);
+    RSX_B2P_LEAVE();
+    return v;
+}
+static int eng_sampler_slot_impl(const rsx_be_sampler_desc* d, int aniso_ok)
 {
     aniso_ok = aniso_ok && g_eng_aniso_on && eng_aniso() > 1 && d->min_linear && d->mag_linear && d->mip_present;
     const u64 key = ((u64)(aniso_ok ? eng_aniso() : 0) << 56) | (u64)d->min_linear | ((u64)d->mag_linear << 1)
@@ -3194,8 +3225,12 @@ static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 static void eng_bind_textures(void* user, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)user;
+    extern int g_wp2_on; extern unsigned long long g_wp2_samp_cyc;   /* prof102: RSX_WPROF=2 times the sampler-slot lookups of 1 draw in 16 (x16) */
+    static unsigned s_wk;
+    const int timed = g_wp2_on && ((++s_wk) & 15u) == 0;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         s_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+        if (timed && ((mask >> u) & 1u)) { const unsigned long long a_ = __rdtsc(); s_pending.samp[u] = eng_sampler_slot(&samplers[u], eng_aniso_tex(textures[u])); g_wp2_samp_cyc += (__rdtsc() - a_) * 16ull; continue; }
         s_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u], eng_aniso_tex(textures[u])) : -1;
     }
 }
@@ -5112,7 +5147,8 @@ static void eng_enc_join_why(const char* why, int is_handover)
     if (!s_enc_pending) return;
     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
     const int idle = WaitForSingleObject(s_enc_done, 0) == WAIT_OBJECT_0;
-    if (!idle) { BEACON_WAIT("enc_join"); WaitForSingleObject(s_enc_done, INFINITE); BEACON_POP(); }
+    RSX_B2P_ADD(B2C_ENCJOIN, 1);
+    if (!idle) { RSX_B2P_ENTER(B2P_WENC); RSX_B2P_ADD(B2C_ENCBLK, 1); BEACON_WAIT("enc_join"); WaitForSingleObject(s_enc_done, INFINITE); BEACON_POP(); RSX_B2P_LEAVE(); }
     QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
     const double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
     g_rsx_frame_join_ms += ms;   /* surf54: for the [hitch] line */
@@ -5246,8 +5282,11 @@ static int pw_on(void)
     return g_pw_on;
 }
 #define PW_LAP(i, t) do { if (pw_on()) { const double n_ = pw_t(); g_pw_ms[i] += n_ - (t); (t) = n_; } } while (0)
+static u32 s_last_present_surface;     /* svpick: the surface of the last present, for rsx_d3d12_engine_repaint */
+static ULONGLONG s_last_present_tick;
 static void eng_submit_impl(u32 present_surface, int wait)
 {
+    if (present_surface) { s_last_present_surface = present_surface; s_last_present_tick = GetTickCount64(); }
     if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
     if (!s_ready) { ENG_JOIN("not_ready"); s_rec_count = 0; s_rt_mark = ~0u; eng_stage_submitted(0); s_vis_npending = 0; return; }
     if (s_fs_restore && present_surface) { ENG_JOIN("fs_restore"); eng_fullscreen_restore(); }
@@ -5433,10 +5472,23 @@ static void eng_submit(u32 present_surface, int wait)
     BEACON_POP();
 }
 
+/* svpick: present the last frame again (with the overlay on top). The save-slot picker blocks the guest thread, so no
+ * new flip comes while it is open; its wait loop calls this ~30x/s. Does nothing while the game is still presenting
+ * (last present < 120 ms ago) or when there is no window. */
+void rsx_d3d12_engine_repaint(void)
+{
+    if (!s_active || !s_ready || s_headless || !s_last_present_surface) return;
+    if (GetTickCount64() - s_last_present_tick < 120) return;
+    eng_submit(s_last_present_surface, 1);
+    s_last_present_tick = GetTickCount64() - 100;
+}
+
 static void eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;
+    RSX_B2P_ENTER(B2P_WSUBMIT); RSX_B2P_ADD(B2C_SUBMIT, 1);
     eng_submit(0, 1);
+    RSX_B2P_LEAVE();
 }
 
 /* ---- readback and present -------------------------------------------------- */

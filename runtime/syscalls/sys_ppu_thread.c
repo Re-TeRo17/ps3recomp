@@ -412,6 +412,13 @@ uint64_t ppu_thread_register_main(void)
  * guest thread `tid`'s HOST thread, in microseconds. Distinguishes a lock
  * holder that is CPU-BOUND in recompiled code (cpu delta ~= wall delta) from
  * one BLOCKED in a wait (cpu delta ~= 0). Returns 0 if unknown. */
+/* Name of guest thread `tid` (the title's sys_ppu_thread_create name); AUDIO_TICK_DIAG output. */
+const char* ppu_thread_name_of(unsigned tid)
+{
+    if (tid == 1) return "ppu main";
+    if (tid < 2 || tid > PPU_THREAD_MAX) return "?";
+    return g_ppu_threads[tid - 1].name;
+}
 unsigned long long ppu_thread_cpu_us(unsigned tid)
 {
 #ifdef _WIN32

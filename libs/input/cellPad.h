@@ -242,6 +242,13 @@ void cellPad_host_ds_triggers(u32 port, const u8* r2, const u8* l2);
 void cellPad_host_ds_fire_on_r2(int on);
 void cellPad_host_ds_r2_threshold(int raw255);
 
+/* Trigger motors (Xbox One / Series "impulse triggers", through SDL's trigger rumble). Any thread.
+ *   trig_rumble_present: the controller on this port has motors in its triggers.
+ *   trig_rumble:         run them at left / right (0..65535) for ms milliseconds (0 0 = stop).
+ * PAD_RUMBLE=0 silences them too. */
+int  cellPad_host_trig_rumble_present(u32 port);
+void cellPad_host_trig_rumble(u32 port, u16 left, u16 right, u32 ms);
+
 #ifdef __cplusplus
 }
 #endif

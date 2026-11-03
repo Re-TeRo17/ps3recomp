@@ -465,6 +465,8 @@ extern "C" void ppu_waitprof_report(double window_s)
     }
 }
 
+extern "C" volatile unsigned g_blk_diag_tid;
+extern "C" void (*g_blk_diag_fn)(unsigned kind, unsigned num, uint32_t lr, long long q0, long long q1);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -541,6 +543,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     } _wg{ (unsigned)ctx->thread_id, _site, _wp_on ? ppu_waitprof_now() : 0,
            _wp_on ? tl_wp_name : nullptr, _wp_on };
     if (_wp_on) tl_wp_name = nullptr;
+    /* AUDIO_TICK_DIAG (aud104): time the HLE calls of the one thread the title watches (see lv2_syscall). */
+    struct _BlkGuard { uint32_t nid, lr; long long q0;
+        ~_BlkGuard() { if (q0) { LARGE_INTEGER q; QueryPerformanceCounter(&q); if (g_blk_diag_fn) g_blk_diag_fn(1, nid, lr, q0, q.QuadPart); } }
+    } _bg{ nid, (uint32_t)ctx->lr, 0 };
+    if (__builtin_expect(g_blk_diag_tid != 0, 0) && g_blk_diag_tid == (unsigned)ctx->thread_id) { LARGE_INTEGER q; QueryPerformanceCounter(&q); _bg.q0 = q.QuadPart; }
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *

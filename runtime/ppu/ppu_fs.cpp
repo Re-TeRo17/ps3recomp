@@ -195,6 +195,10 @@ static void host_path(char* out, size_t cap, const char* guest)
     ps3_vfs_ps3game_fallback(out, cap);
 }
 
+/* Optional hook set by the host program: called after a failed read-only cellFsOpen with the guest path and the
+ * host path that failed; it may rewrite the host path (return 1) so the open is retried there. */
+extern "C" { int (*ps3_fs_open_fallback)(const char* guest, char* host_path, size_t cap) = nullptr; }
+
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
@@ -257,6 +261,8 @@ static void cellFsOpen(ppu_context* ctx)
         }
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
+    if (hfd < 0 && acc == CELL_FS_O_RDONLY && ps3_fs_open_fallback && ps3_fs_open_fallback(gpath, hpath, sizeof hpath))
+        hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags 0x%X: %s)\n", gpath, hpath,
                 flags, strerror(errno));

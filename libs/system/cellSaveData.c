@@ -359,6 +359,119 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
     printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
     return result;
 }
+/* gp101 03/11: newest-entry selection for the title's fixedList (see dispatch_func_select). */
+static int savedata_pick_legacy(void)
+{
+    const char* e = getenv("PS3_SAVEDATA_PICK");
+    return e && !strcmp(e, "legacy");
+}
+
+/* Modification time of a save directory: GAME.SAV when present, else the directory; 0 when it does not exist. */
+static long long savedata_dir_mtime(const char* name)
+{
+    char path[1100];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s/GAME.SAV", s_save_root, name);
+    if (stat(path, &st) == 0) return (long long)st.st_mtime;
+    snprintf(path, sizeof path, "%s/%s", s_save_root, name);
+    if (stat(path, &st) == 0) return (long long)st.st_mtime;
+    return 0;
+}
+
+/* 1 when the newData name is empty or already a directory on disk. */
+static int savedata_new_name_taken(uint32_t name_ea)
+{
+    char nm[64];
+    for (int i = 0; i < 63; i++) { nm[i] = (char)vm_read8(name_ea + (uint32_t)i); if (!nm[i]) break; }
+    nm[63] = 0;
+    if (!nm[0]) return 1;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%s", s_save_root, nm);
+    const int taken = dir_exists(path);
+    if (taken) printf("[cellSaveData] newData '%s' already exists on disk -> not created again%c", nm, 10);
+    return taken;
+}
+
+/* EA of the fixedList entry (48-byte DirList records, dirName first) with the newest mtime; first entry on a tie. */
+static uint32_t savedata_newest_fixed(uint32_t fixed_ea, uint32_t n)
+{
+    uint32_t best = fixed_ea;
+    long long best_t = -1;
+    if (n > 64) n = 64;
+    for (uint32_t i = 0; i < n; i++) {
+        char nm[33];
+        for (int k = 0; k < 32; k++) nm[k] = (char)vm_read8(fixed_ea + i * 48 + (uint32_t)k);
+        nm[32] = 0;
+        if (!nm[0]) continue;
+        const long long t = savedata_dir_mtime(nm);
+        if (t > best_t) { best_t = t; best = fixed_ea + i * 48; }
+    }
+    return best;
+}
+
+
+/* svpick 03/11: the on-screen save-slot picker. The port's overlay (src/ui/tod_overlay.cpp) installs the hook; with no
+ * hook, TOD_SAVE_PICKER=0, PS3_SAVEDATA_PICK=legacy, or a single choice, the automatic pick above stays as it was.
+ * Hook: blocks the calling (guest) thread until the user chooses. Returns the index in names[] (0..n-1), -1 = cancel,
+ * -2 = no UI available (fall back to the automatic pick). */
+typedef int (*cellSaveData_pick_hook_t)(int is_save, int n, const char* const* names, const char* const* infos,
+                                        int new_idx, int def_idx);
+static cellSaveData_pick_hook_t s_pick_hook;
+void cellSaveData_set_pick_hook(cellSaveData_pick_hook_t fn) { s_pick_hook = fn; }
+
+#define CELL_SAVEDATA_RET_CANCEL_HLE 1   /* CELL_CANCEL: what the system returns when the user cancels the list dialog */
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+static int savedata_picker_enabled(void)
+{
+    const char* e = getenv("TOD_SAVE_PICKER");
+    if (e && e[0] == '0') return 0;
+    return s_pick_hook != NULL && !savedata_pick_legacy();
+}
+
+/* Ask the user which of the fixedList entries (and the newData slot, new_ea != 0) to use. Returns the EA of the chosen
+ * name (fixed[i] or new_ea), 0 + *cancel=1 on cancel, 0 + *cancel=0 when there is nothing to ask / no UI. */
+static uint32_t savedata_ask_user(uint32_t fixed_ea, uint32_t fixed_n, uint32_t new_ea, int is_save, int* cancel)
+{
+    enum { MAXC = 65 };
+    static char names[MAXC][40], infos[MAXC][160];
+    const char* pn[MAXC]; const char* pi[MAXC];
+    uint32_t eas[MAXC];
+    int n = 0, new_idx = -1, def_idx = 0;
+    long long best_t = -1;
+    *cancel = 0;
+    if (!savedata_picker_enabled()) return 0;
+    if (fixed_n > 64) fixed_n = 64;
+    for (uint32_t i = 0; i < fixed_n && fixed_ea; i++) {
+        char nm[33];
+        for (int k = 0; k < 32; k++) nm[k] = (char)vm_read8(fixed_ea + i * 48 + (uint32_t)k);
+        nm[32] = 0;
+        if (!nm[0]) continue;
+        snprintf(names[n], sizeof names[n], "%s", nm);
+        char path[1100]; CellSaveDataSystemFileParam prm;
+        snprintf(path, sizeof path, "%s/%s", s_save_root, nm);
+        read_param_sfo(path, &prm);
+        prm.subTitle[sizeof prm.subTitle - 1] = 0;
+        const long long t = savedata_dir_mtime(nm);
+        if (t > best_t) { best_t = t; def_idx = n; }
+        char when[40] = "";
+        if (t > 0) { time_t tt = (time_t)t; struct tm* lt = localtime(&tt); if (lt) strftime(when, sizeof when, "%Y-%m-%d  %H:%M", lt); }
+        snprintf(infos[n], sizeof infos[n], "%s%s%s", when, (when[0] && prm.subTitle[0]) ? "   -   " : "", prm.subTitle);
+        pn[n] = names[n]; pi[n] = infos[n]; eas[n] = fixed_ea + i * 48; n++;
+    }
+    if (is_save && new_ea && n < MAXC) {
+        snprintf(names[n], sizeof names[n], "(new save)");
+        for (int k = 0; k < 32; k++) { char c = (char)vm_read8(new_ea + (uint32_t)k); if (!c) { infos[n][k] = 0; break; } infos[n][k] = c; infos[n][k + 1] = 0; }
+        pn[n] = names[n]; pi[n] = infos[n]; eas[n] = new_ea; new_idx = n; def_idx = n; n++;
+    }
+    if (n < 2) return 0;
+    printf("[savepick] %s: asking the user, %d choices (newData=%s)%c", is_save ? "save" : "load", n, new_idx >= 0 ? "yes" : "no", 10);
+    const int r = s_pick_hook(is_save, n, pn, pi, new_idx, def_idx);
+    if (r == -2) { printf("[savepick] no UI -> automatic pick%c", 10); return 0; }
+    if (r < 0 || r >= n) { printf("[savepick] cancelled by the user%c", 10); *cancel = 1; return 0; }
+    printf("[savepick] user chose #%d '%s'%c", r, pn[r], 10);
+    return eas[r];
+}
 
 /* Dispatch a List/Fixed selection callback.
  *
@@ -395,8 +508,9 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  * listed the new-save name wins -- headless, there is no user to pick. */
 static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
-                                uint32_t userdata_ea, const char* who, char selected[64])
+                                uint32_t userdata_ea, const char* who, char selected[64], int* cancelled)
 {
+    if (cancelled) *cancelled = 0;
     selected[0] = '\0';
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
@@ -429,8 +543,20 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
     const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
     uint32_t pick = 0;
-    if (is_save && new_name && fixed_n == 0) pick = new_name;
-    else if (fixed_n && fixed)               pick = fixed;
+    /* gp101 03/11: the title's list callbacks hand the system UI EVERY save in fixedList (load: funcList 0x6C74B8
+     * sets fixedList=dirList, newData=0; save: funcList 0x695780 adds a newData entry while slots < max). No UI here,
+     * so "fixedList[0]" was the alphabetically first dir: a load took the OLDER of two saves, and a save with newData
+     * overwrote SAVE_1 instead of creating the new slot. Now a save with newData creates that slot (unless it exists
+     * on disk), and a load / save over an existing slot takes the NEWEST fixedList entry.
+     * PS3_SAVEDATA_PICK=legacy restores the old rule. */
+    const int legacy_pick = savedata_pick_legacy();
+    int ask_cancel = 0;
+    const uint32_t asked = (result >= 0 && (fixed_n || new_name)) ? savedata_ask_user(fixed, fixed_n, new_name, is_save, &ask_cancel) : 0;
+    if (ask_cancel) { if (cancelled) *cancelled = 1; return result; }
+    if (asked) pick = asked;
+    else if (!legacy_pick && is_save && new_name && !savedata_new_name_taken(new_name)) pick = new_name;
+    else if (is_save && new_name && fixed_n == 0) pick = new_name;
+    else if (fixed_n && fixed)               pick = legacy_pick ? fixed : savedata_newest_fixed(fixed, fixed_n);
     else if (new_name)                       pick = new_name;
     else if (focus)                          pick = focus;
     if (pick) {
@@ -1155,17 +1281,28 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    int user_cancel = 0;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 1,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir, &user_cancel);
     (void)listSet;
 
+    if (user_cancel) {   /* svpick: the user backed out of the slot picker; the title's stat/file callbacks never run */
+        free(dirList);
+        return CELL_SAVEDATA_RET_CANCEL_HLE;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
-    if (!selectedDir[0] && dirCount > 0)
-        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+    if (!selectedDir[0] && dirCount > 0) {
+        u32 bi = 0; long long bt = -1;    /* gp101: newest, not alphabetically first */
+        for (u32 i = 0; i < dirCount && i < dir_max && !savedata_pick_legacy(); i++) {
+            const long long t = savedata_dir_mtime(dirList[i].dirName);
+            if (t > bt) { bt = t; bi = i; }
+        }
+        strncpy(selectedDir, dirList[bi].dirName, sizeof selectedDir - 1);
+    }
     if (!selectedDir[0]) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_NODATA;
@@ -1215,17 +1352,28 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    int user_cancel = 0;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 0,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir, &user_cancel);
     (void)listSet;
 
+    if (user_cancel) {   /* svpick: the user backed out of the slot picker; the title's stat/file callbacks never run */
+        free(dirList);
+        return CELL_SAVEDATA_RET_CANCEL_HLE;
+    }
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
-    if (!selectedDir[0] && dirCount > 0)
-        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+    if (!selectedDir[0] && dirCount > 0) {
+        u32 bi = 0; long long bt = -1;    /* gp101: newest, not alphabetically first */
+        for (u32 i = 0; i < dirCount && i < dir_max && !savedata_pick_legacy(); i++) {
+            const long long t = savedata_dir_mtime(dirList[i].dirName);
+            if (t > bt) { bt = t; bi = i; }
+        }
+        strncpy(selectedDir, dirList[bi].dirName, sizeof selectedDir - 1);
+    }
     if (!selectedDir[0]) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_NODATA;

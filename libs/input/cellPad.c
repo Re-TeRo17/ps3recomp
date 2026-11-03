@@ -266,6 +266,10 @@ static volatile int        s_sdl_quit;
 static PadHostState        s_sdl_state[PAD_MAX_HOST_PORTS];      /* under s_sdl_lock */
 static u8                  s_sdl_rumble[PAD_MAX_HOST_PORTS][2];  /* large, small; under s_sdl_lock */
 static int                 s_sdl_rumble_new[PAD_MAX_HOST_PORTS]; /* under s_sdl_lock */
+static u16                 s_trig_rumble[PAD_MAX_HOST_PORTS][2]; /* left, right trigger motor; under s_sdl_lock */
+static u32                 s_trig_rumble_ms[PAD_MAX_HOST_PORTS]; /* under s_sdl_lock */
+static int                 s_trig_rumble_new[PAD_MAX_HOST_PORTS];/* under s_sdl_lock */
+static volatile int        s_trig_rumble_has[PAD_MAX_HOST_PORTS];/* the pad thread's answer to SDL_GameControllerHasRumbleTriggers */
 /* The pad thread's own */
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 
@@ -590,7 +594,13 @@ static void pad_sdl_rumble_apply(void)
     const Uint32 now = SDL_GetTicks();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
+        s_trig_rumble_has[i] = gc && SDL_GameControllerHasRumbleTriggers(gc);
         if (!gc) continue;
+        if (s_trig_rumble_new[i]) {          /* the trigger motors: one request, SDL keeps it for its duration */
+            s_trig_rumble_new[i] = 0;
+            if (s_trig_rumble_has[i])
+                SDL_GameControllerRumbleTriggers(gc, s_trig_rumble[i][0], s_trig_rumble[i][1], s_trig_rumble_ms[i]);
+        }
         const int on = s_sdl_rumble[i][0] || s_sdl_rumble[i][1];
         if (!s_sdl_rumble_new[i] && !(on && now - last[i] >= 50)) continue;
         s_sdl_rumble_new[i] = 0;
@@ -667,6 +677,20 @@ void cellPad_host_ds_r2_threshold(int raw255)
     if (raw255 > 250) raw255 = 250;
     s_ds_r2_thr = raw255 * 32767 / 255;
 }
+int cellPad_host_trig_rumble_present(u32 port)
+{
+    return port < PAD_MAX_HOST_PORTS && s_trig_rumble_has[port];
+}
+void cellPad_host_trig_rumble(u32 port, u16 left, u16 right, u32 ms)
+{
+    if (port >= PAD_MAX_HOST_PORTS || !s_sdl_lock) return;
+    SDL_LockMutex(s_sdl_lock);
+    s_trig_rumble[port][0] = left;
+    s_trig_rumble[port][1] = right;
+    s_trig_rumble_ms[port] = ms;
+    s_trig_rumble_new[port] = 1;
+    SDL_UnlockMutex(s_sdl_lock);
+}
 
 static void pad_init_backend(void)
 {
@@ -699,6 +723,8 @@ int  cellPad_host_ds_present(u32 port) { (void)port; return 0; }
 void cellPad_host_ds_triggers(u32 port, const u8* r2, const u8* l2) { (void)port; (void)r2; (void)l2; }
 void cellPad_host_ds_fire_on_r2(int on) { (void)on; }
 void cellPad_host_ds_r2_threshold(int raw255) { (void)raw255; }
+int  cellPad_host_trig_rumble_present(u32 port) { (void)port; return 0; }
+void cellPad_host_trig_rumble(u32 port, u16 left, u16 right, u32 ms) { (void)port; (void)left; (void)right; (void)ms; }
 #endif
 
 

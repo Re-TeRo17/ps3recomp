@@ -252,7 +252,13 @@ static volatile int s_arm_lock;   /* serialises vm_watch_arm while prep workers 
 int g_wp_fl = -1; unsigned long long g_wp_c[6], g_wp_meths, g_wp_runs, g_wp_runw, g_wp_cmds;
 unsigned long long g_wp_fifo_cyc, g_wp_enc_cyc, g_wp_fifo_calls;   /* cellGcmSys.c / rsx_d3d12_engine.c */
 static int s_wp_on = -1, s_wk_fast = -1;
-static unsigned long long s_wp_cyc[8], s_wp_draws, s_wp_nscan, s_wp_nmiss;
+static unsigned long long s_wp_cyc[64], s_wp_draws, s_wp_nscan, s_wp_nmiss, s_wp_n2[48];
+int g_wp2_on; unsigned long long g_wp2_samp_cyc;   /* prof102: set when RSX_WPROF=2; the D3D12 backend adds its sampler-slot time */
+static unsigned s_tdec_pass, s_wp_dk;   /* prof102: which pass decodes a texture unit; sample counter */
+#define WP2_CNT(i) do { if (s_wp_on > 1) s_wp_n2[i]++; } while (0)
+/* RSX_WPROF=2 (metro131): finer rdtsc buckets [wprof5]; cycle slots 8.. , counters s_wp_n2. */
+#define WP2_BEGIN(v) unsigned long long v = s_wp_on > 1 ? wp_tsc() : 0
+#define WP2_END(v, k) do { if (s_wp_on > 1) s_wp_cyc[k] += wp_tsc() - (v); } while (0)
 static u32 s_zgen = 1;                                       /* walk37: bumped when a depth target is created or moved to another address */
 static struct { u32 loc, off, gen; } s_tex_znomatch[16];      /* per texture unit: no depth target at loc/off as of s_zgen */
 static u32 s_surf_gen = 1;                                   /* bumped when the surface set changes */
@@ -273,10 +279,88 @@ static inline unsigned long long wp_tsc(void)
     return 0;
 #endif
 }
+/* metro131 RSX_TEX_DEC_MEMO=1 (default OFF): the draw-side view's texture unit u, decoded once per change of its registers (snap_apply marks them in
+ * g_snap_tex_dirty) instead of by every consumer of every draw. Only for the B2 view; anything else decodes as before. */
+static inline void eng_get_tex_impl(const rsx_dispatch* rsx, u32 u, rsx_dsp_texture* t);
+static inline void eng_get_tex(const rsx_dispatch* rsx, u32 u, rsx_dsp_texture* t)
+{
+    if (s_wp_on > 1) {   /* prof102: decode calls per pass; 1 call in 16 is timed (x16) */
+        s_wp_n2[10 + s_tdec_pass]++;
+        if ((++s_wp_dk & 15u) == 0) { const unsigned long long a_ = wp_tsc(); eng_get_tex_impl(rsx, u, t); s_wp_cyc[40 + s_tdec_pass] += (wp_tsc() - a_) * 16ull; return; }
+    }
+    eng_get_tex_impl(rsx, u, t);
+}
+/* opt102 RSX_TEXMASK_MEMO (1.1: default ON, =0 off, =2: check). (a) Per-unit decode memo: the unit's 9 raw register words (8-word block 0x1A00 + u*0x20 and
+ * the size1 word 0x1840 + u*4) are compared with the ones the memoised rsx_dsp_texture was decoded from; equal = same struct, no decode.
+ * Pure function of those words, so valid for any view (per thread). (b) eng_texmasks_get below: the masks of eng_pipeline_get. */
+static int s_tm_mode = -1;                       /* 0 off, 1 on, 2 on + compare with a fresh computation */
+static ENG_TLS int s_tm_raw;                     /* set while a check computes the old way: no memo at all */
+static unsigned long long s_tm_dec_n, s_tm_dec_bad, s_tm_mask_n, s_tm_mask_hit, s_tm_mask_bad, s_tm_vt_n, s_tm_vt_bad;
+static ENG_TLS struct { u32 raw[9]; int valid; rsx_dsp_texture t; } s_tdm[RSX_DSP_NUM_TEXTURES];
+static inline int eng_tm_mode(void)
+{
+    if (s_tm_mode < 0) { const char* e = getenv("RSX_TEXMASK_MEMO"); s_tm_mode = (e && e[0]) ? (e[0] == '0' ? 0 : e[0] == '2' ? 2 : 1) : 1; }   /* 1.1: default ON */
+    return s_tm_mode;
+}
+static void eng_tm_report(void)
+{
+    fprintf(stderr, "[texmask-check] mode %d: mask memo reads %llu (hits %llu, mismatches %llu); unit decode checks %llu (mismatches %llu); vtex checks %llu (mismatches %llu) frame %u\n",
+            s_tm_mode, s_tm_mask_n, s_tm_mask_hit, s_tm_mask_bad, s_tm_dec_n, s_tm_dec_bad, s_tm_vt_n, s_tm_vt_bad, g.frames);
+}
+static inline void eng_get_tex_impl(const rsx_dispatch* rsx, u32 u, rsx_dsp_texture* t)
+{
+    if (eng_tm_mode() && !s_tm_raw && u < RSX_DSP_NUM_TEXTURES && !g_rsx_dsp_trace) {
+        u32 raw[9];
+        memcpy(raw, &rsx->regs[(0x1A00u + u * 0x20u) >> 2], 8 * sizeof(u32));
+        raw[8] = rsx->regs[(0x1840u + u * 4u) >> 2];
+        if (s_tdm[u].valid && !memcmp(raw, s_tdm[u].raw, sizeof raw)) {
+            if (s_tm_mode == 2) {
+                rsx_dsp_texture f; rsx_dsp_get_texture(rsx, u, &f);
+                s_tm_dec_n++;
+                if (memcmp(&f, &s_tdm[u].t, sizeof f)) { if (s_tm_dec_bad++ < 16) fprintf(stderr, "[texmask-check] MISMATCH unit decode %u frame %u\n", u, g.frames); }
+            }
+            *t = s_tdm[u].t;
+            return;
+        }
+        rsx_dsp_get_texture(rsx, u, t);
+        memcpy(s_tdm[u].raw, raw, sizeof raw); s_tdm[u].t = *t; s_tdm[u].valid = 1;
+        return;
+    }
+    rsx_dsp_get_texture(rsx, u, t);
+}
+/* ---- RSX_B2_PROF=1 (03/11 b2prof) ----------------------------------------------------------------------------------------------
+ * Exclusive rdtsc buckets of the work thread B2 does per job (b2_exec -> sink_end_impl and what it calls, the waits of the D3D12
+ * engine included). The time since the last mark goes to the current bucket: RSX_B2P_SET changes the base bucket (and clears the
+ * nesting stack), ENTER/LEAVE nest a callee. Only thread B2 accumulates (t_b2p_thr). Printed every 2 s as [b2prof] by b2_report;
+ * each mark's own cost is calibrated at start and taken out of the bucket it opens. Off: g_b2p_on == 0, every hook is one test. */
+int g_b2p_on;
+static ENG_TLS int t_b2p_thr;
+static unsigned long long s_b2p_cyc[B2P_N], s_b2p_nm[B2P_N], s_b2p_cnt[B2C_N], s_b2p_last;
+static int s_b2p_cur, s_b2p_sp, s_b2p_stk[24];
+static inline void b2p_mark(void) { const unsigned long long t = wp_tsc(); s_b2p_cyc[s_b2p_cur] += t - s_b2p_last; s_b2p_last = t; }
+void rsx_b2p_set(int k) { if (!t_b2p_thr) return; b2p_mark(); s_b2p_sp = 0; s_b2p_cur = k; s_b2p_nm[k]++; }
+void rsx_b2p_enter(int k) { if (!t_b2p_thr) return; b2p_mark(); if (s_b2p_sp < 24) s_b2p_stk[s_b2p_sp++] = s_b2p_cur; s_b2p_cur = k; s_b2p_nm[k]++; }
+void rsx_b2p_leave(void) { if (!t_b2p_thr) return; b2p_mark(); if (s_b2p_sp > 0) s_b2p_cur = s_b2p_stk[--s_b2p_sp]; s_b2p_nm[s_b2p_cur]++; }
+void rsx_b2p_add(int c, unsigned long long v) { if (t_b2p_thr) s_b2p_cnt[c] += v; }
+static void b2p_job_begin(void) { b2p_mark(); s_b2p_sp = 0; s_b2p_cur = B2P_JOBPRE; s_b2p_nm[B2P_JOBPRE]++; }
+static void b2p_job_end(void) { b2p_mark(); s_b2p_sp = 0; s_b2p_cur = B2P_IDLE; s_b2p_nm[B2P_IDLE]++; }
+static double s_b2p_cost = -1.0;   /* cycles of one mark (calibrated on B2 at start) */
+static void b2p_calibrate(void)
+{
+    t_b2p_thr = 1;
+    s_b2p_last = wp_tsc(); s_b2p_cur = B2P_IDLE;
+    const unsigned long long a = wp_tsc();
+    for (int i = 0; i < 20000; i++) { rsx_b2p_enter(B2P_TAIL); rsx_b2p_leave(); }
+    const unsigned long long b = wp_tsc();
+    s_b2p_cost = (double)(b - a) / 40000.0;
+    memset(s_b2p_cyc, 0, sizeof s_b2p_cyc); memset(s_b2p_nm, 0, sizeof s_b2p_nm); memset(s_b2p_cnt, 0, sizeof s_b2p_cnt);
+    s_b2p_last = wp_tsc(); s_b2p_cur = B2P_IDLE; s_b2p_sp = 0;
+}
+
 static void eng_wk_env(void)
 {
     { const char* e2 = getenv("RSX_SURF_HASH"); s_surf_hash_on = (!e2 || !e2[0] || e2[0] != '0') ? 1 : 0;   /* default ON (28/10) */ }
-    const char* e = getenv("RSX_WPROF"); s_wp_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    const char* e = getenv("RSX_WPROF"); s_wp_on = (e && e[0] && e[0] != '0') ? (e[0] == '2' ? 2 : 1) : 0; g_wp2_on = s_wp_on > 1;
     e = getenv("RSX_WALKER_FAST"); s_wk_fast = (!e || !e[0] || e[0] != '0') ? 1 : 0;   /* default ON (28/10) */
 }
 
@@ -1596,8 +1680,16 @@ static inline int eng_tex_unit_on(u32 u, u32 reads)
  * single lane is one dependent 64-bit multiply per 8 bytes, latency-bound at a
  * few GB/s, and it was 13% of the draw engine's time in Drakengard 3's battle
  * areas. The lanes run in parallel and cover every byte as before. */
-static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
-                                    int* readable)
+static u64 eng_texture_content_hash_impl(u32 location, u32 offset, u32 span, int* readable);
+static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span, int* readable)
+{
+    RSX_B2P_ENTER(B2P_TEXHASH); RSX_B2P_ADD(B2C_TEXHASH, 1);
+    const u64 v = eng_texture_content_hash_impl(location, offset, span, readable);
+    RSX_B2P_LEAVE();
+    return v;
+}
+static u64 eng_texture_content_hash_impl(u32 location, u32 offset, u32 span,
+                                         int* readable)
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
@@ -1763,8 +1855,17 @@ static int eng_standin_ask(u32 fmt, u32 w, u32 h, u32 levels, const u8* src,
            sub->w <= ENG_MAX_TEX_DIM && sub->h <= ENG_MAX_TEX_DIM;
 }
 
+static u32 eng_texture_upload_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cube, u32 remap);
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap)
+{
+    RSX_B2P_ENTER(B2P_TEXUP); RSX_B2P_ADD(B2C_TEXUP, 1);
+    const u32 v = eng_texture_upload_impl(location, offset, fmt, w, h, levels, pitch, cube, remap);
+    RSX_B2P_LEAVE();
+    return v;
+}
+static u32 eng_texture_upload_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                   u32 levels, u32 pitch, int cube, u32 remap)
 {
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
@@ -1916,7 +2017,15 @@ static int eng_tex_watch_on(void)
     return g_eng_tex_watch > 0;
 }
 /* Arm the watch over a texture's bytes; 1 when the stamp can be trusted. */
+static int eng_tex_watch_arm_impl(u32 location, u32 offset, u32 span, u64* stamp);
 static int eng_tex_watch_arm(u32 location, u32 offset, u32 span, u64* stamp)
+{
+    RSX_B2P_ENTER(B2P_TEXWATCH); RSX_B2P_ADD(B2C_TEXWATCH, 1);
+    const int v = eng_tex_watch_arm_impl(location, offset, span, stamp);
+    RSX_B2P_LEAVE();
+    return v;
+}
+static int eng_tex_watch_arm_impl(u32 location, u32 offset, u32 span, u64* stamp)
 {
     u32 unwatched = 1;
     if (s_guest_reader) {
@@ -2123,6 +2232,7 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0, u32 border,
  * converts. RSX_NO_TEXEL_OPS=1 turns both off, RSX_NO_TEX_GAMMA=1 gamma only. */
 static u32 eng_texel_ops(u32 ops[16])
 {
+    s_tdec_pass = 2;
     static int off = -1, no_gamma = -1;
     if (off < 0) { off = getenv("RSX_NO_TEXEL_OPS") ? 1 : 0; no_gamma = getenv("RSX_NO_TEX_GAMMA") ? 1 : 0; }
     u32 mask = 0;
@@ -2132,7 +2242,7 @@ static u32 eng_texel_ops(u32 ops[16])
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
         if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(RV, u, &t);
+        eng_get_tex(RV, u, &t);
         if (!t.enabled) continue;
         const u32 base = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
         int can_gamma = 0, can_expand = 0, wide = 0;
@@ -2198,7 +2308,7 @@ static int eng_fp_sat_alpha(const u8* fp_uc, u32 fp_size)
 
 /* ---- pipelines ----------------------------------------------------------- */
 
-static u32 eng_vtex_mask(void)
+static u32 eng_vtex_mask_raw(void)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
@@ -2208,6 +2318,19 @@ static u32 eng_vtex_mask(void)
     }
     return mask;
 }
+/* opt102: the mask is a function of the 4 vertex-texture blocks (4 x 8 words at 0x900) only. */
+static u32 eng_vtex_mask(void)
+{
+    if (!eng_tm_mode() || s_tm_raw || g_rsx_dsp_trace) return eng_vtex_mask_raw();
+    static ENG_TLS u32 key[32]; static ENG_TLS u32 val; static ENG_TLS int valid;
+    const u32* r = &RV->regs[0x900u >> 2];
+    if (valid && !memcmp(key, r, sizeof key)) {
+        if (s_tm_mode == 2) { s_tm_vt_n++; if (eng_vtex_mask_raw() != val && s_tm_vt_bad++ < 16) fprintf(stderr, "[texmask-check] MISMATCH vtex mask frame %u\n", g.frames); }
+        return val;
+    }
+    val = eng_vtex_mask_raw(); memcpy(key, r, sizeof key); valid = 1;
+    return val;
+}
 
 /* Shadow-map units: an enabled depth-format texture (DEPTH24_D8, DEPTH16 and
  * their float variants) whose TEXTURE_ADDRESS carries a compare function
@@ -2216,6 +2339,7 @@ static u32 eng_vtex_mask(void)
  * rsx_fp_set_shadow_units). RSX_NO_SHADOW_CMP=1 turns it off. */
 static u32 eng_shadow_units(u8 funcs[16])
 {
+    s_tdec_pass = 1;
     static int off = -1; if (off < 0) off = getenv("RSX_NO_SHADOW_CMP") ? 1 : 0;
     u32 mask = 0;
     memset(funcs, 0, 16);
@@ -2224,7 +2348,7 @@ static u32 eng_shadow_units(u8 funcs[16])
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
         if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(RV, u, &t);
+        eng_get_tex(RV, u, &t);
         if (!t.enabled) continue;
         const u32 base = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
         if (base < 0x90u || base > 0x93u) continue;
@@ -2316,12 +2440,13 @@ static void eng_ssr_snapshot(u32 surface_slot)
 
 static u32 eng_cube_mask(void)
 {
+    s_tdec_pass = 0;
     u32 mask = 0;
     const u32 reads = eng_fp_reads();
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(RV, u, &t);
+        eng_get_tex(RV, u, &t);
         /* A cube face is square by construction, so a non-square image
          * cannot be one; the fragment program is compiled against this mask
          * and a texturecube slot filled with a 2D texture is a validation
@@ -2387,8 +2512,18 @@ static unsigned long long s_fpc_hits, s_fpc_miss;
 
 static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
                                        const u8** out_fp, u32* out_fp_size);
+static int eng_guest_programs_impl(const u8** out_vp, u32* out_vp_instrs, const u8** out_fp, u32* out_fp_size);
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                               const u8** out_fp, u32* out_fp_size)
+{
+    const int b2p_work = g_b2p_on && (!s_progs.valid || !s_progs.scanned);   /* only the call that does the lookup/scan is a bucket */
+    if (b2p_work) rsx_b2p_enter(B2P_GPROG);
+    const int v = eng_guest_programs_impl(out_vp, out_vp_instrs, out_fp, out_fp_size);
+    if (b2p_work) rsx_b2p_leave();
+    return v;
+}
+static int eng_guest_programs_impl(const u8** out_vp, u32* out_vp_instrs,
+                                   const u8** out_fp, u32* out_fp_size)
 {
     if (!s_draw_open || eng_slow())
         return eng_guest_programs_uncached(out_vp, out_vp_instrs, out_fp, out_fp_size);
@@ -2410,6 +2545,18 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                 g.fp_constants.count = hit->ncon;
                 if (hit->ncon) memcpy(g.fp_constants.values, hit->con, hit->ncon * 16u);
                 s_fpc_hits++;
+                if (s_fpc_on == 2) {   /* opt102 check: scan anyway (into a scratch block) and compare with what the hit gave */
+                    static unsigned long long chk, bad;
+                    rsx_fp_constant_block cb; u64 k2 = 0; u32 t2 = ~0u;
+                    const int ok2 = rsx_fp_scan(s_progs.fp, s_progs.fp_size, &cb, &k2, &t2) >= 0;
+                    const u32 sz2 = rsx_fp_program_size(s_progs.fp, ENG_FP_MAX_BYTES);
+                    int diff = ok2 != hit->scan_ok || sz2 != s_progs.fp_size;
+                    if (ok2 && hit->scan_ok) diff |= k2 != hit->key || t2 != hit->tex || cb.count != hit->ncon || (hit->ncon && memcmp(cb.values, hit->con, hit->ncon * 16u));
+                    chk++;
+                    if (diff && bad++ < 16) fprintf(stderr, "[fpscan-check] MISMATCH frame %u ok %d/%d size %u/%u key %llx/%llx tex %x/%x ncon %u/%u\n", g.frames, hit->scan_ok, ok2, s_progs.fp_size, sz2,
+                                                    (unsigned long long)hit->key, (unsigned long long)k2, hit->tex, t2, hit->ncon, cb.count);
+                    if ((chk & 0xFFFFu) == 0) fprintf(stderr, "[fpscan-check] %llu hits compared, %llu mismatches (misses %llu) frame %u\n", chk, bad, s_fpc_miss, g.frames);
+                }
             } else {
                 s_progs.scan_ok = rsx_fp_scan(s_progs.fp, s_progs.fp_size, &g.fp_constants, &s_progs.fp_key, &tex) >= 0;
                 if (fill) {
@@ -2422,7 +2569,8 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                     s_fpc_miss++;
                 }
             }
-            if (s_wp_on > 0) { s_wp_cyc[6] += wp_tsc() - _a; s_wp_nscan++; }
+            if (s_wp_on > 0) { const unsigned long long _d = wp_tsc() - _a; s_wp_cyc[6] += _d; s_wp_nscan++;
+                if (s_wp_on > 1) { static const u8* pfp2; if (s_progs.fp == pfp2) { s_wp_cyc[62] += _d; s_wp_n2[32]++; } pfp2 = s_progs.fp; if (hit) s_wp_n2[33]++; } }
             s_progs.scanned = 1;
             if (tex != ~0u) { s_progs.tex = tex; s_progs.tex_valid = 1; }
         }
@@ -2498,7 +2646,9 @@ static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
         s_fpc_hit = s_fpc_fill = NULL;
         EngFpc* ce = NULL;
         if (fp_uc && s_draw_open && !eng_slow()) {
-            if (s_fpc_on < 0) { const char* e = getenv("RSX_FPCACHE"); s_fpc_on = (e && e[0] == '1') ? 1 : 0; }   /* off by default: no measured gain, image not verified */
+            if (s_fpc_on < 0) {   /* 1.1: ON by default (=0 off). opt102: RSX_FPSCAN_MEMO=1 (=2: also scan and compare on every hit) or the older RSX_FPCACHE=1 */
+                const char* e = getenv("RSX_FPSCAN_MEMO"); const char* e0 = getenv("RSX_FPCACHE");
+                s_fpc_on = (e && e[0]) ? (e[0] == '2' ? 2 : e[0] == '0' ? 0 : 1) : (e0 && e0[0] == '0') ? 0 : 1; }   /* 1.1: default ON */
             if (s_fpc_on) {
                 if (!s_fpc) s_fpc = (EngFpc*)calloc(ENG_FPC_N, sizeof(EngFpc));
                 if (s_fpc) {
@@ -2533,7 +2683,14 @@ static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
 
 /* The layout the active vertex program actually reads. An uncertain analysis
  * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
+static void eng_vertex_layout_impl(rsx_vertex_layout_plan* layout);
 static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+{
+    RSX_B2P_ENTER(B2P_LAYOUT);
+    eng_vertex_layout_impl(layout);
+    RSX_B2P_LEAVE();
+}
+static void eng_vertex_layout_impl(rsx_vertex_layout_plan* layout)
 {
     u32 mask = 0xFFFFu;
     const u8* uc = NULL;
@@ -3202,11 +3359,62 @@ static int eng_unnorm_surf_dim(const rsx_dsp_texture* t, u32* w, u32* h)
     return 0;
 }
 
+/* opt102 RSX_TEXMASK_MEMO: every texture-derived input of the pipeline key that is a pure function of the texture registers and the
+ * program's read mask: cube / vtex / shadow (+ funcs) / texel-op (+ ops) masks and the candidate list of the unnorm loop (enabled, UNNORM format,
+ * not cube, sized; the bound-surface adjustment that follows depends on the surface set and runs every draw). The memo key is the 176 register
+ * words of texture units, size1 and vertex textures plus the FP read mask; equal key = equal masks. Per thread. */
+typedef struct { u32 reads, cube, vtex, shadow, texop, ucand; u8 sfun[16]; u32 ops[16]; u32 udim[16][2]; } EngTexMasks;
+#define ENG_TM_KEYW 176u
+static ENG_TLS struct { int valid; u32 key[ENG_TM_KEYW]; EngTexMasks m; } s_tmk;
+static void eng_texmasks_compute(EngTexMasks* m)
+{
+    memset(m, 0, sizeof *m);
+    m->reads = eng_fp_reads();
+    m->cube = eng_cube_mask();
+    m->vtex = eng_vtex_mask_raw();
+    m->shadow = eng_shadow_units(m->sfun);
+    m->texop = eng_texel_ops(m->ops);
+    static int off = -1; if (off < 0) off = getenv("RSX_NO_UNNORM") ? 1 : 0;
+    for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        if (!eng_tex_unit_on(u, m->reads)) continue;
+        rsx_dsp_texture t; eng_get_tex(RV, u, &t);
+        if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((m->cube >> u) & 1u)) continue;
+        if (!t.width || !t.height) continue;
+        m->ucand |= 1u << u; m->udim[u][0] = t.width; m->udim[u][1] = t.height;
+    }
+}
+/* Returns the masks for the draw: the memo (hit), or a fresh computation stored in the memo. NULL = memo off, caller computes as before. */
+static const EngTexMasks* eng_texmasks_get(void)
+{
+    if (!eng_tm_mode() || g_rsx_dsp_trace || eng_slow()) return NULL;
+    const u32 reads = eng_fp_reads();
+    const rsx_dispatch* rv = RV;
+    const u32* a = &rv->regs[0x1A00u >> 2]; const u32* b = &rv->regs[0x1840u >> 2]; const u32* c = &rv->regs[0x900u >> 2];
+    s_tm_mask_n++;
+    if (s_tmk.valid && s_tmk.m.reads == reads && !memcmp(s_tmk.key, a, 128 * 4) && !memcmp(s_tmk.key + 128, b, 16 * 4) && !memcmp(s_tmk.key + 144, c, 32 * 4)) {
+        s_tm_mask_hit++;
+        if (s_tm_mode == 2) {
+            EngTexMasks f; s_tm_raw = 1; eng_texmasks_compute(&f); s_tm_raw = 0;
+            if (memcmp(&f, &s_tmk.m, sizeof f) && s_tm_mask_bad++ < 16)
+                fprintf(stderr, "[texmask-check] MISMATCH masks frame %u: cube %X/%X vtex %X/%X shadow %X/%X texop %X/%X ucand %X/%X\n", g.frames,
+                        s_tmk.m.cube, f.cube, s_tmk.m.vtex, f.vtex, s_tmk.m.shadow, f.shadow, s_tmk.m.texop, f.texop, s_tmk.m.ucand, f.ucand);
+        }
+        if ((s_tm_mask_n & 0xFFFFu) == 0) eng_tm_report();
+        return &s_tmk.m;
+    }
+    eng_texmasks_compute(&s_tmk.m);
+    memcpy(s_tmk.key, a, 128 * 4); memcpy(s_tmk.key + 128, b, 16 * 4); memcpy(s_tmk.key + 144, c, 32 * 4);
+    s_tmk.valid = 1;
+    if ((s_tm_mask_n & 0xFFFFu) == 0) eng_tm_report();
+    return &s_tmk.m;
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
 {
     eng_pipe_preload();
+    WP2_BEGIN(_w17);
     *out_fixed = 1;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
@@ -3215,13 +3423,23 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(RV);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vtex_mask = eng_vtex_mask();
+    const EngTexMasks* tmm = eng_texmasks_get();   /* opt102: NULL = RSX_TEXMASK_MEMO off */
+    WP2_BEGIN(_w30);
+    const u32 cube_mask = tmm ? tmm->cube : eng_cube_mask();
+    WP2_END(_w30, 30);
+    WP2_BEGIN(_w29);
+    const u32 vtex_mask = tmm ? tmm->vtex : eng_vtex_mask();
+    WP2_END(_w29, 29);
     const u32 ssr_cfg = (s_ssr_cu >= 0 && s_ssr_du >= 0 && cube_mask) ? (0x10000u | (s_ssr_dbg ? 0x20000u : 0u) | ((u32)s_ssr_cu << 8) | (u32)s_ssr_du) : 0;
     u8 shadow_funcs[16];
-    const u32 shadow_mask = eng_shadow_units(shadow_funcs);
+    WP2_BEGIN(_w31);
+    const u32 shadow_mask = tmm ? (memcpy(shadow_funcs, tmm->sfun, 16), tmm->shadow) : eng_shadow_units(shadow_funcs);
+    WP2_END(_w31, 31);
     u32 texel_ops[16];
-    const u32 texop_mask = eng_texel_ops(texel_ops);
+    WP2_BEGIN(_w32);
+    const u32 texop_mask = tmm ? (memcpy(texel_ops, tmm->ops, sizeof texel_ops), tmm->texop) : eng_texel_ops(texel_ops);
+    WP2_END(_w32, 32);
+    WP2_BEGIN(_w33);
     /* Texel-addressed units (RSX_TEX_FMT_UNNORM): the decompiler scales their
      * coordinates by 1/size. The D3D12 path patched this in; this engine never
      * did, so every post-process pass that samples a render target in texels
@@ -3233,11 +3451,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     memset(unnorm_dim, 0, sizeof unnorm_dim);
     { static int off = -1; if (off < 0) off = getenv("RSX_NO_UNNORM") ? 1 : 0;
       const u32 reads = eng_fp_reads();
+      s_tdec_pass = 3;
       for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+          rsx_dsp_texture t;
+          if (tmm) {   /* opt102: only the memoised candidates; same body as below */
+              if (!((tmm->ucand >> u) & 1u)) continue;
+              eng_get_tex(RV, u, &t);
+          } else {
           if (!eng_tex_unit_on(u, reads)) continue;
-          rsx_dsp_texture t; rsx_dsp_get_texture(RV, u, &t);
+          eng_get_tex(RV, u, &t);
           if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((cube_mask >> u) & 1u)) continue;
           if (!t.width || !t.height) continue;
+          }
           unnorm_mask |= 1u << u; unnorm_dim[u][0] = t.width; unnorm_dim[u][1] = t.height;
           { u32 sw = 0, sh = 0;
             if (eng_unnorm_surf_dim(&t, &sw, &sh) && (sw > t.width || sh > t.height)) {
@@ -3251,6 +3476,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 unnorm_dim[u][0] = sw; unnorm_dim[u][1] = sh; } }
       } }
 
+    WP2_END(_w17, 17);
+    WP2_BEGIN(_w18);
+    WP2_END(_w33, 33);
     const int slow = eng_slow();
     u64 fp_key = 0;
     if (fixed) g.fp_constants.count = 0;   /* a guest program's are already in (the lookup's scan) */
@@ -3298,17 +3526,22 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (bb_uses) vp_bb = s_vp_bb_draw;
     }
     const int memo = !slow && !fixed && in_vp && fp_key && !eng_pso_norm_stats();   /* stats need every key computed */
-    if (memo && km.valid && !km.fixed && km.vp_key == in_vp && km.fp_key == fp_key &&
+    WP2_BEGIN(_w39);
+    const int _kmh = (memo && km.valid && !km.fixed && km.vp_key == in_vp && km.fp_key == fp_key &&
         km.fp_ctrl == (fp_ctrl & 0x40u) && km.cube_mask == cube_mask && km.vtex_mask == vtex_mask && km.ssr_cfg == ssr_cfg &&
         km.shadow_mask == shadow_mask && km.unnorm_mask == unnorm_mask && km.texop_mask == texop_mask &&
         !memcmp(km.shadow_funcs, shadow_funcs, sizeof km.shadow_funcs) &&
         !memcmp(km.unnorm_dim, unnorm_dim, sizeof km.unnorm_dim) &&
         !memcmp(km.texel_ops, texel_ops, sizeof km.texel_ops) &&
         km.layout_mask == layout->mask && km.layout_stride == layout->stride &&
-        km.rt_count == rt_count && km.rt_fmt == rt_fmt && km.vp_bb == vp_bb && !memcmp(&km.rs, rs, sizeof *rs)) {
+        km.rt_count == rt_count && km.rt_fmt == rt_fmt && km.vp_bb == vp_bb && !memcmp(&km.rs, rs, sizeof *rs));
+    WP2_END(_w39, 39);
+    if (_kmh) {
         key = km.key;
+        WP2_CNT(22);
         goto key_done;
     }
+    WP2_BEGIN(_w61);
     key = 1469598103934665603ull;
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
@@ -3356,6 +3589,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = rsx_draw_engine_hash_render_state(rs, key);
     if (eng_pso_norm_stats()) eng_pson_key(key_pre_rs, g.frames);
     km.valid = memo;
+    WP2_END(_w61, 61);
     if (memo) {
         km.fixed = 0; km.vp_key = in_vp; km.fp_key = fp_key; km.fp_ctrl = fp_ctrl & 0x40u;
         km.cube_mask = cube_mask; km.vtex_mask = vtex_mask; km.shadow_mask = shadow_mask; km.ssr_cfg = ssr_cfg;
@@ -3368,6 +3602,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         km.key = key;
     }
 key_done:;
+    if (s_wp_on > 1) { WP2_BEGIN(_w47); static u64 pk; static int pkv; static const u8* pfp; static u64 pfk; s_wp_n2[20]++; if (pkv && pk == key) s_wp_n2[21]++; pk = key; pkv = 1;
+        s_wp_n2[25]++; if (fp_uc == pfp) s_wp_n2[23]++; if (fp_key == pfk) s_wp_n2[24]++; pfp = fp_uc; pfk = fp_key; WP2_END(_w47, 47); }
+    WP2_END(_w18, 18);
+    WP2_BEGIN(_w19);
 
     if (slow) {
         for (u32 i = 0; i < g.n_pipelines; i++)
@@ -3381,7 +3619,9 @@ key_done:;
         if (p) {
             *out_fixed = p->fixed;
             s_cur_pipe = p;
-            return eng_pipe_poll_wait(p);
+            const u32 _r = eng_pipe_poll_wait(p);
+            WP2_END(_w19, 19);
+            return _r;
         }
     }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) {
@@ -3390,6 +3630,7 @@ key_done:;
         return 0;
     }
 
+    RSX_B2P_ENTER(B2P_PIPECREATE); RSX_B2P_ADD(B2C_PIPECREATE, 1);   /* left by the next RSX_B2P_SET in sink_end_impl */
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
@@ -3718,6 +3959,10 @@ static void eng_vfetch_check_summary(void)
  * taken BEFORE the conversion reads memory, so a guest write racing it can
  * only cause a miss later, never a stale hit. RSX_VCACHE=0 turns it off;
  * RSX_VCACHE_CHECK=1 converts every hit again and compares. */
+/* metro131 RSX_VC_CHUNK: what an entry's last trusted validation saw of the write counters (vm_watch_chunk_gens) of the 1 MB chunks its ranges
+ * (vertex spans + this key's index ranges) lie in. Unchanged counters and the same chunks = nothing in those chunks was written since. */
+#define ENG_VR_MAX 8
+typedef struct { u32 n; u32 c0[ENG_VR_MAX], c1[ENG_VR_MAX], g0[ENG_VR_MAX], g1[ENG_VR_MAX]; } EngVR;
 typedef struct { u32 location, start, len; } EngVCSpan;
 typedef struct {
     u64 key, content;                       /* key 0: empty slot            */
@@ -3735,6 +3980,9 @@ typedef struct {
     u64 watch_stamp;                        /* write-watch stamp at the last hash */
     int watched;                            /* 1: every page was watched then */
     u64 gen;                                /* store serial: a prep result names the entry it validated by it */
+    u32 vr_ok;                              /* metro131: vr below is a trusted validation's record */
+    EngVR vr;
+    u32 ep_ok, ep;                          /* prof102: global write epoch at the last trusted validation */
 } EngVCEntry;
 typedef struct {
     int ok;
@@ -3844,13 +4092,37 @@ static u32 s_vcdbg_n, s_vcdbg_m[256];
 extern u32 g_rsx_dsp_vtx_gen;
 static ENG_TLS u32 s_draw_vtx_gen;   /* g_rsx_dsp_vtx_gen as of the END of the draw being run (from the DrawSnap under RSX_DRAW_SPLIT=2) */
 static ENG_TLS struct { int valid; u32 gen, prim, rebuild, lmask, lstride, lcount, n_head, ia[6];
+                u64 hh;   /* metro131 RSX_VCKEY_SPLIT: eng_vc_hash of head[0..n_head) */
                 u32 head[ENG_VK_MAX]; rsx_vertex_fetch_plan plan; } s_vkm;
+/* metro131 RSX_VCKEY_SPLIT=1 (default OFF): the key is the hash of the per-draw words (batches, index array) seeded with the hash of the
+ * register-derived head, which the memo keeps -- the head's ~300 bytes are neither copied nor hashed again for every draw that
+ * repeats it. A different function of the same inputs: keys only have to agree within one run. Needs RSX_VCKEY_MEMO=1. */
+static int eng_vkm_mode(void);
+static int eng_vkey_split(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_VCKEY_SPLIT"); on = (e && e[0] && e[0] != '0' && eng_vkm_mode() == 1 && !getenv("RSX_VCACHE_BURST_LOG")) ? 1 : 0; }
+    return on;
+}
 static unsigned long long s_vkm_hit, s_vkm_miss, s_vkm_bad;
 static int eng_vkm_mode(void)
 {
     static int mode = -1;
     if (mode < 0) { const char* e = getenv("RSX_VCKEY_MEMO"); mode = (e && e[0]) ? atoi(e) : 1; if (mode < 0) mode = 0;   /* default ON (28/10) */ }
     return mode;
+}
+
+/* RSX_VCKEY_NODEF (default ON since 1.1, =0 off): leave out of the key what the conversion cannot read: the constant default value of an
+ * attribute that has an array (type and size set; the default is only used for a disabled attribute or an unreadable
+ * source), the divider bits / frequency that rsx_vertex_element_index ignores (frequency <= 1), and the array fields of a
+ * disabled attribute. A guest that writes a constant into a vertex
+ * attribute register (VERTEX_DATA4F) and keeps it there otherwise changed the key of every following draw of the same
+ * meshes (Metropolis bursts: ~5000 re-conversions per frame for 12-25 frames). */
+static int eng_vckey_nodef(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_VCKEY_NODEF"); on = !(e && e[0] == '0'); }   /* 1.1: default ON, =0 turns it off */
+    return on;
 }
 
 /* The register-derived words of the key: the head, up to the draw's own ranges, and the index-array tail. */
@@ -3861,15 +4133,33 @@ static u32 eng_vc_head(const rsx_vertex_layout_plan* layout, u32 prim, int rebui
     u32 n = 0;
     m[n++] = prim; m[n++] = (u32)rebuild;
     m[n++] = layout->mask; m[n++] = layout->stride; m[n++] = layout->count;
-    m[n++] = plan->base_offset; m[n++] = plan->divider_mask;
+    const int nodef = eng_vckey_nodef();
+    u32 dmask = plan->divider_mask;
+    if (nodef) {   /* a divider bit counts only for an attribute that is fetched with a frequency above 1 (rsx_vertex_element_index) */
+        dmask = 0;
+        for (u32 slot = 0; slot < layout->count; slot++) {
+            const u32 attr = layout->attrs[slot];
+            const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+            if (f->desc.type && f->desc.size && f->desc.frequency > 1u) dmask |= plan->divider_mask & (1u << attr);
+        }
+    }
+    m[n++] = plan->base_offset; m[n++] = dmask;
     for (u32 slot = 0; slot < layout->count; slot++) {
         const u32 attr = layout->attrs[slot];
         const rsx_vertex_fetch_attr* f = &plan->attr[attr];
         m[n++] = attr;
+        if (nodef && !(f->desc.type && f->desc.size)) {   /* disabled attribute: every vertex reads its default, nothing else counts */
+            m[n++] = f->desc.type; m[n++] = f->desc.size;
+            memset(&m[n], 0, 6 * 4u); n += 6;
+            memcpy(&m[n], f->default_value, 16); n += 4;
+            continue;
+        }
         m[n++] = f->desc.type; m[n++] = f->desc.size; m[n++] = f->desc.stride;
-        m[n++] = f->desc.frequency; m[n++] = f->desc.offset; m[n++] = f->desc.location;
+        m[n++] = nodef ? (f->desc.frequency > 1u ? f->desc.frequency : 0u) : f->desc.frequency;   /* 0 and 1 fetch alike */
+        m[n++] = f->desc.offset; m[n++] = f->desc.location;
         m[n++] = f->elem_size; m[n++] = f->stride;
-        memcpy(&m[n], f->default_value, 16); n += 4;
+        if (nodef) memset(&m[n], 0, 16); else memcpy(&m[n], f->default_value, 16);   /* an array attribute does not read its default */
+        n += 4;
     }
     rsx_dsp_index_array ia;
     rsx_dsp_get_index_array(RV, &ia);
@@ -3899,11 +4189,14 @@ static u64 eng_vc_key(const rsx_vertex_layout_plan* layout, u32 prim, int rebuil
     u32 ia[6];
     const rsx_vertex_fetch_plan* plan;
     const int memo = eng_vkm_mode();
+    const int split = eng_vkey_split();
+    u64 kseed = 0x5643414348450001ull;
     if (memo && s_vkm.valid && s_vkm.gen == s_draw_vtx_gen && s_vkm.prim == prim && s_vkm.rebuild == (u32)rebuild &&
         s_vkm.lmask == layout->mask && s_vkm.lstride == layout->stride && s_vkm.lcount == layout->count) {
         s_vkm_hit++;
         n = s_vkm.n_head;
-        memcpy(m, s_vkm.head, n * 4u);
+        if (split) { n = 0; kseed = s_vkm.hh; }
+        else memcpy(m, s_vkm.head, n * 4u);
         memcpy(ia, s_vkm.ia, sizeof ia);
         plan = &s_vkm.plan;
         if (memo >= 2) {
@@ -3918,14 +4211,18 @@ static u64 eng_vc_key(const rsx_vertex_layout_plan* layout, u32 prim, int rebuil
         }
     } else {
         s_vkm.valid = 0;
+        WP2_BEGIN(_w50);
         n = eng_vc_head(layout, prim, rebuild, &s_vkm.plan, m, ia);   /* built in place: no 1.4 KB copy per draw */
+        WP2_END(_w50, 50);
         plan = &s_vkm.plan;
         if (memo) {
             s_vkm_miss++;
             s_vkm.valid = 1; s_vkm.gen = s_draw_vtx_gen; s_vkm.prim = prim; s_vkm.rebuild = (u32)rebuild;
             s_vkm.lmask = layout->mask; s_vkm.lstride = layout->stride; s_vkm.lcount = layout->count;
             s_vkm.n_head = n; memcpy(s_vkm.head, m, n * 4u); memcpy(s_vkm.ia, ia, sizeof ia);
+            if (split) s_vkm.hh = eng_vc_hash((const u8*)m, (size_t)n * 4u, 0x5643414348450001ull);
         }
+        if (split) { kseed = s_vkm.hh; n = 0; }
     }
     if (eng_fp_once()) { s_fp = plan; s_fp_valid = 1; }
     m[n++] = di.n_arr;
@@ -3940,7 +4237,9 @@ static u64 eng_vc_key(const rsx_vertex_layout_plan* layout, u32 prim, int rebuil
     }
     { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_VCACHE_BURST_LOG") ? 1 : 0;   /* only the burst log reads it */
       if (dbg) { s_vcdbg_n = n < 256 ? n : 256; memcpy(s_vcdbg_m, m, s_vcdbg_n * 4u); } }
-    const u64 k = eng_vc_hash((const u8*)m, (size_t)n * 4u, 0x5643414348450001ull);
+    WP2_BEGIN(_w51);
+    const u64 k = eng_vc_hash((const u8*)m, (size_t)n * 4u, kseed);
+    WP2_END(_w51, 51);
     return k ? k : 1;
 }
 
@@ -4098,12 +4397,111 @@ static u64 eng_vc_arm(const EngVCEntry* e, int* trusted)
  * known from the write-watch when every page it reads is watched and none
  * was written since the last check, otherwise by hashing them again (the
  * texture cache does the same; RSX_TEX_WATCH=0 turns both off). */
+/* metro131 RSX_VC_CHUNK=1 (default OFF): skip the page walk of eng_vc_arm for an entry whose chunks saw no write since its last trusted validation. */
+static int s_vcchunk_on = -1;
+static volatile long* s_cgen;
+static unsigned long long s_vcchunk_hit, s_vcchunk_chk, s_vcchunk_bad;
+static int eng_vcchunk_on(void)
+{
+    if (s_vcchunk_on < 0) {
+        const char* e = getenv("RSX_VC_CHUNK");
+        s_vcchunk_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (s_vcchunk_on) {
+            s_cgen = s_guest_reader ? NULL : vm_watch_chunk_gens();
+            if (!s_cgen) s_vcchunk_on = 0;
+        }
+    }
+    return s_vcchunk_on && g_eng_vc_watch && eng_tex_watch_on() && !g_rsx_capture_on;
+}
+static int eng_vr_add(EngVR* o, int local, u32 offset, u32 len)
+{
+    if (!len) return 1;
+    const u32 ea = cellGcmResolveLocated(local, offset);
+    if (!ea) return 0;
+    const u64 end = (u64)ea + len - 1u;
+    if (end > 0xFFFFFFFFull || o->n >= ENG_VR_MAX) return 0;
+    const u32 c0 = ea >> 20, c1 = (u32)(end >> 20);
+    if (c1 - c0 > 1u) return 0;
+    o->c0[o->n] = c0; o->c1[o->n] = c1; o->g0[o->n] = (u32)s_cgen[c0]; o->g1[o->n] = (u32)s_cgen[c1]; o->n++;
+    return 1;
+}
+/* The counters as they are now for the ranges eng_vc_arm would arm (same ranges, same resolve). 0 = cannot describe them (too many, or a span crossing 2 chunk boundaries). */
+static int eng_vr_snap(const EngVCEntry* e, EngVR* o)
+{
+    o->n = 0;
+    for (u32 i = 0; i < e->n_spans; i++)
+        if (!eng_vr_add(o, e->span[i].location == RSX_LOCATION_LOCAL, e->span[i].start, e->span[i].len)) return 0;
+    const DrawIn di = di_get();
+    if (di.n_idx) {
+        rsx_dsp_index_array ia;
+        rsx_dsp_get_index_array(RV, &ia);
+        const u32 esz = ia.is_u32 ? 4u : 2u;
+        const int local = ia.location ? 0 : 1;
+        for (u32 b = 0; b < di.n_idx; b++) {
+            const u64 start = (u64)ia.offset + (u64)di.idx[b].first * esz;
+            const u64 bytes = (u64)di.idx[b].count * esz;
+            if (!bytes) continue;
+            if (start + bytes > 0x100000000ull) return 0;
+            if (!eng_vr_add(o, local, (u32)start, (u32)bytes)) return 0;
+        }
+    }
+    return 1;
+}
+static inline int eng_vr_eq(const EngVR* a, const EngVR* b)
+{
+    if (a->n != b->n) return 0;
+    for (u32 i = 0; i < a->n; i++)
+        if (a->c0[i] != b->c0[i] || a->c1[i] != b->c1[i] || a->g0[i] != b->g0[i] || a->g1[i] != b->g1[i]) return 0;
+    return 1;
+}
+
+static EngVCEntry* eng_vc_lookup_impl(u64 key);
 static EngVCEntry* eng_vc_lookup(u64 key)
+{
+    RSX_B2P_ENTER(B2P_VCLOOKUP);
+    EngVCEntry* v = eng_vc_lookup_impl(key);
+    RSX_B2P_LEAVE();
+    return v;
+}
+static EngVCEntry* eng_vc_lookup_impl(u64 key)
 {
     EngVCEntry* e = eng_vc_slot(key);
     if (!e || e->key != key) return NULL;
+    EngVR vsnap; int have_snap = 0;
+    if (eng_vcchunk_on()) {
+        /* Read before the arm below: a write between the two bumps a counter, so the next check fails and takes the full path. */
+        have_snap = eng_vr_snap(e, &vsnap);
+        if (have_snap && e->vr_ok && e->watched && eng_vr_eq(&e->vr, &vsnap)) {
+            static int vchk = -1;
+            if (vchk < 0) vchk = getenv("RSX_VC_CHUNK_CHECK") ? 1 : 0;   /* hash anyway and report a hit the counters got wrong */
+            if (vchk) {
+                u64 hc = key; s_vcchunk_chk++;
+                if (!eng_vc_hash_indices(&hc) || !eng_vc_hash_spans(e->span, e->n_spans, &hc) || hc != e->content) {
+                    if (s_vcchunk_bad++ < 16) fprintf(stderr, "[vc-chunk] MISMATCH at frame %u: key %016llx (%u bytes of vertices)\n", g.frames, (unsigned long long)key, (unsigned)e->bytes);
+                    e->watched = 0; e->vr_ok = 0;
+                    return NULL;
+                }
+                if ((s_vcchunk_chk & 0xFFFFF) == 0) fprintf(stderr, "[vc-chunk] check: %llu shortcut hits verified, %llu bad\n", s_vcchunk_chk, s_vcchunk_bad);
+            }
+            s_vcchunk_hit++;
+            s_vcstat.hit_watch++;
+            e->last_frame = g.frames;
+            return e;
+        }
+    }
     int trusted = 0;
+    EngVR csnap; int chave = 0; u32 ep0 = 0; const u32 lf0 = e->last_frame;
+    if (s_wp_on > 1) {
+        WP2_BEGIN(_w55);
+        s_wp_n2[3]++;
+        { static int cg_tried; if (!cg_tried) { cg_tried = 1; if (!s_cgen && !s_guest_reader) s_cgen = vm_watch_chunk_gens(); } }
+        if (s_cgen) { if (have_snap) { csnap = vsnap; chave = 1; } else chave = eng_vr_snap(e, &csnap); ep0 = (u32)s_cgen[4096]; }
+        WP2_END(_w55, 55);
+    }
+    const unsigned long long _a11 = s_wp_on > 1 ? wp_tsc() : 0;
     const u64 st = eng_vc_arm(e, &trusted);
+    const unsigned long long _armc = s_wp_on > 1 ? wp_tsc() - _a11 : 0;
+    if (s_wp_on > 1) s_wp_cyc[11] += _armc;
     if (trusted && e->watched && st == e->watch_stamp) {
         /* RSX_VC_WATCH_CHECK=1: hash anyway and count the hits the watch got
          * wrong (a write it never saw) as check mismatches. */
@@ -4114,22 +4512,45 @@ static EngVCEntry* eng_vc_lookup(u64 key)
             if (!eng_vc_hash_indices(&hc) || !eng_vc_hash_spans(e->span, e->n_spans, &hc) || hc != e->content) {
                 s_vcstat.check_bad++;
                 e->watched = 0;
+                e->vr_ok = 0;
                 return NULL;
             }
         }
         s_vcstat.hit_watch++;
         e->last_frame = g.frames;
+        if (have_snap) { e->vr = vsnap; e->vr_ok = 1; }
+        if (s_wp_on > 1) {
+            WP2_BEGIN(_w47);
+            s_wp_n2[4]++; s_wp_cyc[59] += _armc;
+            const int cs = chave && e->vr_ok && !have_snap && eng_vr_eq(&e->vr, &csnap);
+            const int es = e->ep_ok && e->ep == ep0;
+            if (cs) { s_wp_n2[5]++; s_wp_cyc[53] += _armc; }
+            if (es) { s_wp_n2[6]++; s_wp_cyc[54] += _armc; }
+            if (lf0 == g.frames) s_wp_n2[7]++; else if (cs) s_wp_n2[8]++;
+            if (chave && !have_snap) { e->vr = csnap; e->vr_ok = 1; }
+            e->ep = ep0; e->ep_ok = 1;
+            WP2_END(_w47, 47);
+        }
         return e;
     }
     u64 h = key;
-    if (!eng_vc_hash_indices(&h) || !eng_vc_hash_spans(e->span, e->n_spans, &h) ||
-        h != e->content) {
+    WP2_BEGIN(_w12);
+    const int _hok = eng_vc_hash_indices(&h) && eng_vc_hash_spans(e->span, e->n_spans, &h) && h == e->content;
+    WP2_END(_w12, 12);
+    if (s_wp_on > 1) { s_wp_n2[0]++; if (_hok) s_wp_n2[1]++; if (!trusted) s_wp_n2[2]++; }
+    if (!_hok) {
         s_vcstat.stale++;
         e->watched = 0;
+        e->vr_ok = 0; e->ep_ok = 0;
         return NULL;
     }
     e->watch_stamp = st;
     e->watched = trusted;
+    if (have_snap && trusted) { e->vr = vsnap; e->vr_ok = 1; } else e->vr_ok = 0;
+    if (s_wp_on > 1) {
+        if (trusted && chave && !have_snap) { e->vr = csnap; e->vr_ok = 1; }
+        if (trusted) { e->ep = ep0; e->ep_ok = 1; } else e->ep_ok = 0;
+    }
     e->last_frame = g.frames;
     return e;
 }
@@ -4247,6 +4668,44 @@ static void eng_vc_free(EngVCEntry* e)
     memset(e, 0, sizeof *e);
 }
 
+/* perf101 03/11: RSX_VC_DEFER_FREE (default OFF until the 3-run A/B is complete; =1 on). eng_vc_evict used to free every dropped entry (verts/indices heap blocks,
+ * backend buffer releases) inside the one walker frame that hit the table limit: 11-58 ms hitch every ~190 frames in Metropolis
+ * (log\perf101 M2: 32 evicts, 779 ms), a frame of +15..40 ms each. Now the dropped entries' pointers go to a list that the following
+ * stores drain a few at a time (under the same lock that evict ran in); the table itself is rebuilt at once as before. */
+typedef struct { void* v; void* x; void* cv; void* cx; u32 buf; } EngVCDead;
+static EngVCDead* s_vc_dead;
+static u32 s_vc_dead_n, s_vc_dead_cap;
+static int eng_vc_defer_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_VC_DEFER_FREE"); on = (e && e[0] == '1'); }
+    return on;
+}
+static void eng_vc_dead_one(const EngVCDead* d)
+{
+    if (d->buf) g.be->buffer_release(g.be->user, d->buf);
+    else { free(d->v); free(d->x); }
+    free(d->cv); free(d->cx);
+}
+static void eng_vc_dead_drain(u32 max)
+{
+    while (s_vc_dead_n && max--) eng_vc_dead_one(&s_vc_dead[--s_vc_dead_n]);
+}
+/* Like eng_vc_free, but the memory is released later by eng_vc_dead_drain (falls back to freeing now if the list cannot grow). */
+static void eng_vc_free_later(EngVCEntry* e)
+{
+    if (s_vc_dead_n == s_vc_dead_cap) {
+        const u32 nc = s_vc_dead_cap ? s_vc_dead_cap * 2u : 4096u;
+        EngVCDead* nd = (EngVCDead*)realloc(s_vc_dead, (size_t)nc * sizeof *nd);
+        if (!nd) { eng_vc_free(e); return; }
+        s_vc_dead = nd; s_vc_dead_cap = nc;
+    }
+    EngVCDead* d = &s_vc_dead[s_vc_dead_n++];
+    d->v = e->verts; d->x = e->indices; d->cv = e->cpu_verts; d->cx = e->cpu_indices; d->buf = e->buf;
+    s_vc_bytes -= e->bytes;
+    memset(e, 0, sizeof *e);
+}
+
 /* Over budget, or the table filling up: keep what the last two frames drew,
  * re-inserted so the probe chains stay intact, and drop the rest -- or
  * everything, when even the recent draws would leave it nearly full again. */
@@ -4256,9 +4715,13 @@ static void eng_vc_evict(void)
     const u32 before = s_vc_count;
     size_t recent = 0;
     u32 n_recent = 0;
+    const int defer = eng_vc_defer_on();
+    u32 n_gpu = 0;
+    eng_vc_dead_drain(0xFFFFFFFFu);   /* a previous evict's leftovers first */
     for (u32 i = 0; i < ENG_VC_SLOTS; i++)
         if (s_vc[i].key && s_vc[i].last_frame + 1u >= g.frames) { recent += s_vc[i].bytes; n_recent++; }
     const int keep_none = recent > ENG_VC_BUDGET / 2u || n_recent > ENG_VC_SLOTS / 2u;
+    const double t_scan = eng_now_ms() - t0;
     EngVCEntry* old = s_vc;
     u64* old_k = s_vck;
     s_vc = (EngVCEntry*)calloc(ENG_VC_SLOTS, sizeof *s_vc);
@@ -4269,9 +4732,9 @@ static void eng_vc_evict(void)
     for (u32 i = 0; i < ENG_VC_SLOTS; i++) {
         EngVCEntry* e = &old[i];
         if (!e->key) continue;
-        if (keep_none || e->last_frame + 1u < g.frames) { eng_vc_free(e); continue; }
+        if (keep_none || e->last_frame + 1u < g.frames) { if (e->buf) n_gpu++; if (defer) eng_vc_free_later(e); else eng_vc_free(e); continue; }
         EngVCEntry* d = eng_vc_slot(e->key);
-        if (!d) { eng_vc_free(e); continue; }
+        if (!d) { if (defer) eng_vc_free_later(e); else eng_vc_free(e); continue; }
         *d = *e;
         s_vck[d - s_vc] = d->key;
         s_vc_count++;
@@ -4287,6 +4750,7 @@ static void eng_vc_store_x(u64 key, const EngVCFill* f, const u8* verts,
                          u32 n_verts, u32 stride, u32 n_source_refs,
                          int indexed, const u32* indices, u32 n_draw)
 {
+    if (s_vc_dead_n) eng_vc_dead_drain(48);   /* perf101: the entries a recent evict dropped, a few per store */
     if (s_vc_bytes > ENG_VC_BUDGET || s_vc_count >= ENG_VC_SLOTS * 3u / 4u)
         eng_vc_evict();
     EngVCEntry* e = eng_vc_slot(key);
@@ -4347,7 +4811,7 @@ static void eng_vc_store_x(u64 key, const EngVCFill* f, const u8* verts,
     if (s_vck) s_vck[e - s_vc] = key;
     e->gen = ++s_vc_gen;
     e->content = f->content;
-    e->watch_stamp = 0; e->watched = 0;   /* validated by hashing until a lookup arms the watch */
+    e->watch_stamp = 0; e->watched = 0; e->vr_ok = 0; e->ep_ok = 0;   /* validated by hashing until a lookup arms the watch */
     e->last_frame = g.frames;
     e->n_verts = n_verts; e->stride = stride;
     e->n_source_refs = n_source_refs;
@@ -4422,9 +4886,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
                      EngVCFill* vc_fill)
 {
     /* The index bytes are hashed before they are read; see the cache note. */
+    WP2_BEGIN(_w34);
     if (vc_fill && vc_fill->ok && !eng_vc_hash_indices(&vc_fill->content))
         vc_fill->ok = 0;
+    WP2_END(_w34, 34);
 
+    WP2_BEGIN(_w35);
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -4471,8 +4938,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
             }
         }
     }
+    WP2_END(_w35, 35);
     if (!dc.fetch_ok) return;
 
+    WP2_BEGIN(_w36);
     dc.n_source_refs = dc.n_refs;
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
@@ -4485,6 +4954,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
         }
     }
 
+    WP2_END(_w36, 36);
+    WP2_BEGIN(_w37);
     dc.layout = *layout;
     /* Same registers, layout and guest_ptr as the plan eng_vc_key just built
      * for this draw: reuse it (RSX_FETCH_PLAN_ONCE=0 rebuilds). */
@@ -4498,10 +4969,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (vc_fill && vc_fill->ok && !eng_vc_fill_spans(vc_fill, &dc.fetch_plan))
         vc_fill->ok = 0;
+    WP2_END(_w37, 37);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
         return;
     }
+    WP2_BEGIN(_w38);
     /* rsx_vertex_fetch_all decodes attribute by attribute (one format
      * dispatch per attribute, not per component per vertex); it was the
      * largest share of the draw engine's time. RSX_VFETCH_ONE=1 keeps the
@@ -4519,6 +4992,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
         }
     } else {
         const int ok = rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts);
+        WP2_END(_w38, 38);
         if (vf_mode == 2) {
             static u8* ref_buf; static u64 ref_cap;
             static unsigned long draws, bad_draws, bad_bytes;
@@ -4669,13 +5143,18 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
 {
     u32 mask = 0;
     const u32 reads = eng_fp_reads();
+    s_tdec_pass = 4;
+    static rsx_dsp_texture s_pt[RSX_BE_MAX_TEXTURES]; static u32 s_pon; u32 cur_on = 0, same_u = 0;   /* prof102 event counts */
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         if (!eng_tex_unit_on(u, reads)) continue;   /* off, or not sampled */
         rsx_dsp_texture t;
-        rsx_dsp_get_texture(RV, u, &t);
-        if (!t.enabled) continue;
-        mask |= 1u << u;
-        eng_decode_sampler(t.filter, t.wrap, t.control0, t.border_color, &samplers[u]);
+        RSX_B2P_ENTER(B2P_TEXDEC);
+        eng_get_tex(RV, u, &t);
+        if (!t.enabled) { RSX_B2P_LEAVE(); continue; }
+        mask |= 1u << u; RSX_B2P_ADD(B2C_TEXUNIT, 1);
+        if (s_wp_on > 1) { WP2_BEGIN(_w47); cur_on |= 1u << u; s_wp_n2[17]++; if (((s_pon >> u) & 1u) && !memcmp(&s_pt[u], &t, sizeof t)) { same_u |= 1u << u; s_wp_n2[18]++; } s_pt[u] = t; WP2_END(_w47, 47); }
+        { WP2_BEGIN(_w46); eng_decode_sampler(t.filter, t.wrap, t.control0, t.border_color, &samplers[u]); WP2_END(_w46, 46); }
+        RSX_B2P_LEAVE();   /* B2P_TEXDEC, entered before eng_get_tex */
 
         int sampled = -1, unused_own = 0;
         /* A depth format is the zeta, never a colour target at the same
@@ -4849,9 +5328,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 fputc('\n', stderr); } }
             if (textures[u]) continue;
         }
+        RSX_B2P_ENTER(B2P_TEXSLOT); RSX_B2P_ADD(B2C_TEXSLOT, 1);
+        { WP2_BEGIN(_w48);
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu);
+        WP2_END(_w48, 48); }
+        RSX_B2P_LEAVE();
         /* RSX_DROP_STATS=1: a sampled unit left with no texture reads the
          * null texture (transparent black), so a particle or icon drawn with
          * it vanishes without a trace. Count them by format, with an example
@@ -4873,6 +5356,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             }
         }
     }
+    if (s_wp_on > 1) { WP2_BEGIN(_w47); s_wp_n2[9]++; if (cur_on == s_pon && same_u == cur_on && cur_on) s_wp_n2[16]++; s_pon = cur_on; WP2_END(_w47, 47); }
     return mask;
 }
 
@@ -4947,6 +5431,7 @@ static void eng_draw_stats_report(void)
             s_dstat.drop_pipeline, s_dstat.drop_empty, s_dstat.refs, s_dstat.verts, s_dstat.vbytes >> 10,
             s_vcstat.hit, s_vcstat.hit_watch, s_vcstat.miss, s_vcstat.uncacheable, s_vcstat.stored, s_vcstat.stale, s_vc_count, s_vc_bytes >> 20,
             s_vcstat.check_bad);
+    if (s_vcchunk_on > 0) fprintf(stderr, "[m131] vc chunk shortcut: %llu hits (cum.), %llu verified, %llu bad\n", s_vcchunk_hit, s_vcchunk_chk, s_vcchunk_bad);
     memset(&s_vcstat, 0, sizeof s_vcstat);
     memset(&s_dstat, 0, sizeof s_dstat);
 }
@@ -5049,7 +5534,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
         fprintf(stderr, " texunits:");
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
-            rsx_dsp_texture t; rsx_dsp_get_texture(RV, u, &t);
+            rsx_dsp_texture t; eng_get_tex(RV, u, &t);
             const u32 row = t.pitch ? t.pitch : t.width;
             const u8* p = (t.width && row) ? eng_guest_ptr(NULL, t.location, t.offset, row) : NULL;
             unsigned long sum = 0; for (u32 k = 0; p && k < row && k < 4096; k++) sum += p[k];
@@ -5072,7 +5557,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
       fprintf(stderr, "[draw-trace]   fp-hash=%016llx\n", (unsigned long long)fh);
       for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < RSX_BE_MAX_TEXTURES; u++) {
           if (!(tex_mask & (1u << u))) continue;
-          rsx_dsp_texture t; rsx_dsp_get_texture(RV, u, &t);
+          rsx_dsp_texture t; eng_get_tex(RV, u, &t);
           int surf = -1, zeta = -1;
           for (u32 k = 0; k < g.n_surfaces; k++) if (g.surfaces[k].handle && g.surfaces[k].location == t.location && g.surfaces[k].offset == t.offset) { surf = (int)k; break; }
           for (u32 k = 0; k < g.n_zdepths; k++) if (g.zdepths[k].handle && g.zdepths[k].location == t.location && g.zdepths[k].offset == t.offset) { zeta = (int)k; break; }
@@ -5173,6 +5658,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
+    RSX_B2P_SET(B2P_SETUP);
     eng_draw_stats_tick();
     if (s_wp_on < 0) eng_wk_env();
     unsigned long long wp_last = s_wp_on > 0 ? wp_tsc() : 0;
@@ -5214,11 +5700,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
     rsx_vertex_layout_plan layout;
-    eng_vertex_layout(&layout);
+    { WP2_BEGIN(_w8); eng_vertex_layout(&layout); WP2_END(_w8, 8); }
 
     /* A cache hit supplies the converted vertices and the rebuilt index list;
      * a miss converts and, once the indices are written, stores both. Under
      * RSX_VCACHE_CHECK a hit is converted anyway and compared at that point. */
+    RSX_B2P_SET(B2P_VCKEY);
     s_fp_valid = 0;
     u64 vc_key = 0;
     EngVCEntry* vce = NULL;
@@ -5230,8 +5717,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
     if (!vce) {
+        WP2_BEGIN(_w9);
         vc_key = eng_vc_key(&layout, prim, rebuild);
+        WP2_END(_w9, 9);
+        WP2_BEGIN(_w10);
         vce = vc_key ? eng_vc_lookup(vc_key) : NULL;
+        WP2_END(_w10, 10);
     }
     EngVCEntry* vc_check = NULL;
     if (vce && eng_vc_checking()) { vc_check = vce; vce = NULL; }
@@ -5244,7 +5735,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     int indexed = 0;
     u32 n_draw = 0;
     if (vce) {
-        s_vcstat.hit++;
+        s_vcstat.hit++; RSX_B2P_ADD(B2C_VCHIT, 1);
         if (!vce->buf && !eng_slow()) {
             const size_t pm = eng_vc_promote_min();
             if (pm && vce->bytes >= pm) eng_vc_promote(vce);
@@ -5260,6 +5751,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         dc.layout = layout;
     } else {
         if (vc_key) s_vcstat.miss++; else s_vcstat.uncacheable++;
+        RSX_B2P_ADD(B2C_VCMISS, 1);
         /* RSX_VCACHE_LOG_MISS=<frame>: every miss of that frame. */
         { static long lf = -2; if (lf == -2) { const char* e = getenv("RSX_VCACHE_LOG_MISS"); lf = e ? atol(e) : -1; }
           if (lf >= 0 && (long)g.frames == lf) {
@@ -5272,6 +5764,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                   rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(RV, a, &va);
                   o += snprintf(buf + o, sizeof buf - o, " a%u=%u:%08X/%u/t%u", a, va.location, va.offset, va.stride, va.type); }
               fprintf(stderr, "%s\n", buf); } }
+        RSX_B2P_SET(B2P_VCFETCH);
         const unsigned long long _fa = s_wp_on > 0 ? wp_tsc() : 0;
         dc_fetch(&layout, rebuild, vc_key ? &vcf : NULL);
         if (s_wp_on > 0) { s_wp_cyc[7] += wp_tsc() - _fa; s_wp_nmiss++; }
@@ -5298,8 +5791,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (g.q_cur) g.q_attempts++;
     WP_MARK(0);   /* layout, vertex-cache key/lookup or conversion */
 
+    RSX_B2P_SET(B2P_RSTATE);
     rsx_be_render_state rs;
+    WP2_BEGIN(_w13);
     rsx_draw_engine_decode_render_state(RV, &rs);
+    WP2_END(_w13, 13);
+    RSX_B2P_SET(B2P_TARGETS);
     /* RSX_SKIP_BLEND=<sf>/<df> (hex blend factors): drop every blended draw
      * using that pair -- an experiment switch to tell whether one blend mode's
      * draws are what wrecks a frame. */
@@ -5312,7 +5809,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           return; } }
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    WP2_BEGIN(_w14);
     const u32 n_targets = eng_current_target_set(targets);
+    WP2_END(_w14, 14);
     if (!n_targets) { s_dstat.drop_targets++; eng_draw_trace("DROP-targets", prim, indexed, n_draw, 0, 0); return; }
     const u32 target = targets[0];
 
@@ -5320,8 +5819,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     rsx_dsp_viewport vp;
     rsx_dsp_get_surface(RV, &sf);
     rsx_dsp_get_viewport(RV, &vp);
+    WP2_BEGIN(_w52);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
+    WP2_END(_w52, 52);
+    if (s_wp_on > 1) { WP2_BEGIN(_w47); static u32 pt[RSX_BE_MAX_COLOR_TARGETS], pn, pz = ~0u; s_wp_n2[31]++; if (pn == n_targets && pz == zslot && !memcmp(pt, targets, n_targets * sizeof *targets)) s_wp_n2[30]++; pn = n_targets; pz = zslot; memcpy(pt, targets, n_targets * sizeof *targets); WP2_END(_w47, 47); }
     /* shad114 RSX_DBIAS_EPILOGUE: slope = raw game slope x the target's pixel ratio, quantised; constant bias moves to the VS epilogue
      * (below). Done HERE (not in the render-state decode) because the pass is known now (eng_current_target_set -> eng_note_pass ran). */
     const int dbe = rsx_dbias_epilogue_on() && rs.poly_offset_fill;
@@ -5339,6 +5841,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
+    RSX_B2P_SET(B2P_TEXBIND);
     u32 textures[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];
     u32 vtextures[RSX_BE_MAX_VERTEX_TEXTURES];
@@ -5347,8 +5850,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
+    WP2_BEGIN(_w15);
     u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
                                       textures, samplers);
+    WP2_END(_w15, 15);
     /* RSX_SSR: a draw with a cube map on unit 7 gets the last frame's scene colour and depth on two free units. */
     s_ssr_cu = s_ssr_du = -1;
     eng_ssr_frame_mode();
@@ -5372,10 +5877,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             }
         }
     }
+    WP2_BEGIN(_w16);
+    RSX_B2P_SET(B2P_VTEX);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    WP2_END(_w16, 16);
     if (s_dtrace_frame >= 0) memcpy(s_trace_tex, textures, sizeof s_trace_tex);   /* for eng_draw_trace */
     WP_MARK(1);   /* render state, targets, zeta, texture binding */
+    RSX_B2P_SET(B2P_PIPE);
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -5401,6 +5910,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                                           n_targets, &pipeline_is_fixed);
     if (!pipeline) { s_dstat.drop_pipeline++; eng_draw_trace("DROP-pipeline", prim, indexed, n_draw, 0, tex_mask); return; }
     WP_MARK(2);   /* pipeline lookup */
+    RSX_B2P_SET(B2P_IDX);
     /* RSX_SURF_DUMP_AT_FP=<hash>: the first time (from RSX_SURF_DUMP_FROM) a
      * draw with that fragment program is about to run, finish the GPU work
      * recorded so far and dump every surface -- what the draw will read. */
@@ -5428,6 +5938,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
           for (int k = 0; k < n; k++) if (fh && fh == want[k]) return; } }
 
+    WP2_BEGIN(_w56);
     if (indexed && !vce) {
         if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
@@ -5436,6 +5947,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g.indices);
         draw_indices = g.indices;
     }
+    WP2_END(_w56, 56);
     if (vc_check) {
         const int same = vc_check->n_verts == dc.n_verts && vc_check->stride == layout.stride &&
             vc_check->indexed == indexed && vc_check->n_draw == n_draw &&
@@ -5443,17 +5955,21 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             (!indexed || !memcmp(vc_check->indices, g.indices, (size_t)n_draw * sizeof(u32)));
         s_vc_checked++;
         if (!same) s_vc_check_bad_total++;
+        { static u32 lastrep; if (g.frames - lastrep >= 120) { lastrep = g.frames; eng_vc_check_summary(); } }   /* periodic: a killed run has no atexit */
         if (!same && ++s_vcstat.check_bad <= 8)
             fprintf(stderr, "[vcache-check] f%u MISMATCH: cached %u verts/%u draw (indexed %d), converted %u/%u (%d)\n",
                     g.frames, vc_check->n_verts, vc_check->n_draw, vc_check->indexed,
                     dc.n_verts, n_draw, indexed);
     } else if (!vce && vcf.ok && dc.fetch_ok) {
         eng_vcdbg_miss(&vcf);
+        WP2_BEGIN(_w57);
         eng_vc_store(vc_key, &vcf, dc.verts, dc.n_verts, layout.stride,
                      dc.n_source_refs, indexed, g.indices, n_draw);
+        WP2_END(_w57, 57);
     }
 
     WP_MARK(3);   /* index build, vertex-cache store */
+    RSX_B2P_SET(B2P_CONST);
     /* The transform constant block, then the viewport epilogue the vertex
      * program's tail multiplies by: RSX window coordinates mapped into the
      * host's clip space (rsx_live_draw.c:6143-6156). */
@@ -5484,6 +6000,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             xf[5] = -((my + k * vp.translate[1] - H * 0.5f) / (H * 0.5f));
         }
     }
+    WP2_BEGIN(_w20);
     /* The 8 KB block is copied and staged again only when a constant or the
      * viewport changed since the last draw; otherwise the backend rebinds
      * what it already staged. RSX_VS_CB_ALWAYS=1 stages it every draw. */
@@ -5516,6 +6033,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.vp_cb_bound = 0;
     }
 
+    WP2_END(_w20, 20);
+    WP2_BEGIN(_w21);
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
@@ -5526,9 +6045,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
+    WP2_BEGIN(_w58);
     memset(g.fp_cb, 0, fp_bytes);
     if (g.fp_constants.count)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+    WP2_END(_w58, 58);
     /* RSX_FPCONST_AT_FP=<hash>: the fragment constants of the first 3 draws
      * (from RSX_SURF_DUMP_FROM) whose program translates to that hash. */
     { static int left = -1; static unsigned long long want = 0;
@@ -5615,27 +6136,34 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         rsx_rt_freeze_camera(rjob);
         g.be->rt_ao_inject(g.be->user, rch, rdh, rjob);
     }
+    WP2_END(_w21, 21);
+    WP2_BEGIN(_w22);
+    RSX_B2P_SET(B2P_BIND);
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
-    g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
+    { WP2_BEGIN(_w24); g.be->bind_targets(g.be->user, handles, n_targets, depth_handle); WP2_END(_w24, 24); }
     g.be->bind_pipeline(g.be->user, pipeline);
+    { WP2_BEGIN(_w25);
     if (vs_cb_always || !g.vp_cb_bound || !g.be->reuse_vs_constants ||
         !g.be->reuse_vs_constants(g.be->user))
         g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    WP2_END(_w25, 25); }
     g.vp_cb_bound = 1;
-    g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
-    g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
-    g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+    if (s_wp_on > 1) { WP2_BEGIN(_w47); static u8 pcb[4096]; static u32 pbytes; s_wp_n2[26]++; if (fp_bytes == pbytes && fp_bytes <= sizeof pcb && !memcmp(pcb, g.fp_cb, fp_bytes)) s_wp_n2[27]++; if (fp_bytes <= sizeof pcb) { memcpy(pcb, g.fp_cb, fp_bytes); pbytes = fp_bytes; } else pbytes = 0; s_wp_n2[29]++; if (vs_cb_same) s_wp_n2[19]++; WP2_END(_w47, 47); }
+    { WP2_BEGIN(_w26); g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes); WP2_END(_w26, 26); }
+    { WP2_BEGIN(_w27); g.be->bind_textures(g.be->user, textures, samplers, tex_mask); WP2_END(_w27, 27); }
+    { WP2_BEGIN(_w28); g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask); WP2_END(_w28, 28); }
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
     /* A movie's picture: a quad sampling two or more of its planes (8-bit,
      * 256 wide and up, as g_rsx_video_plane_uploads counts them). The
      * present shows the frame it is in whole (rsx_present_layout). */
     if (!s_frame_video && tex_mask && dc.n_verts && dc.n_verts <= 8) {
         u32 planes = 0;
+        s_tdec_pass = 5;
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
             if (!(tex_mask & (1u << u))) continue;
             rsx_dsp_texture t;
-            rsx_dsp_get_texture(RV, u, &t);
+            eng_get_tex(RV, u, &t);
             if ((t.format & 0x9Fu) == 0x81u && t.width >= 256) planes++;
         }
         if (planes >= 2) s_frame_video = 1;
@@ -5696,6 +6224,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.be->set_blend_color(g.be->user, bc);
     }
 
+    RSX_B2P_SET(B2P_DRAWREC);
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     /* RT_AO: transparent draws of the scene (particles, steam, water, light passes) are drawn after the AO, whatever their place in
      * the stream: the AO is a function of the opaque depth and must not tint what is in front of it. Fur shells stay (they are
@@ -5704,6 +6233,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         n_targets == 1 && depth_handle && g.surfaces[target].handle == rsx_rt_scene_color() &&
         !(vce && s_cur_pipe && (s_cur_pipe->rt_static & 2) && topology == RSX_TOPOLOGY_TRIANGLES && !pipeline_is_fixed))
         g.be->rt_ao_defer(g.be->user);
+    WP2_END(_w22, 22);
+    WP2_BEGIN(_w23);
     if (g.q_cur && g.be->query_set) { g.be->query_set(g.be->user, g.q_cur); g.q_draws++; }
     if (vce && vce->buf)
         g.be->draw_buffer(g.be->user, topology, vce->buf, 0, uploaded,
@@ -5711,7 +6242,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     else
         g.be->draw(g.be->user, topology, draw_verts, uploaded, layout.stride,
                    indexed ? draw_indices : NULL, indexed ? n_draw : 0);
+    WP2_END(_w23, 23);
     WP_MARK(4);   /* constants, backend binds, record */
+    RSX_B2P_SET(B2P_TAIL);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -6134,7 +6667,7 @@ static void eng_wprof_report(void)
     if (s_wp_on < 0) eng_wk_env();
     if (s_wp_on <= 0) return;
     static unsigned n; static unsigned long long t0tsc, t0q;
-    static unsigned long long l_nscan, l_nmiss, l_cyc[8], l_fifo, l_enc, l_draws, l_calls;
+    static unsigned long long l_nscan, l_nmiss, l_cyc[64], l_fifo, l_enc, l_draws, l_calls;
     static unsigned long long l_c[6], l_meths, l_runs, l_runw, l_cmds;
     unsigned long long q = 0;
 #ifdef _WIN32
@@ -6169,7 +6702,31 @@ static void eng_wprof_report(void)
                 (g_pw_ms[4] - l_pw[4]) / 240.0, (g_pw_ms[5] - l_pw[5]) / 240.0, (g_pw_ms[6] - l_pw[6]) / 240.0, (g_pw_ms[7] - l_pw[7]) / 240.0,
                 (g_pw_ms[9] - l_pw[9]) * k / 1.0, (g_pw_ms[10] - l_pw[10]) * k, (g_pw_ms[11] - l_pw[11]) * k);
         for (int i = 0; i < 12; i++) l_pw[i] = g_pw_ms[i]; }
-    for (int i = 0; i < 8; i++) l_cyc[i] = s_wp_cyc[i];
+    if (s_wp_on > 1) {
+        static unsigned long long l_n2[48];
+        const double* kk = &k;
+        fprintf(stderr, "[wprof5] per present ms: layout %.2f key %.2f lookup %.2f (arm %.2f hashfallback %.2f; hashed %.0f ok %.0f untrusted %.0f) | state: decode %.2f targets %.2f bindtex %.2f vtex+ssr %.2f | "
+                "pipeline: pre %.2f key %.2f find %.2f | p4: vpcb %.2f fpcb %.2f binds %.2f draw %.2f\n",
+                (s_wp_cyc[8] - l_cyc[8]) * *kk, (s_wp_cyc[9] - l_cyc[9]) * *kk, (s_wp_cyc[10] - l_cyc[10]) * *kk, (s_wp_cyc[11] - l_cyc[11]) * *kk, (s_wp_cyc[12] - l_cyc[12]) * *kk,
+                (double)(s_wp_n2[0] - l_n2[0]) / 240.0, (double)(s_wp_n2[1] - l_n2[1]) / 240.0, (double)(s_wp_n2[2] - l_n2[2]) / 240.0,
+                (s_wp_cyc[13] - l_cyc[13]) * *kk, (s_wp_cyc[14] - l_cyc[14]) * *kk, (s_wp_cyc[15] - l_cyc[15]) * *kk, (s_wp_cyc[16] - l_cyc[16]) * *kk,
+                (s_wp_cyc[17] - l_cyc[17]) * *kk, (s_wp_cyc[18] - l_cyc[18]) * *kk, (s_wp_cyc[19] - l_cyc[19]) * *kk,
+                (s_wp_cyc[20] - l_cyc[20]) * *kk, (s_wp_cyc[21] - l_cyc[21]) * *kk, (s_wp_cyc[22] - l_cyc[22]) * *kk, (s_wp_cyc[23] - l_cyc[23]) * *kk);
+        fprintf(stderr, "[wprof6] per present ms: p4 binds: targets %.2f vscb %.2f pscb %.2f tex %.2f vtex %.2f | pipeline pre: cube+vtex %.2f shadow %.2f texop %.2f unnorm %.2f\n",
+                (s_wp_cyc[24] - l_cyc[24]) * *kk, (s_wp_cyc[25] - l_cyc[25]) * *kk, (s_wp_cyc[26] - l_cyc[26]) * *kk, (s_wp_cyc[27] - l_cyc[27]) * *kk, (s_wp_cyc[28] - l_cyc[28]) * *kk,
+                (s_wp_cyc[30] - l_cyc[30]) * *kk, (s_wp_cyc[31] - l_cyc[31]) * *kk, (s_wp_cyc[32] - l_cyc[32]) * *kk, (s_wp_cyc[33] - l_cyc[33]) * *kk);
+        fprintf(stderr, "[wprof7] per present ms, dc_fetch (miss path): hash-indices %.2f decode-refs %.2f remap %.2f plan+prepare+spans %.2f fetch_all %.2f\n",
+                (s_wp_cyc[34] - l_cyc[34]) * *kk, (s_wp_cyc[35] - l_cyc[35]) * *kk, (s_wp_cyc[36] - l_cyc[36]) * *kk, (s_wp_cyc[37] - l_cyc[37]) * *kk, (s_wp_cyc[38] - l_cyc[38]) * *kk);
+        { extern unsigned long long g_wp2_samp_cyc; static unsigned long long l_samp, l_hits;
+          fprintf(stderr, "[wprof8]");
+          for (int i = 0; i < 64; i++) if (s_wp_cyc[i] != l_cyc[i]) fprintf(stderr, " c%d=%.4f", i, (s_wp_cyc[i] - l_cyc[i]) * *kk);
+          fprintf(stderr, " c49=%.4f", (g_wp2_samp_cyc - l_samp) * *kk);
+          for (int i = 0; i < 48; i++) fprintf(stderr, " n%d=%.2f", i, (double)(s_wp_n2[i] - l_n2[i]) / 240.0);
+          fprintf(stderr, " fpchit=%.2f\n", (double)(s_fpc_hits - l_hits) / 240.0);
+          l_samp = g_wp2_samp_cyc; l_hits = s_fpc_hits; }
+        for (int i = 0; i < 48; i++) l_n2[i] = s_wp_n2[i];
+    }
+    for (int i = 0; i < 64; i++) l_cyc[i] = s_wp_cyc[i];
     l_fifo = g_wp_fifo_cyc; l_enc = g_wp_enc_cyc; l_draws = s_wp_draws; l_calls = g_wp_fifo_calls;
     t0tsc = t1; t0q = q;
 }
@@ -6614,8 +7171,8 @@ static long long b2_qpc(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); re
 
 static void b2_exec(EngJob* j)
 {
-    if (j->kind == 1) { extern void vm_write32(unsigned, unsigned); vm_write32(j->c_a, j->c_b); s_b2_nctrl++; return; }
-    if (j->kind == 2) { eng_query_method(j->c_a, j->c_b); s_b2_nctrl++; return; }
+    if (j->kind == 1) { extern void vm_write32(unsigned, unsigned); RSX_B2P_SET(B2P_CTRLW); vm_write32(j->c_a, j->c_b); s_b2_nctrl++; return; }
+    if (j->kind == 2) { RSX_B2P_SET(B2P_CTRLQ); eng_query_method(j->c_a, j->c_b); s_b2_nctrl++; return; }
     s_b2_njobs++;
     const double t0 = s_wk_fast ? 0.0 : eng_now_ms();
     static unsigned hp_k_; const unsigned long long hp_c0 = (hp_on() && ((++hp_k_) & 7u) == 0u) ? wp_tsc() : 0ull;   /* reg60: 1 draw in 8 is timed (the rest costs nothing) */
@@ -6754,12 +7311,58 @@ static void wk_stop(void)
     for (int i = 0; i < s_wk_n; i++) if (s_wk_thr[i]) { WaitForSingleObject(s_wk_thr[i], 3000); CloseHandle(s_wk_thr[i]); s_wk_thr[i] = NULL; }
 }
 
+static const char* const s_b2p_name[B2P_N] = { "idle", "jobpre", "setup", "layout", "vckey", "vclookup", "vcfetch", "rstate", "targets", "texbind",
+    "texdec", "texslot", "texhash", "texwatch", "texup", "vtex", "pipe", "pipecreate", "gprog", "idx", "const", "bind", "sampler", "stage", "drawrec",
+    "tail", "w_enc", "w_fence", "w_submit", "ctrl_wr", "ctrl_q" };
+/* nj == 0: only takes the baseline snapshot. Called from b2_report (thread B2), once per printed window. */
+static void b2p_report(unsigned nj, unsigned frames, long long now_q, long long qf, double busy_ms)
+{
+    static unsigned long long t0tsc, l_cyc[B2P_N], l_nm[B2P_N], l_cnt[B2C_N], l_cpu; static long long t0q;
+    FILETIME ct, et, kt, ut; GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut);
+    const unsigned long long cpu = ((((unsigned long long)kt.dwHighDateTime << 32) | kt.dwLowDateTime) + (((unsigned long long)ut.dwHighDateTime << 32) | ut.dwLowDateTime));
+    const unsigned long long cpu_k = (((unsigned long long)kt.dwHighDateTime << 32) | kt.dwLowDateTime);
+    static unsigned long long l_cpu_k;
+    const unsigned long long t1 = wp_tsc();
+    if (nj && t0tsc) {
+        const double secs = (double)(now_q - t0q) / (double)qf;
+        const double hz = (double)(t1 - t0tsc) / secs;
+        const double us_cyc = 1e6 / hz;
+        double net[B2P_N], sum = 0.0, raw = 0.0, ovh = 0.0; unsigned long long marks = 0;
+        for (int k = 0; k < B2P_N; k++) {
+            const double dc = (double)(s_b2p_cyc[k] - l_cyc[k]), dm = (double)(s_b2p_nm[k] - l_nm[k]);
+            const double n = dc - dm * s_b2p_cost;
+            net[k] = n > 0.0 ? n * us_cyc : 0.0;                     /* us in the window */
+            marks += (unsigned long long)dm;
+            if (k != B2P_IDLE) { sum += net[k]; raw += dc * us_cyc; ovh += dm * s_b2p_cost * us_cyc; }
+        }
+        fprintf(stderr, "[b2prof] %.2f s, %u draws, %u frames (%.0f draws/frame): busy(qpc) %.1f ms | buckets non-idle raw %.1f ms, net of mark cost %.1f ms | idle bucket %.1f ms | "
+                "thread CPU %.1f ms (kernel %.1f) | marks/draw %.1f x %.0f cyc = %.2f us/draw (est.)\n",
+                secs, nj, frames, frames ? (double)nj / frames : 0.0, busy_ms, raw / 1000.0, sum / 1000.0, net[B2P_IDLE] / 1000.0,
+                (double)(cpu - l_cpu) / 10000.0, (double)(cpu_k - l_cpu_k) / 10000.0, (double)marks / nj, s_b2p_cost, ovh / nj);
+        fprintf(stderr, "[b2prof-us/draw]");
+        for (int k = 1; k < B2P_N; k++) fprintf(stderr, " %s %.3f", s_b2p_name[k], net[k] / nj);
+        fputc(10, stderr);
+        fprintf(stderr, "[b2prof-ms/frame]");
+        for (int k = 1; k < B2P_N; k++) fprintf(stderr, " %s %.3f", s_b2p_name[k], frames ? net[k] / 1000.0 / frames : 0.0);
+        fputc(10, stderr);
+        const unsigned long long* c = s_b2p_cnt;
+        fprintf(stderr, "[b2prof-cnt/draw] vchit %.3f vcmiss %.4f texunit %.3f texslot %.3f texhash %.4f texwatch %.4f texup %.5f pipecreate %.5f stage %.3f stage_bytes %.1f | window: enc-join found-pending %llu blocked %llu, fence-blocked %llu, mid-frame submits %llu\n",
+                (double)(c[B2C_VCHIT] - l_cnt[B2C_VCHIT]) / nj, (double)(c[B2C_VCMISS] - l_cnt[B2C_VCMISS]) / nj, (double)(c[B2C_TEXUNIT] - l_cnt[B2C_TEXUNIT]) / nj,
+                (double)(c[B2C_TEXSLOT] - l_cnt[B2C_TEXSLOT]) / nj, (double)(c[B2C_TEXHASH] - l_cnt[B2C_TEXHASH]) / nj, (double)(c[B2C_TEXWATCH] - l_cnt[B2C_TEXWATCH]) / nj,
+                (double)(c[B2C_TEXUP] - l_cnt[B2C_TEXUP]) / nj, (double)(c[B2C_PIPECREATE] - l_cnt[B2C_PIPECREATE]) / nj, (double)(c[B2C_STAGE] - l_cnt[B2C_STAGE]) / nj,
+                (double)(c[B2C_STAGEB] - l_cnt[B2C_STAGEB]) / nj, c[B2C_ENCJOIN] - l_cnt[B2C_ENCJOIN], c[B2C_ENCBLK] - l_cnt[B2C_ENCBLK],
+                c[B2C_FENCEBLK] - l_cnt[B2C_FENCEBLK], c[B2C_SUBMIT] - l_cnt[B2C_SUBMIT]);
+    }
+    memcpy(l_cyc, s_b2p_cyc, sizeof l_cyc); memcpy(l_nm, s_b2p_nm, sizeof l_nm); memcpy(l_cnt, s_b2p_cnt, sizeof l_cnt);
+    l_cpu = cpu; l_cpu_k = cpu_k; t0tsc = t1; t0q = now_q;
+}
+
 static void b2_report(void)
 {
-    static long long last_q; static unsigned last_jobs;
+    static long long last_q; static unsigned last_jobs; static unsigned last_frames;
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     const long long now = b2_qpc();
-    if (!last_q) { last_q = now; last_jobs = s_b2_njobs; return; }
+    if (!last_q) { last_q = now; last_jobs = s_b2_njobs; last_frames = g.frames; if (g_b2p_on) b2p_report(0, 0, now, f.QuadPart, 0.0); return; }
     if ((now - last_q) * 1000 / f.QuadPart < 2000) return;
     const double ms = 1000.0 / (double)f.QuadPart;
     const unsigned nj = s_b2_njobs - last_jobs;
@@ -6767,6 +7370,8 @@ static void b2_report(void)
             (double)(now - last_q) / (double)f.QuadPart, nj, (double)s_b2_busy_q * ms, nj ? (double)s_b2_busy_q * ms * 1000.0 / nj : 0.0,
             (double)s_b2_idle_q * ms, s_b2_nfull, (double)s_b2_full_q * ms, s_b2_ndrain, s_b2_nblocked, (double)s_b2_drain_q * ms,
             s_b2_nwait, s_b2_nwait_blk, s_b2_maxq);
+    if (g_b2p_on) b2p_report(nj, g.frames - last_frames, now, f.QuadPart, (double)s_b2_busy_q * ms);
+    last_frames = g.frames;
     last_q = now; last_jobs = s_b2_njobs;
     s_b2_busy_q = s_b2_idle_q = s_b2_full_q = s_b2_drain_q = 0;
     s_b2_nfull = s_b2_ndrain = s_b2_nblocked = s_b2_nwait = s_b2_nwait_blk = s_b2_maxq = 0;
@@ -6785,7 +7390,8 @@ static DWORD WINAPI b2_main(LPVOID arg)
     (void)arg;
     t_on_b2 = 1;
     { extern void ps3_sampler_tag_thread(void); if (getenv("PS3_SAMPLE_B2")) ps3_sampler_tag_thread(); }   /* PS3_SAMPLE=<ms> PS3_SAMPLE_SPU=1: profile this thread */
-    const int prof = s_wp_on > 0;
+    if (g_b2p_on) b2p_calibrate();
+    const int prof = s_wp_on > 0 || g_b2p_on;
     long long idle0 = 0;
     for (;;) {
         const unsigned long long c = s_b2_cons;
@@ -6807,8 +7413,10 @@ static DWORD WINAPI b2_main(LPVOID arg)
         long long t0 = 0;
         if (prof) { t0 = b2_qpc(); if (idle0) { s_b2_idle_q += t0 - idle0; idle0 = 0; } }
         { EngJob* jj = &s_b2_jobs[c % B2_SLOTS];
+          if (g_b2p_on) b2p_job_begin();
           if (s_wk_n && jj->kind == 0) { wk_commit_wait(jj); s_cur_pre = &jj->pre; }
           b2_exec(jj);
+          if (g_b2p_on) b2p_job_end();
           s_cur_pre = NULL; }
         if (prof) { s_b2_busy_q += b2_qpc() - t0; }
         __atomic_store_n(&s_b2_cons, c + 1, __ATOMIC_RELEASE);
@@ -6824,6 +7432,7 @@ static int eng_b2_on(void)
 
 static void b2_start(void)
 {
+    { const char* pe = getenv("RSX_B2_PROF"); g_b2p_on = (pe && pe[0] && pe[0] != '0') ? 1 : 0; }   /* before the thread exists */
     s_b2_jobs = (EngJob*)calloc(B2_SLOTS, sizeof(EngJob));
     s_b2_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
     wk_start();

@@ -468,6 +468,25 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                             const u32* occurrence_to_unique,
                                             u32* indices);
 
+/* RSX_B2_PROF=1 (03/11 b2prof): exclusive rdtsc buckets of the B2 draw thread, printed as [b2prof] (rsx_draw_engine.c). The
+ * hooks do nothing unless the flag is set and the calling thread is B2; with the flag off each one is a test of g_b2p_on. */
+enum {
+    B2P_IDLE, B2P_JOBPRE, B2P_SETUP, B2P_LAYOUT, B2P_VCKEY, B2P_VCLOOKUP, B2P_VCFETCH, B2P_RSTATE, B2P_TARGETS, B2P_TEXBIND, B2P_TEXDEC,
+    B2P_TEXSLOT, B2P_TEXHASH, B2P_TEXWATCH, B2P_TEXUP, B2P_VTEX, B2P_PIPE, B2P_PIPECREATE, B2P_GPROG, B2P_IDX, B2P_CONST, B2P_BIND,
+    B2P_SAMPLER, B2P_STAGE, B2P_DRAWREC, B2P_TAIL, B2P_WENC, B2P_WFENCE, B2P_WSUBMIT, B2P_CTRLW, B2P_CTRLQ, B2P_N
+};
+enum { B2C_VCHIT, B2C_VCMISS, B2C_TEXUNIT, B2C_TEXSLOT, B2C_TEXHASH, B2C_TEXWATCH, B2C_TEXUP, B2C_PIPECREATE, B2C_STAGE, B2C_STAGEB,
+       B2C_ENCJOIN, B2C_ENCBLK, B2C_FENCEBLK, B2C_SUBMIT, B2C_N };
+extern int g_b2p_on;
+void rsx_b2p_set(int bucket);
+void rsx_b2p_enter(int bucket);
+void rsx_b2p_leave(void);
+void rsx_b2p_add(int counter, unsigned long long v);
+#define RSX_B2P_SET(k)      do { if (g_b2p_on) rsx_b2p_set(k); } while (0)
+#define RSX_B2P_ENTER(k)    do { if (g_b2p_on) rsx_b2p_enter(k); } while (0)
+#define RSX_B2P_LEAVE()     do { if (g_b2p_on) rsx_b2p_leave(); } while (0)
+#define RSX_B2P_ADD(c, v)   do { if (g_b2p_on) rsx_b2p_add((c), (v)); } while (0)
+
 #ifdef __cplusplus
 }
 #endif

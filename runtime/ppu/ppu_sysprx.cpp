@@ -166,7 +166,17 @@ static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile unsigned long long acq_cpu_us;
     volatile long state;   /* Windows fast path: 0 free, 1 held, 2 held with waiters */
     volatile long pending; /* lwcond waiters signalled but not yet re-locked (LV2 hands them the mutex at signal time) */
+    volatile long long dg_t0; volatile unsigned dg_tid, dg_lr;   /* AUDIO_TICK_DIAG (aud104): who took it, when, from where */
+    volatile unsigned long long dg_cyc;                          /* ...and the holder's own cycle counter at that time */
+    volatile long syn_waited;                                    /* AUDIO_SYN_LOCK_BOOST: the watched thread has blocked on this one */
+    volatile long bst_tid, bst_prev;                             /* ...and who runs boosted because of it, at what priority before */
     } g_lwm[LWM_HASH];
+extern "C" volatile unsigned g_blk_diag_tid;   /* ppu_loader.cpp: the guest thread being watched (0 = diag off) */
+extern "C" volatile double g_blk_diag_cpus;
+extern "C" volatile unsigned g_syn_boost_tid;
+extern "C" const char* ppu_thread_name_of(unsigned tid);
+extern "C" uint32_t g_sc_inflight[];
+static unsigned g_sc_inflight_diag(unsigned tid) { return g_sc_inflight[tid]; }
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }
@@ -177,6 +187,23 @@ static volatile long g_lwm_tab_lock = 0;
  * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
  * convoy root. Default OFF. */
 static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
+/* AUDIO_TICK_DIAG (aud104): when a thread is watched, every lwmutex acquire stamps (tid, lr, QPC); the watched thread logs a contended wait
+ * of more than 3 ms with the holder at the moment it blocked, and any holder logs a hold of more than 4 ms at its unlock. */
+static long long lwmd_now(void){ LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }
+static double lwmd_ms(long long d){ static double f = 0; if (f == 0) { LARGE_INTEGER x; QueryPerformanceFrequency(&x); f = (double)x.QuadPart; } return d * 1000.0 / f; }
+/* Called by the thread that has just acquired lwm (not recursive). Diag stamp, and the boost: a lock the watched thread has waited on is held
+ * at THREAD_PRIORITY_HIGHEST by whoever takes it, until it unlocks (priority inheritance, which Windows locks here do not have). */
+static void lwmd_taken(struct LwmSlot* sl, ppu_context* ctx)
+{
+    if (!sl) return;
+    if (g_blk_diag_tid) { ULONG64 c = 0; QueryThreadCycleTime(GetCurrentThread(), &c);
+        sl->dg_cyc = c; sl->dg_t0 = lwmd_now(); sl->dg_tid = (unsigned)ctx->thread_id; sl->dg_lr = (uint32_t)ctx->lr; }
+    if (g_syn_boost_tid && sl->syn_waited && g_syn_boost_tid != (unsigned)ctx->thread_id) {
+        const int pr = GetThreadPriority(GetCurrentThread());
+        if (pr != THREAD_PRIORITY_ERROR_RETURN && pr < THREAD_PRIORITY_HIGHEST && SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
+            sl->bst_prev = pr; sl->bst_tid = (long)ctx->thread_id; }
+    }
+}
 static long long lwm_now_us(void){
     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
@@ -337,6 +364,12 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
+            long long _dg_q0 = 0; unsigned _dg_htid = 0, _dg_hlr = 0; long long _dg_ht0 = 0;
+            if (g_syn_boost_tid && g_syn_boost_tid == (unsigned)ctx->thread_id) { struct LwmSlot* bsl = lwm_find(lwm); if (bsl) bsl->syn_waited = 1; }
+            if (g_blk_diag_tid && g_blk_diag_tid == (unsigned)ctx->thread_id) {
+                _dg_q0 = lwmd_now(); struct LwmSlot* dsl = lwm_find(lwm);
+                if (dsl) { _dg_htid = dsl->dg_tid; _dg_hlr = dsl->dg_lr; _dg_ht0 = dsl->dg_t0; }
+            }
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = lwm_lock_wait(lwm, s, ms);
@@ -346,12 +379,17 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
                 return;
             }
+            if (_dg_q0) { const long long q1 = lwmd_now(); const double w = lwmd_ms(q1 - _dg_q0);
+                if (w > 3.0) fprintf(stderr, "[lwm-wait] qpc %.1f ms: lwm=%08X waited %.1f ms, waiter tid=%u lr=%08X; holder when it blocked: tid=%u \"%s\" took it at lr=%08X, had held %.1f ms, its in-flight syscall %u\n",
+                    lwmd_ms(q1), lwm, w, (unsigned)ctx->thread_id, (uint32_t)ctx->lr, _dg_htid, ppu_thread_name_of(_dg_htid), _dg_hlr,
+                    _dg_ht0 ? lwmd_ms(_dg_q0 - _dg_ht0) : -1.0, _dg_htid < 64 ? g_sc_inflight_diag(_dg_htid) : 0u); }
             if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu ACQUIRED lwm=0x%08X after waiting %lldus\n",
                 (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
         }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+    if (__builtin_expect(g_blk_diag_tid != 0 || g_syn_boost_tid != 0, 0)) lwmd_taken(lwm_find(lwm), ctx);
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
@@ -372,6 +410,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         if (!lwm_lock_try(lwm, s)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // EBUSY (was 0x8001000B = ETIMEDOUT)
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+    if (__builtin_expect(g_blk_diag_tid != 0 || g_syn_boost_tid != 0, 0)) lwmd_taken(lwm_find(lwm), ctx);
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;
@@ -387,6 +426,19 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     }
     vm_write32(lwm + LWM_RECUR, 0);
     vm_write32(lwm + LWM_OWNER, 0);
+    if (__builtin_expect(g_blk_diag_tid != 0 || g_syn_boost_tid != 0, 0)) { struct LwmSlot* dsl = lwm_find(lwm);
+        if (dsl && g_blk_diag_tid && dsl->dg_t0) { const long long q = lwmd_now(); const double h = lwmd_ms(q - dsl->dg_t0);
+            if (h > 4.0) {
+                ULONG64 c = 0; QueryThreadCycleTime(GetCurrentThread(), &c);
+                const double cpu = dsl->dg_tid == (unsigned)ctx->thread_id ? (double)(c - dsl->dg_cyc) / g_blk_diag_cpus / 1000.0 : -1.0;
+                uint32_t sp = (uint32_t)ctx->gpr[1]; char b[400]; int pn = 0; uint32_t prev = 0; int found = 0;
+                for (uint32_t a2 = sp; a2 < sp + 0x1800 && found < 10; a2 += 4) { uint32_t v = vm_read32(a2);
+                    if (v >= 0x00010000u && v < 0x00900000u && v != prev) { pn += snprintf(b + pn, sizeof b - pn, " %08X", v); prev = v; found++; } }
+                fprintf(stderr, "[lwm-hold] qpc %.1f ms: lwm=%08X held %.1f ms (holder cpu %.1f ms) by tid=%u \"%s\" prio=%d (taken at lr=%08X, unlocked from lr=%08X) stack:%s\n",
+                    lwmd_ms(q), lwm, h, cpu, dsl->dg_tid, ppu_thread_name_of(dsl->dg_tid), GetThreadPriority(GetCurrentThread()), dsl->dg_lr, (uint32_t)ctx->lr, b);
+            }
+            dsl->dg_t0 = 0; }
+        if (dsl && dsl->bst_tid == (long)ctx->thread_id) { SetThreadPriority(GetCurrentThread(), (int)dsl->bst_prev); dsl->bst_tid = 0; } }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {

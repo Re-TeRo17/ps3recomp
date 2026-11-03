@@ -506,6 +506,85 @@ static struct SpursInst {
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
+/* SPURS_LOCK_DIAG=<ms> (aud104, default off): who holds the SPURS instance lock / workload registry lock for more than <ms>, and who waited
+ * more than <ms> for one (with the holder at the moment it blocked). The synth tick's cellSpursReadyCountStore takes both locks and was seen
+ * blocked 10-115 ms. Off: one int compare per lock operation. Wrapped: every acquire/release of si->lock and the registry lock, and the two
+ * condvar sleeps on si->lock (a sleep releases it). */
+struct SplState { void* lk; long long t0; unsigned tid; int line; const char* fn; };
+static struct SplState s_spl[8];
+static int s_spl_thr = -1; static double s_spl_f;
+static struct SplState* spl_find(void* lk)
+{
+    for (int i = 0; i < 8; i++) {
+        if (s_spl[i].lk == lk) return &s_spl[i];
+        if (!s_spl[i].lk && __sync_bool_compare_and_swap(&s_spl[i].lk, (void*)0, lk)) return &s_spl[i];
+    }
+    return NULL;
+}
+static void spl_init(void)
+{
+    const char* e = getenv("SPURS_LOCK_DIAG"); int t = e ? atoi(e) : 0; if (t < 0) t = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_spl_f = (double)f.QuadPart; s_spl_thr = t;
+}
+static void spl_who(char* out, size_t n)
+{
+    PWSTR w = NULL; out[0] = 0;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL); LocalFree(w); }
+    if (!out[0]) snprintf(out, n, "?");
+}
+static void spl_acq(SRWLOCK* lk, const char* fn, int line)
+{
+    if (s_spl_thr < 0) spl_init();
+    if (s_spl_thr == 0) { AcquireSRWLockExclusive(lk); return; }
+    struct SplState* s = spl_find(lk);
+    LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+    struct SplState snap = {0}; int blocked = 0;
+    if (!TryAcquireSRWLockExclusive(lk)) {
+        blocked = 1; if (s) snap = *s;
+        AcquireSRWLockExclusive(lk);
+    }
+    QueryPerformanceCounter(&q1);
+    if (s) { s->t0 = q1.QuadPart; s->tid = GetCurrentThreadId(); s->line = line; s->fn = fn; }
+    const double wait = (q1.QuadPart - q0.QuadPart) * 1000.0 / s_spl_f;
+    if (blocked && wait > s_spl_thr) {
+        char nm[64]; spl_who(nm, sizeof nm);
+        fprintf(stderr, "[spurs-lock] WAIT %s %.1f ms: waiter tid=%u \"%s\" (%s:%d); holder when it blocked tid=%u (%s:%d) had held %.1f ms\n",
+                lk == &s_workload_registry_lock ? "registry" : "inst", wait, (unsigned)GetCurrentThreadId(), nm, fn, line,
+                snap.tid, snap.fn ? snap.fn : "?", snap.line, snap.t0 ? (q0.QuadPart - snap.t0) * 1000.0 / s_spl_f : -1.0);
+    }
+}
+static void spl_rel(SRWLOCK* lk)
+{
+    if (s_spl_thr <= 0) { ReleaseSRWLockExclusive(lk); return; }
+    struct SplState* s = spl_find(lk); struct SplState c = {0};
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    if (s) { c = *s; s->t0 = 0; }
+    ReleaseSRWLockExclusive(lk);
+    const double held = c.t0 ? (q.QuadPart - c.t0) * 1000.0 / s_spl_f : 0;
+    if (held > s_spl_thr) {
+        char nm[64]; spl_who(nm, sizeof nm);
+        fprintf(stderr, "[spurs-lock] HELD %s %.1f ms by tid=%u \"%s\" (taken %s:%d)\n", lk == &s_workload_registry_lock ? "registry" : "inst", held,
+                c.tid, nm, c.fn ? c.fn : "?", c.line);
+    }
+}
+static BOOL spl_sleep(CONDITION_VARIABLE* cv, SRWLOCK* lk, DWORD ms, const char* fn, int line)
+{
+    if (s_spl_thr < 0) spl_init();
+    if (s_spl_thr == 0) return SleepConditionVariableSRW(cv, lk, ms, 0);
+    struct SplState* s = spl_find(lk); struct SplState c = {0};
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    if (s) { c = *s; s->t0 = 0; }
+    const double held = c.t0 ? (q.QuadPart - c.t0) * 1000.0 / s_spl_f : 0;
+    if (held > s_spl_thr) {
+        char nm[64]; spl_who(nm, sizeof nm);
+        fprintf(stderr, "[spurs-lock] HELD inst %.1f ms by tid=%u \"%s\" (taken %s:%d) until its condvar sleep\n", held, c.tid, nm, c.fn ? c.fn : "?", c.line);
+    }
+    const BOOL r = SleepConditionVariableSRW(cv, lk, ms, 0);
+    QueryPerformanceCounter(&q);
+    if (s) { s->t0 = q.QuadPart; s->tid = GetCurrentThreadId(); s->line = line; s->fn = fn; }
+    return r;
+}
+
 static s32 spurs_scheduler_start(struct SpursInst* si);
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea);
 static void spurs_scheduler_retire(u32 ea);
@@ -520,24 +599,25 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 
 /* Lock a live instance before changing admission. The global table retains
  * its existing ID convention; its allocation lock prevents cross-instance reuse. */
-static s32 spurs_api_lock(u32 ea, struct SpursInst** out)
+static s32 spurs_api_lock_f(u32 ea, struct SpursInst** out, const char* fn)
 {
     struct SpursInst* si = spurs_inst_find(ea);
     if (!si) return CELL_SPURS_CORE_ERROR_STAT;
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, fn, 0);
     if (si->ea != ea || !si->kernel_live || si->stopping || si->starting) {
-        ReleaseSRWLockExclusive(&si->lock);
+        spl_rel(&si->lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    spl_acq(&s_workload_registry_lock, fn, 1);
     *out = si;
     return CELL_OK;
 }
+#define spurs_api_lock(ea, out) spurs_api_lock_f((ea), (out), __func__)
 static void spurs_api_unlock(struct SpursInst* si)
 {
-    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    spl_rel(&s_workload_registry_lock);
     WakeAllConditionVariable(&si->wake);
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
@@ -553,16 +633,16 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     }
     if (!si) { ReleaseSRWLockExclusive(&s_inst_directory_lock); return CELL_SPURS_CORE_ERROR_NOMEM; }
 
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     if (si->kernel_live || si->stopping || si->starting) {
-        ReleaseSRWLockExclusive(&si->lock);
+        spl_rel(&si->lock);
         ReleaseSRWLockExclusive(&s_inst_directory_lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
     si->starting = 1;
     si->kernel_live = 1; /* reserve this lifecycle before publishing guest memory */
     __atomic_store_n(&si->ea, spurs_ea, __ATOMIC_RELEASE);
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     ReleaseSRWLockExclusive(&s_inst_directory_lock);
     si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
     memset(si->prefix, 0, sizeof(si->prefix));
@@ -576,10 +656,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
     s32 start_rc = spurs_scheduler_start(si);
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     si->starting = 0;
     if (start_rc) __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     if (start_rc) return start_rc;
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
@@ -620,10 +700,10 @@ s32 cellSpursFinalize(CellSpurs* spurs)
     spurs_policy_release_instance(ea);
     spurs_scheduler_retire(ea);
     spurs_cancel_attached_queues(ea);
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
     si->stopping = 0;
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     return CELL_OK;
 }
 
@@ -1920,12 +2000,12 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
       const char* e = getenv("SPU_FAST_FP");
       if (si->nspus == 1 && !(e && e[0] == '0')) g_spu_fast_fp = 1; }
     { extern void tl_name(const char*, int); char nb[64]; snprintf(nb, sizeof nb, "SPURS %08X lane%u", si->ea, (unsigned)slot->spu_num); tl_name(nb, 100 + (int)slot->spu_num + (si->nspus > 1 ? 0 : 50)); }   /* TOD_TIMELINE */
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     for (;;) {
         while (!slot->busy && !si->stopping)
-            SleepConditionVariableSRW(spurs_slot_wake() ? &slot->wake_cv : &si->wake, &si->lock, INFINITE, 0);
+            spl_sleep(spurs_slot_wake() ? &slot->wake_cv : &si->wake, &si->lock, INFINITE, __func__, __LINE__);
         if (si->stopping && !slot->busy) break;
-        ReleaseSRWLockExclusive(&si->lock);
+        spl_rel(&si->lock);
         { extern void ps3_cpu_note(void); ps3_cpu_note(); }
         LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
         static SPU_THREAD_LOCAL long long hk[4]; static unsigned long long h_acc[5];   /* SPURS_CPU_STATS: where the hand-off goes (lane 0) */
@@ -2006,7 +2086,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         QueryPerformanceCounter(&q1);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
-        AcquireSRWLockExclusive(&si->lock);
+        spl_acq(&si->lock, __func__, __LINE__);
         LARGE_INTEGER hq1; QueryPerformanceCounter(&hq1);
         slot->last_end = q1.QuadPart;
         u32 wid = slot->wid;
@@ -2025,14 +2105,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
          * wake up and scan: that wake-up costs ~90-150 us between consecutive runs on a lane. */
         { static int s_ho = -1; if (s_ho < 0) { const char* e = getenv("SPURS_HANDOFF"); s_ho = e ? atoi(e) : 0; }
           if (s_ho && !si->stopping) {
-              AcquireSRWLockExclusive(&s_workload_registry_lock);
+              spl_acq(&s_workload_registry_lock, __func__, __LINE__);
               si->handoffs += spurs_dispatch_slot(si, slot->spu_num, vm_read32(si->ea + SPURS_WKL_ENABLED), 0);
-              ReleaseSRWLockExclusive(&s_workload_registry_lock);
+              spl_rel(&s_workload_registry_lock);
           } }
         { LARGE_INTEGER hq3; QueryPerformanceCounter(&hq3); hk[0] = q1.QuadPart; hk[1] = hq1.QuadPart; hk[2] = hq2.QuadPart; hk[3] = hq3.QuadPart; }
         if (spurs_slot_wake()) WakeConditionVariable(&si->wake); else WakeAllConditionVariable(&si->wake);
     }
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     return 0;
 }
 
@@ -2059,7 +2139,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     struct SpursInst* si = (struct SpursInst*)p;
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
     SetThreadDescription(GetCurrentThread(), si->nspus > 1 ? L"spurs kernel" : L"spurs audio kernel");
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     static int s_spin_us = -1;
     if (s_spin_us < 0) { const char* e = getenv("SPURS_KERNEL_SPIN_US"); s_spin_us = e ? atoi(e) : 0;
         fprintf(stderr, "[cellSpurs] coordinator wait: %s (%d us)\n", s_spin_us ? "spin" : "1 ms condvar", s_spin_us); }
@@ -2069,7 +2149,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             /* The PPU kicks with inline atomics on the instance line, which never
              * signal the condvar: poll the ready/signal bytes instead of sleeping
              * a timer tick per kick. */
-            ReleaseSRWLockExclusive(&si->lock);
+            spl_rel(&si->lock);
             LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
             long long lim = f.QuadPart * s_spin_us / 1000000;
             for (unsigned it = 1; !si->stopping; it++) {
@@ -2078,14 +2158,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (b.QuadPart - a.QuadPart > lim) { timed_out = 1; break; }
                 if (it & 7) { for (int k = 0; k < 32; k++) YieldProcessor(); } else SwitchToThread();
             }
-            AcquireSRWLockExclusive(&si->lock);
+            spl_acq(&si->lock, __func__, __LINE__);
         } else
-            timed_out = !SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+            timed_out = !spl_sleep(&si->wake, &si->lock, 1, __func__, __LINE__);
         if (timed_out) si->wakes_to++; else si->wakes_cv++;
         if (si->stopping) break;
         if (disabled) continue;
         u32 ea = si->ea;
-        AcquireSRWLockExclusive(&s_workload_registry_lock);
+        spl_acq(&s_workload_registry_lock, __func__, __LINE__);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
         for (u32 sn_i = 0; sn_i < si->nspus; sn_i++) {
@@ -2131,9 +2211,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               }
               fprintf(stderr, "[spurs-lat] ea=%08X wakes: timeout=%u condvar=%u handoff=%u\n", ea, si->wakes_to, si->wakes_cv, si->handoffs);
               si->wakes_to = si->wakes_cv = si->handoffs = 0; } } }
-        ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        spl_rel(&s_workload_registry_lock);
     }
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     return 0;
 }
 
@@ -2250,10 +2330,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
      * job took up to 20 ms under load and the audio ring went unwritten.
      * Its threads run above the game's. SPURS_SOLO_PRIO=0: normal. */
     { static int pr = -1;
-      if (pr < 0) { const char* e = getenv("SPURS_SOLO_PRIO"); pr = !(e && e[0] == '0'); }
-      if (pr && si->nspus == 1) {
-          SetThreadPriority(si->slots[0].thread, THREAD_PRIORITY_HIGHEST);
-          SetThreadPriority(si->coordinator, THREAD_PRIORITY_HIGHEST);
+      if (pr < 0) { const char* e = getenv("SPURS_SOLO_PRIO"); pr = !(e && e[0] == '0'); if (e && e[0] == '2') pr = 2; }
+      if (pr && si->nspus == 1) {   /* SPURS_SOLO_PRIO=2 (aud103): TIME_CRITICAL instead of HIGHEST */
+          SetThreadPriority(si->slots[0].thread, pr == 2 ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST);
+          SetThreadPriority(si->coordinator, pr == 2 ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST);
           fprintf(stderr, "[cellSpurs] instance 0x%08X (1 SPU): threads at HIGHEST priority\n", si->ea);
       } }
 #ifdef _WIN32
@@ -2299,36 +2379,36 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
 #endif
     return CELL_OK;
 failed:
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     si->stopping = 1; WakeAllConditionVariable(&si->wake); for (u32 k_ = 0; k_ < 6; k_++) WakeAllConditionVariable(&si->slots[k_].wake_cv);
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     si->kernel_live = 0; si->stopping = 0;
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     return CELL_SPURS_CORE_ERROR_NOMEM;
 }
 
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
 {
-    AcquireSRWLockExclusive(&si->lock);
-    if (si->ea != ea || !si->kernel_live) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_STAT; }
-    if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+    spl_acq(&si->lock, __func__, __LINE__);
+    if (si->ea != ea || !si->kernel_live) { spl_rel(&si->lock); return CELL_SPURS_CORE_ERROR_STAT; }
+    if (si->stopping || si->starting) { spl_rel(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     for (u32 wid = 0; wid < 16; wid++)
-        if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+        if (si->active[wid]) { spl_rel(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     si->stopping = 1; WakeAllConditionVariable(&si->wake); for (u32 k_ = 0; k_ < 6; k_++) WakeAllConditionVariable(&si->slots[k_].wake_cv);
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
     for (u32 sn = 0; sn < si->nspus; sn++) {
         HANDLE h = si->slots[sn].thread;
         if (h) { WaitForSingleObject(h, INFINITE); CloseHandle(h); si->slots[sn].thread = NULL; }
     }
-    AcquireSRWLockExclusive(&si->lock);
+    spl_acq(&si->lock, __func__, __LINE__);
     si->kernel_live = 0;
-    ReleaseSRWLockExclusive(&si->lock);
+    spl_rel(&si->lock);
     return CELL_OK;
 }
 
@@ -2339,13 +2419,13 @@ static void spurs_scheduler_forget(u32 wid)
 
 static void spurs_scheduler_retire(u32 ea)
 {
-    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    spl_acq(&s_workload_registry_lock, __func__, __LINE__);
     for (u32 wid = 0; wid < CELL_SPURS_MAX_WORKLOAD; wid++)
         if (s_workloads[wid].in_use && s_workloads[wid].spurs_ea == ea) {
             memset(&s_workloads[wid], 0, sizeof(s_workloads[wid]));
             spurs_scheduler_forget(wid);
         }
-    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    spl_rel(&s_workload_registry_lock);
 }
 
 s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
@@ -2353,6 +2433,19 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    /* SPURS_RCS_NOLOCK=1 (aud104, default off): the store is one byte on the instance line (a single store on hardware); the readyCount
+     * mirror is never read. Taking si->lock + the registry lock made the caller (ToD's synth tick) wait for the coordinator's whole
+     * dispatch pass / a lane's bookkeeping, 10-115 ms under load. Validate lock-free, store, wake the coordinator. */
+    { static int nl = -1; if (nl < 0) { const char* e = getenv("SPURS_RCS_NOLOCK"); nl = (e && e[0] == '1'); }
+      if (nl) {
+          struct SpursInst* si2 = spurs_inst_find((u32)(uintptr_t)spurs);
+          if (si2 && si2->kernel_live && !si2->stopping && !si2->starting && s_workloads[wid].in_use && s_workloads[wid].spurs_ea == si2->ea) {
+              s_workloads[wid].readyCount = value;
+              vm_write8(si2->ea + SPURS_WKL_READY1 + wid, (u8)value);
+              WakeAllConditionVariable(&si2->wake);
+              return CELL_OK;
+          }
+      } }
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;

@@ -726,6 +726,7 @@ static inline float ld_be_f32(const float* p)
 static u32 s_dropped_nonfinite;
 
 /* AUDIO_UNDERRUN_LOG=1 counters (see the mixer loop). */
+unsigned g_audio_conceal_blocks;
 static u32 s_ur_zero_reads;   /* port blocks read still cleared, after sound was heard */
 
 /* ld_be_f32 for mixing: a non-finite sample would poison the whole mix (one
@@ -878,6 +879,7 @@ static void audio_mix_one_block(void)
                               map[b] = b == block_idx ? 'R' : (nz ? '#' : '.');
                           }
                           map[b] = 0;
+                          { LARGE_INTEGER q_, f_; QueryPerformanceCounter(&q_); QueryPerformanceFrequency(&f_); fprintf(stderr, "[audio-gap-t] qpc %.1f ms\n", q_.QuadPart * 1000.0 / f_.QuadPart); }
                           fprintf(stderr, "[audio-gap] port %d: %u block(s) (%.1f ms) not written in time, "
                                   "ending at frame %u; ring [%s] published %u\n", p, run[p],
                                   run[p] * CELL_AUDIO_BLOCK_SAMPLES * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
@@ -892,11 +894,11 @@ static void audio_mix_one_block(void)
          * (before the downmix): where the game puts its sound -- LFE is dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_CH_RMS") ? 1 : 0;
           if (on && nch <= 8) {
-              static double ss[CELL_AUDIO_PORT_MAX][8]; static float pk[CELL_AUDIO_PORT_MAX][8]; static u32 nb[CELL_AUDIO_PORT_MAX];
+              static double ss[CELL_AUDIO_PORT_MAX][8]; static float pk[CELL_AUDIO_PORT_MAX][8]; static u32 nb[CELL_AUDIO_PORT_MAX]; static u32 nfc[CELL_AUDIO_PORT_MAX][8];
               for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
                   for (u32 c = 0; c < nch; c++) {
                       const float v = ld_be_f32(&src[s * nch + c]);
-                      if (!isfinite(v)) continue;
+                      if (!isfinite(v)) { nfc[p][c]++; continue; }
                       ss[p][c] += (double)v * v;
                       if (fabsf(v) > pk[p][c]) pk[p][c] = fabsf(v);
                   }
@@ -908,6 +910,9 @@ static void audio_mix_one_block(void)
                       o += snprintf(buf + o, sizeof buf - o, " %.4f/%.3f", rr[c], (double)pk[p][c]);
                       ss[p][c] = 0; pk[p][c] = 0;
                   }
+                  { u32 nft = 0; for (u32 c = 0; c < nch; c++) nft += nfc[p][c];
+                    if (nft) { o += snprintf(buf + o, sizeof buf - o, " NONFINITE(NaN/Inf samples per ch):");
+                               for (u32 c = 0; c < nch; c++) { o += snprintf(buf + o, sizeof buf - o, " %u", nfc[p][c]); nfc[p][c] = 0; } } }
                   fprintf(stderr, "%s level %.2f%c", buf, (double)level, 10);
                   /* Self-diagnosis of the "channels 2-5 stay at zero for the whole run" state
                    * (about 1 run in 18, see RIPARTENZA 26/10 audiorace): L/R carry sound
@@ -921,6 +926,44 @@ static void audio_mix_one_block(void)
                       if (lr && !surr) badrun[p]++; else if (lr && surr) { badrun[p] = 0; goodw[p]++; }
                       fprintf(stderr, "[audio-ch-state] port %d: %s (bad windows in a row %u, good windows %u)%c", p,
                               !lr ? "QUIET" : surr ? "OK (ch2-5 live)" : "BAD (L/R live, ch2-5 zero)", badrun[p], goodw[p], 10);
+                      /* AUDIO_CH_SNAP=<file>: diagnostic (off by default). At the FIRST window where L/R are live, write a
+                       * snapshot of guest memory (the game's .data/.bss 0x850000-0x900000, the SCREAM group table, the
+                       * region NextSynth writes at 0x10738000, the SPURS instance 0x1067A000) so that a BAD run (ch2-5 zero)
+                       * can be diffed byte by byte against OK runs. Records: u32 addr, u32 len (host order), bytes. */
+                      { static int snapped = 0; const char* sn = getenv("AUDIO_CH_SNAP");
+                        if (sn && *sn && lr && !snapped) {
+                            snapped = 1;
+                            char fn[600]; snprintf(fn, sizeof fn, "%s_%s.bin", sn, surr ? "ok" : "bad");
+                            FILE* sf = fopen(fn, "wb");
+                            if (sf) {
+                                const u32 gt_pp = *(const u32*)(vm_base + 0x8A80C8);
+                                u32 gt_p = ((gt_pp >> 24) | ((gt_pp >> 8) & 0xFF00) | ((gt_pp << 8) & 0xFF0000) | (gt_pp << 24));
+                                u32 gt = 0;
+                                if (gt_p) { const u32 v = *(const u32*)(vm_base + gt_p); gt = ((v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24)); }
+                                const u32 reg[5][2] = { {0x850000u, 0xB0000u}, {gt, gt ? 64u * 0xB0u : 0u}, {0x10738000u, 0x2000u}, {0x1067A000u, 0x4000u}, {0x10679000u, 0x1000u} };
+                                for (int r = 0; r < 5; r++) { if (!reg[r][1]) continue;
+                                    /* commit every page first (a kernel read of a never-touched reserved page fails) */
+                                    for (u32 o = 0; o < reg[r][1]; o += 0x1000) { volatile u8* q = (volatile u8*)(vm_base + reg[r][0] + o); (void)*q; }
+                                    fwrite(&reg[r][0], 4, 1, sf); fwrite(&reg[r][1], 4, 1, sf);
+                                    fwrite(vm_base + reg[r][0], 1, reg[r][1], sf); }
+                                /* AUDIO_CH_SNAP_ALL=1: also every non-zero 4 KB page of main memory (0x10000-0x10010000),
+                                 * same record format, so the whole SCREAM heap can be diffed BAD vs OK. */
+                                if (getenv("AUDIO_CH_SNAP_ALL")) {
+                                    for (u32 pg = 0x10000u; pg < 0x22000000u; pg += 0x1000u) {
+                                        if (pg >= 0x10900000u && pg < 0x20000000u) { pg = 0x20000000u - 0x1000u; continue; }
+                                        MEMORY_BASIC_INFORMATION mbi;
+                                        if (!VirtualQuery(vm_base + pg, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+                                            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) continue;
+                                        const u32* q = (const u32*)(vm_base + pg); u32 z = 0;
+                                        while (z < 1024 && !q[z]) z++;
+                                        if (z == 1024) continue;
+                                        const u32 len = 0x1000u;
+                                        fwrite(&pg, 4, 1, sf); fwrite(&len, 4, 1, sf); fwrite(q, 1, len, sf);
+                                    }
+                                }
+                                fclose(sf);
+                                fprintf(stderr, "[audio-ch-snap] %s written (%s)%c", fn, surr ? "ok" : "bad", 10);
+                            } } }
                       if (badrun[p] == 3 && goodw[p] == 0)
                           fprintf(stderr, "[audio-ch-alert] port %d: channels 2-5 silent from the start of the run%c", p, 10);
                   }
@@ -966,7 +1009,29 @@ static void audio_mix_one_block(void)
             while (k3 < n3 && !w3[k3]) k3++;
             dc_empty = (k3 == n3);
         }
-        if (dc_empty) {
+        /* AUDIO_CONCEAL=<n> (default 0 = off): packet-loss concealment. An unwritten block in the middle
+         * of sound (the game's synth missed its tick under load) plays the port's last good block
+         * ping-pong (reversed, forward, reversed...: no step at the joins) faded linearly to silence
+         * over n blocks (5.3 ms each), instead of dropping to silence at once. */
+        static int s_cn = -1;
+        if (s_cn < 0) { const char* e = getenv("AUDIO_CONCEAL"); s_cn = e ? atoi(e) : 0; if (s_cn < 0) s_cn = 0; if (s_cn > 64) s_cn = 64; }
+        static float cn_blk[CELL_AUDIO_PORT_MAX][CELL_AUDIO_BLOCK_SAMPLES * 2]; static u32 cn_run[CELL_AUDIO_PORT_MAX]; static u8 cn_have[CELL_AUDIO_PORT_MAX];
+        int cn_done = 0;
+        if (dc_empty && s_cn > 0 && cn_have[p] && cn_run[p] < (u32)s_cn) {
+            const u32 k = cn_run[p]++;
+            const float gA = 1.0f - (float)k / s_cn, gB = 1.0f - (float)(k + 1) / s_cn;
+            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+                const u32 si2 = (k & 1) ? s : (CELL_AUDIO_BLOCK_SAMPLES - 1 - s);
+                const float g = (gA + (gB - gA) * (float)(s + 1) / CELL_AUDIO_BLOCK_SAMPLES) * level;
+                s_mix_buffer[s * 2 + 0] += cn_blk[p][si2 * 2 + 0] * g;
+                s_mix_buffer[s * 2 + 1] += cn_blk[p][si2 * 2 + 1] * g;
+            }
+            dc_last[p][0] = dc_last[p][1] = 0.0f;
+            dc_hole[p] = 1; cn_done = 1;
+            { extern unsigned g_audio_conceal_blocks; g_audio_conceal_blocks++; }
+        }
+        if (!dc_empty) cn_run[p] = 0;
+        if (dc_empty && !cn_done) {
             const float l0 = dc_last[p][0] * level, r0 = dc_last[p][1] * level;
             if (l0 != 0.0f || r0 != 0.0f) {
                 for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
@@ -1011,6 +1076,7 @@ static void audio_mix_one_block(void)
                 right = (right + center + rr + sr) * norm;
             }
 
+            if (s_cn > 0) { cn_blk[p][s * 2 + 0] = left; cn_blk[p][s * 2 + 1] = right; cn_have[p] = 1; }
             if (s_dc) {
                 if (s == CELL_AUDIO_BLOCK_SAMPLES - 1) { dc_last[p][0] = left; dc_last[p][1] = right; }
                 if (dc_ramp && s < 64) { const float g = (float)(s + 1) / 64.0f; left *= g; right *= g; }
@@ -1295,6 +1361,8 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         if (ur_log) {
             ULONGLONG t = GetTickCount64();
             if (t - ur_t0 >= 1000) {
+                extern uint32_t g_rsx_engine_frame; static uint32_t fr0; const uint32_t fr = g_rsx_engine_frame;
+                fprintf(stderr, "[audio-ur] fps %.1f frame %u conceal-total %u | ", (fr - fr0) * 1000.0 / (double)(t - ur_t0), (unsigned)fr, g_audio_conceal_blocks); fr0 = fr;
                 fprintf(stderr, "[audio-ur] %.1fs: underruns %u, late-mix blocks %u (max %.1f ms), "
                         "min device queue %u frames (cushion %u), guest-unwritten reads %u, blocks %u, "
                         "avg queue after submit %.1f ms + stream %.1f ms = ~%.1f ms behind the read index, trims %u, render-starved %ld, device-empty %ld%c",
