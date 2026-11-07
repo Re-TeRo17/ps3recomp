@@ -834,6 +834,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
  * persistent LS-0xA00 workload module if one is set. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
+/* rissa128: same body as spu_drain.c, inline at the call sites (936 of them in the fxvis module alone) */
+static inline void spu_img_restore_inl(spu_context* c, int32_t s) { c->image_id = c->module_img_a00 ? c->module_img_a00 : s; }
+#define spu_img_restore(c, s) spu_img_restore_inl((c), (s))
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
 /* Cooperative abort of a SPU host thread (raw SPU RunCntl=0 / restart). The

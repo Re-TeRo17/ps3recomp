@@ -64,16 +64,37 @@ static CRITICAL_SECTION s_cs;
  * Serve a capire perche' (b39_a47q B1/B2) il gioco si impianta con SPU_HLE_WID0=1: stato corrente del commit, tentativi di
  * PUTLLC falliti per motivo, comandi ripetuti (stesso descrittore due volte di fila), ultimi comandi in un anello. */
 static int s_diag;
+/* frz107: ANIM_HLE_STRESS=<n> (default OFF): random 0..n us pauses at the race-prone points of the wid0 consumer (between GETLLAR and PUTLLC in
+ * hle_commit, before the PUTF of the flag, around GETLLAR/PUTLLC of the queue line in spu_channels.c, and in the PPU stwcx on that line), to
+ * widen the windows and reproduce the rare freeze of issue #10 on a machine that does not hit it. Diagnostic only. */
+int g_anim_stress_us;
+volatile uint32_t g_anim_stress_line;            /* 128-byte queue line of the anim commands (0 until the first command) */
+void anim_stress_pause(void)
+{
+    static __declspec(thread) uint32_t t_rng;
+    if (!t_rng) t_rng = (uint32_t)(__rdtsc() | 1u) ^ (uint32_t)GetCurrentThreadId() * 2654435761u;
+    t_rng ^= t_rng << 13; t_rng ^= t_rng >> 17; t_rng ^= t_rng << 5;
+    const uint32_t us = t_rng % ((uint32_t)g_anim_stress_us + 1u);
+    if (!us) return;
+    if (us > 200u) { Sleep(0); }
+    static double s_cpu = 0;
+    if (s_cpu == 0) s_cpu = s_cyc_per_ns > 0 ? s_cyc_per_ns : 3.0;
+    const unsigned long long end = __rdtsc() + (unsigned long long)(us * 1000.0 * s_cpu);
+    while (__rdtsc() < end) _mm_pause();
+}
 static volatile long long s_st_state, s_st_t0;                 /* 0 fuori, 1 calcolo, 2 commit: linea coda, 3 commit: DMA/attesa tag */
 static volatile long long s_cm_n, s_cm_retry, s_cm_retry_max, s_cm_fail_noresv, s_cm_fail_ea, s_cm_fail_line, s_cm_spin_max;
 static volatile long long s_cm_cyc_max, s_cp_cyc_max, s_rep_same, s_rep_cnt;
-static volatile uint32_t s_last_cmd_ea, s_last_line_ea, s_last_cnt;
+static volatile uint32_t s_last_cmd_ea, s_prev_cmd_ea, s_last_line_ea, s_last_cnt;
 static spu_context* volatile s_last_ctx;
 typedef struct { uint32_t cmd_ea, cnt_ls, w1, w0, retries, flag_after, n; unsigned long long tsc; int rc; } ring_ent;
 static ring_ent s_ring[64]; static volatile long s_ring_pos;
 static uint8_t s_last_desc[32];
 static __declspec(thread) uint32_t t_retries;
 
+#define WD_DEFAULT 1   /* frz108: ANIM_HLE_WATCHDOG default (=0 turns it off) */
+void anim_hle_wd_start(void);
+static int s_drop_n;
 void anim_hle_init(void)
 {
     if (s_inited) return;
@@ -82,15 +103,21 @@ void anim_hle_init(void)
     int m = e ? atoi(e) : 1;   /* anim80: default ATTIVO (0.5); SPU_HLE_WID0=0 lo spegne */
     if (m < 0 || m > 2) m = 0;
     g_anim_hle_mode = m;
+    { const char* st = getenv("ANIM_HLE_STRESS"); g_anim_stress_us = st ? atoi(st) : 0; if (g_anim_stress_us < 0) g_anim_stress_us = 0;
+      if (g_anim_stress_us) fprintf(stderr, "[anim-hle] ANIM_HLE_STRESS=%d us (diagnostic: random pauses in the consumer)\n", g_anim_stress_us); }
     { /* perf99: percorsi veloci RZ del calcolo (f4D70 / f5160); ANIM_FAST=0 li spegne (corpo originale) */
       extern int g_f4d70_off, g_f5160_off; const char* f = getenv("ANIM_FAST"); if (f && f[0] == '0') { g_f4d70_off = 1; g_f5160_off = 1; }
       fprintf(stderr, "[anim-hle] percorsi veloci f4D70/f5160: %s\n", (f && f[0] == '0') ? "OFF" : "ON"); }
-    if (!m) return;
+    if (!m) { fprintf(stderr, "[anim-hle] SPU_HLE_WID0=0 (off)\n"); return; }
     InitializeCriticalSection(&s_cs);
     { const char* d = getenv("ANIM_HLE_DIAG"); const char* w = getenv("ANIM_HLE_WATCH"); s_diag = (d && d[0] == '1') || (w && w[0] == '1');
       if (w && w[0] == '1') { extern void anim_hle_watch_start(void); anim_hle_watch_start(); } }
     g_anim_strict = 1;
     g_anim_ea_ok = spu_hle_ea_ok;
+    { const char* dn = getenv("ANIM_HLE_DROP"); s_drop_n = dn ? atoi(dn) : 0; if (s_drop_n < 0) s_drop_n = 0;
+      if (s_drop_n) fprintf(stderr, "[anim-hle] ANIM_HLE_DROP=%d (TEST: the consumer skips every %d-th command)\n", s_drop_n, s_drop_n);
+      const char* wde = getenv("ANIM_HLE_WATCHDOG"); const int wdon = wde ? (wde[0] == '1') : WD_DEFAULT;
+      if (wdon && g_anim_hle_mode == 1) { anim_hle_wd_start(); fprintf(stderr, "[anim-hle] watchdog ON (PPU parked in 0048DA58 for >500 ms with the consumer idle: the command is completed by the watchdog)\n"); } }
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     unsigned long long t0 = __rdtsc(); LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
     do { QueryPerformanceCounter(&b); } while ((b.QuadPart - a.QuadPart) * 1000 < f.QuadPart * 20);   /* 20 ms */
@@ -165,6 +192,7 @@ static uint32_t hle_commit(spu_context* c, const anim_commit* cm)
     for (;;) {
         wr_dma(c, 0x7A00, cm->line_ea, 128, 0, 208);                           /* GETLLAR */
         if (spu_rdch(c, MFC_RdAtomicStat)._u32[0] == 0) goto backoff;
+        if (g_anim_stress_us) anim_stress_pause();                             /* frz107 stress: between GETLLAR and PUTLLC */
         {   /* halfword a linea+10: (v + 1) & 127 */
             uint32_t v = (((uint32_t)ls[0x7A0A] << 8) | ls[0x7A0B]) + 1u;
             v &= 127u; ls[0x7A0A] = (uint8_t)(v >> 8); ls[0x7A0B] = (uint8_t)v;
@@ -187,6 +215,7 @@ static uint32_t hle_commit(spu_context* c, const anim_commit* cm)
             size -= ch; lsa += ch; ea += ch;
         } while (size);
     }
+    if (g_anim_stress_us) anim_stress_pause();                                 /* frz107 stress: before the PUTF of the flag */
     wr_dma(c, 0x7A90, cm->cmd_ea + 16, 4, cm->tp, 34);                         /* PUTF */
     spu_wrch(c, MFC_WrTagMask, V32(1u << (cm->tp & 31)));
     spu_wrch(c, MFC_WrTagUpdate, V32(2));
@@ -253,6 +282,139 @@ static DWORD WINAPI watch_thread(LPVOID unused)
     return 0;
 }
 void anim_hle_watch_start(void) { HANDLE h = CreateThread(0, 0, watch_thread, 0, 0, 0); if (h) CloseHandle(h); }
+
+/* frz107: one-shot dump for the [stall] probe (main.cpp); works with or without ANIM_HLE_WATCH/DIAG. Best-effort, unlocked.
+ * Without ANIM_HLE_DIAG=1 the state/ring/retry counters stay 0 (only last ctx/cmd and the native count are always kept). */
+void anim_hle_dump_stall(void)
+{
+    __try {
+        spu_context* c = s_last_ctx;
+        const unsigned long long now = __rdtsc();
+        const double cps = s_cyc_per_ns > 0 ? s_cyc_per_ns : 3.0;
+        fprintf(stderr, "[anim-stall] mode=%d diag=%d nat=%lld last_cmd_ea=%08X ctx=%p state=%lld (%.1f ms in state) commits=%lld retry=%lld max=%lld failNoResv=%lld failEa=%lld failLine=%lld\n",
+                g_anim_hle_mode, s_diag, s_nnative, s_last_cmd_ea, (void*)c, s_st_state, s_st_state ? (now - (unsigned long long)s_st_t0) / cps / 1e6 : 0.0,
+                s_cm_n, s_cm_retry, s_cm_retry_max, s_cm_fail_noresv, s_cm_fail_ea, s_cm_fail_line);
+        if (!c || !vm_base) return;
+        const uint8_t* ls = c->ls;
+        uint32_t line_ea = LW_(ls, 0x34BA0), base = LW_(ls, 0x34BB0), cnt = LW_(ls, 0x34B90);
+        fprintf(stderr, "[anim-stall] consumer ctx: image_id=%d pc=%05X resv_valid=%d resv_ea=%08X | LS cnt34B90=%u (0x%X) base34BB0=%08X line34BA0=%08X r3=%08X r4=%08X\n",
+                c->image_id, (unsigned)(c->pc & 0x3FFFF), c->resv_valid, c->resv_ea, cnt, cnt, base, line_ea, c->gpr[3]._u32[0], c->gpr[4]._u32[0]);
+        if (line_ea && line_ea < 0xE0000000u - 128) {
+            const uint8_t* ln = vm_base + line_ea;
+            fprintf(stderr, "[anim-stall] VM line %08X: w0=%08X w1=%08X w2=%08X w3=%08X +10=%02X%02X\n", line_ea, LW_(ln, 0), LW_(ln, 4), LW_(ln, 8), LW_(ln, 12), ln[10], ln[11]);
+        }
+        if (s_diag) {
+            long pos = s_ring_pos;
+            for (int k = 12; k >= 1; k--) {
+                const ring_ent* r = &s_ring[(pos - k) & 63];
+                if (!r->cmd_ea) continue;
+                fprintf(stderr, "[anim-stall]   cmd_ea=%08X cnt=%u line.w0=%08X line.w1=%08X N=%u retries=%u rc=%d flag(after)=%08X flag(now)=%08X age=%.2fs\n", r->cmd_ea, r->cnt_ls, r->w0, r->w1, r->n, r->retries,
+                        r->rc, r->flag_after, LW_(vm_base, r->cmd_ea + 16), (now - r->tsc) / cps / 1e9);
+            }
+        } else fprintf(stderr, "[anim-stall]   (command ring empty: set ANIM_HLE_DIAG=1 to record the last 12 commands)\n");
+        if (s_last_cmd_ea && s_last_cmd_ea < 0xE0000000u - 64) {
+            const uint8_t* d = vm_base + s_last_cmd_ea;
+            fprintf(stderr, "[anim-stall] last cmd desc @%08X: %08X %08X %08X %08X | flag@+10=%08X %08X %08X %08X\n", s_last_cmd_ea, LW_(d, 0), LW_(d, 4), LW_(d, 8), LW_(d, 12), LW_(d, 16), LW_(d, 20), LW_(d, 24), LW_(d, 28));
+        }
+    } __except (1) { fprintf(stderr, "[anim-stall] fault while reading consumer state\n"); }
+    fflush(stderr);
+}
+
+
+/* ------------------------------------------------------------------ frz107: WATCHDOG (ANIM_HLE_WATCHDOG=1/0) + fault injection (ANIM_HLE_DROP=n)
+ * Safety net for the rare freeze of issue #10: the PPU parks in func_0048DA58 waiting for the completion flag (bit0) of an animation command,
+ * and the wid0 consumer never sets it. Every 100 ms a thread looks for a guest PPU thread whose lr/cia is in [0x48DA58,0x48DB58). If the same
+ * flag has been awaited for >500 ms, its bit0 is still clear, the handle on the stack still names that slot of the current generation and the
+ * consumer has completed no command for 500 ms, the watchdog does the command on its behalf: it computes it natively on a PRIVATE copy of the
+ * consumer's LS, copies the matrices to the output EA, bumps the queue-line counter (+10, mod 128) under the lock-line lock and sets the flag.
+ * At most one recovery per second; every action is logged as [anim-wd]. The cost at steady state is a thread asleep 100 ms at a time.
+ * ANIM_HLE_DROP=<n> (test only): the consumer silently skips every n-th command (it advances its own counter but never computes, writes
+ * nothing, never sets the flag) = the freeze's signature, to prove the watchdog end to end. */
+
+int ppu_find_guest_thread_in(uint32_t lo, uint32_t hi, uint32_t* tid, uint32_t* r1, uint32_t* r2, uint32_t* r31);
+void spu_lockline_lock(void); void spu_lockline_unlock(void); void spu_coh_notify_write(uint32_t ea);
+static volatile long s_drop_cnt;
+static volatile long long s_wd_rec, s_wd_det, s_wd_fail;
+static uint32_t wd_rd(uint32_t ea) { return ((uint32_t)vm_base[ea] << 24) | ((uint32_t)vm_base[ea + 1] << 16) | ((uint32_t)vm_base[ea + 2] << 8) | vm_base[ea + 3]; }
+static int wd_ok(uint32_t ea, uint32_t n) { return vm_base && !(ea & 3u) && ea >= 0x10000u && ea < 0xE0000000u - n && spu_hle_ea_ok(ea, n); }
+static void wd_recover(uint32_t cmd_ea)
+{
+    static uint8_t* priv;
+    spu_context* c = s_last_ctx;
+    if (!c) { fprintf(stderr, "[anim-wd] no consumer context yet: nothing to do\n"); return; }
+    if (!priv) priv = (uint8_t*)malloc(SPU_LS_SIZE);
+    if (!priv) return;
+    const uint32_t base_ls = LW_(c->ls, 0x34BB0), cnt = LW_(c->ls, 0x34B90);
+    memcpy(priv, c->ls, SPU_LS_SIZE);
+    memcpy(priv + 0x7A80, vm_base + cmd_ea, 32);   /* frz108: the poll's DMA of the descriptor, done here by hand (the private LS holds the previous command's) */
+    { uint32_t eb = wd_rd(cmd_ea + 4), et = wd_rd(cmd_ea + 8), eo = wd_rd(cmd_ea);
+      if (!spu_hle_ea_ok(eb, 16) || !spu_hle_ea_ok(et, 32) || !spu_hle_ea_ok(eo, 64)) { fprintf(stderr, "[anim-wd] descriptor at %08X has implausible addresses (out %08X body %08X tree %08X): only the flag is set\n", cmd_ea, eo, eb, et);
+        __atomic_fetch_or(vm_base + cmd_ea + 16 + 3, 1, __ATOMIC_SEQ_CST); INC(s_wd_fail); INC(s_wd_rec); return; } }
+    anim_commit cm; memset(&cm, 0, sizeof cm);
+    int rc = hle_compute(vm_base, cmd_ea, priv, &cm);
+    uint32_t idx = (cmd_ea - base_ls) >> 5;
+    if (rc == ANIM_OK && wd_ok(cm.ea_out, cm.n * 64u) && wd_ok(cm.line_ea, 128) && wd_ok(cmd_ea + 16, 4)) {
+        memcpy(vm_base + cm.ea_out, priv + cm.mw, cm.n * 64u);
+        spu_lockline_lock();
+        { uint8_t* ln = vm_base + cm.line_ea; uint32_t v = (((uint32_t)ln[10] << 8) | ln[11]) + 1u; v &= 127u; ln[10] = (uint8_t)(v >> 8); ln[11] = (uint8_t)v; }
+        spu_coh_notify_write(cm.line_ea);
+        spu_lockline_unlock();
+        _ReadWriteBarrier(); __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(vm_base + cmd_ea + 16, priv + 0x7A90, 4);               /* the flag word with bit0 set, as the consumer's PUTF would */
+        fprintf(stderr, "[anim-wd] RECOVERED cmd_ea=%08X idx=%u N=%u: matrices + counter + flag written by the watchdog (consumer cnt=%u base=%08X)\n", cmd_ea, idx, cm.n, cnt, base_ls);
+    } else {
+        __atomic_fetch_or(vm_base + cmd_ea + 16 + 3, 1, __ATOMIC_SEQ_CST);   /* big-endian word: bit0 = low bit of the last byte */
+        fprintf(stderr, "[anim-wd] compute rc=%d (not natively coverable): only the flag was set for cmd_ea=%08X idx=%u (consumer cnt=%u base=%08X)\n", rc, cmd_ea, idx, cnt, base_ls);
+        INC(s_wd_fail);
+    }
+    /* the consumer's own counter: if it still waits for exactly this slot, move it on so that it does not run the command a second time */
+    if (cnt == idx && idx < 1024u) {
+        u128 q = spu_ls_rd(c->ls, 0x34B90); for (int k = 0; k < 4; k++) q._u32[k] += 1; spu_ls_wr(c->ls, 0x34B90, q);
+        fprintf(stderr, "[anim-wd] consumer cnt %u -> %u (it was waiting for this slot)\n", cnt, cnt + 1);
+    }
+    INC(s_wd_rec);
+}
+static DWORD WINAPI wd_thread(LPVOID unused)
+{
+    (void)unused;
+    LARGE_INTEGER fq, t0; QueryPerformanceFrequency(&fq);
+    uint32_t last_tid = 0, last_flag = 0; long long since = 0, last_nat = -1, last_rec = 0, nat_move_t = 0;
+    /* ANIM_HLE_WD_FAST=<ms> (default 0 = off, legacy 500 ms / 1 s gap): idle threshold in ms (min 100) and NO gap between recoveries, so a
+     * starved consumer (wid 0 kept off lane 0, 07/11 Sargasso: 4 commands x ~0.9 s = 3.6 s freeze) costs ~threshold + 100 ms per command. */
+    long long wd_ms = 500, wd_gap = 1000;
+    { const char* f = getenv("ANIM_HLE_WD_FAST"); int v = f ? atoi(f) : 0;
+      if (v > 0) { wd_ms = v < 100 ? 100 : v; wd_gap = 0; fprintf(stderr, "[anim-hle] ANIM_HLE_WD_FAST: watchdog threshold %lld ms, no gap between recoveries\n", wd_ms); } }
+    for (;;) {
+        Sleep(100);
+        QueryPerformanceCounter(&t0);
+        const long long now_ms = t0.QuadPart * 1000 / fq.QuadPart;
+        const long long nat = s_nnative;
+        if (nat != last_nat) { last_nat = nat; nat_move_t = now_ms; }
+        uint32_t tid, r1, r2, r31;
+        if (!ppu_find_guest_thread_in(0x48DA58, 0x48DB58, &tid, &r1, &r2, &r31)) { last_flag = 0; continue; }
+        if (tid != last_tid || r31 != last_flag) { last_tid = tid; last_flag = r31; since = now_ms; continue; }
+        const long long stuck = now_ms - since;
+        if (stuck < wd_ms || now_ms - nat_move_t < wd_ms || (last_rec && now_ms - last_rec < wd_gap)) continue;
+        if (!wd_ok(r31, 4)) continue;
+        uint32_t flag = wd_rd(r31);
+        if (flag & 1u) continue;
+        uint32_t base = wd_ok(r2 + 0x6B68u, 4) ? wd_rd(r2 + 0x6B68u) : 0;   /* informative only */
+        uint32_t gen = wd_ok(base + 0x210u, 4) ? wd_rd(base + 0x210u) : 0, put = wd_ok(base + 0x214u, 4) ? wd_rd(base + 0x214u) : 0;
+        uint32_t h = wd_ok(r1 + 0x90u + 0x1C0u, 4) ? wd_rd(r1 + 0x90u + 0x1C0u) : 0;
+        const uint32_t slot = base + 0x230u + ((h & 0x3FFu) << 5);
+        INC(s_wd_det);
+        fprintf(stderr, "[anim-wd] guest tid %u waits %lld ms on flag@%08X (word %08X); handle %08X gen %u (current %u) idx %u put %u; consumer idle %lld ms; detections %lld recoveries %lld\n",
+                tid, (long long)stuck, r31, flag, h, h >> 10, gen, h & 0x3FFu, put, (long long)(now_ms - nat_move_t), s_wd_det, s_wd_rec);
+        (void)slot;   /* frz108: the handle read from the stack is only informative (the sp captured is that of a callee frame); the awaited slot is identified by the flag ADDRESS (r31) */
+        { /* ring base as the consumer sees it (LS 0x34BB0 = first command slot; the PPU-side base from the stack/TOC is not reliable here) */
+          spu_context* cc = s_last_ctx; const uint32_t ring = cc ? LW_(cc->ls, 0x34BB0) : 0, cea = r31 - 0x10u;
+          if (!cc || r31 < ring + 0x10u || ((cea - ring) & 31u) || ((cea - ring) >> 5) >= 0x3FFu) { fprintf(stderr, "[anim-wd] flag address %08X is not a slot of the command ring (ring %08X): not touching anything\n", r31, ring); last_rec = now_ms; continue; } }
+        wd_recover(r31 - 0x10u);
+        last_rec = now_ms;
+    }
+    return 0;
+}
+void anim_hle_wd_start(void) { HANDLE h = CreateThread(0, 0, wd_thread, 0, 0, 0); if (h) CloseHandle(h); }
 
 /* ------------------------------------------------------------------ doppia modalita' */
 static uint8_t s_lsc[0x40000];
@@ -388,16 +550,24 @@ int anim_hle_run(struct spu_context* ctx, void (*self)(struct spu_context*))
     int why;
     if (r3 != 0x7A80) { INC(s_cnt[R_R3]); return 0; }
     if ((why = hle_gate(c)) != R_OK) { INC(s_cnt[why]); goto report; }
+    if (s_drop_n && g_anim_hle_mode == 1 && (__atomic_add_fetch(&s_drop_cnt, 1, __ATOMIC_RELAXED) % s_drop_n) == 0) {   /* TEST fault injection */
+        u128 q = spu_ls_rd(c->ls, 0x34B90); for (int k = 0; k < 4; k++) q._u32[k] += 1; spu_ls_wr(c->ls, 0x34B90, q);
+        s_last_ctx = c; s_last_cmd_ea = cmd_ea;
+        fprintf(stderr, "[anim-hle] DROP: command cmd_ea=%08X skipped (counter advanced, flag NOT set)\n", cmd_ea);
+        hle_return(c, 0); return 1;
+    }
     if (g_anim_hle_mode == 2) { int r = hle_dual(c, self, cmd_ea); if (!((++s_report_tick) & 8191)) hle_report(); return r; }
     {
         anim_commit cm;
         const unsigned long long t0 = __rdtsc();
         uint32_t d_cnt = 0, d_w0 = 0, d_w1 = 0;
+        if (g_anim_stress_us) g_anim_stress_line = LW_(c->ls, 0x34BA0) & ~127u;
+        s_last_ctx = c; s_last_cmd_ea = cmd_ea;            /* frz107: two plain stores, so the [stall] dump finds the consumer without ANIM_HLE_DIAG */
         if (s_diag) {
-            s_last_ctx = c; s_st_state = 1; s_st_t0 = t0;
+            s_st_state = 1; s_st_t0 = t0;
             d_cnt = LW_(c->ls, 0x34B90); d_w0 = LW_(c->ls, 0x7A00); d_w1 = LW_(c->ls, 0x7A04);
-            if (cmd_ea == s_last_cmd_ea) { INC(s_rep_cnt); if (memcmp(s_last_desc, c->ls + 0x7A80, 32) == 0) INC(s_rep_same); }
-            s_last_cmd_ea = cmd_ea; memcpy(s_last_desc, c->ls + 0x7A80, 32);
+            if (cmd_ea == s_prev_cmd_ea) { INC(s_rep_cnt); if (memcmp(s_last_desc, c->ls + 0x7A80, 32) == 0) INC(s_rep_same); }
+            s_prev_cmd_ea = cmd_ea; memcpy(s_last_desc, c->ls + 0x7A80, 32);
         }
         g_anim_note_cb = t_note_ctx ? note_cb : 0;     /* NB: globale, ma scritta solo con il gate gia' passato; vedi sotto */
         int rc = hle_compute(vm_base, cmd_ea, c->ls, &cm);

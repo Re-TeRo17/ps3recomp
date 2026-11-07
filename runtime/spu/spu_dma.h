@@ -727,6 +727,8 @@ static inline int mfc_do_transfer_slow(spu_context* spu, uint32_t lsa, uint64_t 
             extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            { extern void (*g_spu_ring_preput)(uint32_t, const uint8_t*, uint32_t);
+              if (g_spu_ring_preput) g_spu_ring_preput((uint32_t)ea, (const uint8_t*)ls_ptr, size); }
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             int span_reserved = 0;
@@ -922,6 +924,8 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
     else        __atomic_thread_fence(__ATOMIC_RELEASE);   /* PUT*  */
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea;
+    if (is_put) { extern void (*g_spu_ring_preput)(uint32_t, const uint8_t*, uint32_t);   /* rissa127: SPU_COLL_RING=2 compare */
+                  if (__builtin_expect(g_spu_ring_preput != 0, 0)) g_spu_ring_preput((uint32_t)ea, (const uint8_t*)ls_ptr, size); }
     if (mfc_stats_on()) {   /* instrumented run: time the transfer through the plain (non-FAST2) body */
         { extern int g_cri_video_dma; if (is_get && size > 0x100 && spu->image_id == spu_cri_image()) g_cri_video_dma = 1; }
         uint64_t t0 = __rdtsc();

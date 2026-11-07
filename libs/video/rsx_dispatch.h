@@ -129,6 +129,8 @@ struct rsx_dispatch {
     u32 vp_gen;                       /* bumped on every vp[] write         */
     u32 canvas_mark_at;               /* where g_rsx_canvas_mark sits in constants[]:
                                          slot * 4 + component + 1; 0 nowhere */
+    unsigned long long reg_dirty[RSX_DSP_NUM_REGS / 16 / 64];   /* walk108 (RSX_WALK_SNAP2): bit g = some register of regs[g*16 .. g*16+15] may have been written
+                                         since the snapshot last scanned that group; set by every store path, cleared by snap_fill_into */
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
@@ -168,6 +170,9 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be);
 int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be);   /* RSX_FIFO_FAST */
 u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, const u8* be);   /* RSX_FIFO_RUN */
+int rsx_dispatch_direct_ok(void);   /* RSX_DISP_DIRECT (walk109) */
+int rsx_dispatch_direct_run(u32 method, u32 count, int incr, const u8* be);
+void rsx_dsp_wc_pass_end(unsigned frame);   /* walk107: [walkprof4] word-class counters (RSX_WALK_PROF=1), called once per FIFO pass */
 
 /* ---- decoded state getters -------------------------------------------- */
 
@@ -325,6 +330,15 @@ u32 rsx_dsp_restart_index(const rsx_dispatch* rsx);
  * what a disabled vertex attribute reads as. Falls back to (0,0,0,1) when
  * the register block was never written. */
 void rsx_dsp_vertex_default(const rsx_dispatch* rsx, u32 index, float out[4]);
+
+/* walk108: mark regs[idx .. idx+n-1] as written (see reg_dirty). Over-marking is harmless (the snapshot compares values). */
+static inline void rsx_dsp_dirty_range(rsx_dispatch* rsx, u32 idx, u32 n)
+{
+    if (!n || idx >= RSX_DSP_NUM_REGS) return;
+    u32 g = idx >> 4, ge = (idx + n - 1u) >> 4;
+    if (ge >= RSX_DSP_NUM_REGS / 16u) ge = RSX_DSP_NUM_REGS / 16u - 1u;
+    for (; g <= ge; g++) rsx->reg_dirty[g >> 6] |= 1ull << (g & 63u);
+}
 
 #ifdef __cplusplus
 }

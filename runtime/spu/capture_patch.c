@@ -299,13 +299,9 @@ void anim_cap_init(void)
     g_anim_cap_on = 1;
     fprintf(stderr, "[anim-cap] cattura wid0 0x6248 -> %s (max %u comandi)\n", path, s_max);
 }
-#if defined(__clang__) || defined(__GNUC__)
-__attribute__((constructor)) static void anim_cap_ctor(void) { anim_cap_init(); }
-#else
-static int anim_cap_ctor2(void) { anim_cap_init(); return 0; }
-#pragma section(".CRT$XCU", read)
-__declspec(allocate(".CRT$XCU")) static int (*p_anim_cap_ctor)(void) = anim_cap_ctor2;
-#endif
+/* frz107: no static constructor any more. It ran before main(), i.e. before tod_settings_load() put tod.ini's keys in the environment,
+ * so SPU_HLE_WID0 / ANIM_HLE_WATCH / ANIM_HLE_DIAG / ANIM_FAST / ANIM_CAPTURE from tod.ini were never seen. main() now calls anim_cap_init()
+ * explicitly right after tod_settings_load(). */
 
 int anim_cap_run(struct spu_context* ctx, void (*self)(struct spu_context*))
 {

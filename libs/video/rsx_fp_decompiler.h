@@ -64,6 +64,7 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  *          control word is available (standalone tests) to fall back to the
  *          legacy "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+int rsx_fp_ssr_off_clean(void);   /* pso112: RSX_SSR_OFF_CLEAN=1: ssr_cfg==0 means NO ssr path (default 0 = old behaviour) */
 unsigned long long rsx_fp_codegen_salt(void);   /* integ113: 0 by default; non-zero when a run-time toggle changes the generated HLSL (cache id salt) */
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 

@@ -545,7 +545,12 @@ void rsx_fp_set_saturate_alpha(int on) { s_sat_alpha = on ? 1 : 0; }
 static int fp_safe_rcp(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_FP_SAFE_RCP"); v = (e && e[0] == '0') ? 0 : 1; } return v; }
 /* integ113: the PSO/manifest cache ids are RSX_CODEGEN_ID (hash of the decompiler SOURCES) and do not see run-time HLSL toggles:
  * fold the toggle in (0 for the default = the plain codegen id, so default-ON caches are unchanged). */
-unsigned long long rsx_fp_codegen_salt(void) { return fp_safe_rcp() ? 0ull : 0x5afe0cb0f0f0ull; }
+/* pso112: RSX_SSR_OFF_CLEAN=1 (default OFF). With RSX_SSR off the engine used to call rsx_fp_set_ssr(0,0) (ssr_cfg==0 decodes to
+ * units 0/0, which the decompiler reads as "SSR on"), so every program with a cube map and a TXL got the screen-space-reflection
+ * prelude and rsx_envL wired to texture unit 0 even with the feature off. =1 passes (-1,-1) there: the plain cube sample.
+ * It changes the HLSL text, so it is folded into the cache id salt (and MAN_KEYREV) only while active. */
+int rsx_fp_ssr_off_clean(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_SSR_OFF_CLEAN"); v = (e && e[0] == '1') ? 1 : 0; } return v; }
+unsigned long long rsx_fp_codegen_salt(void) { return (fp_safe_rcp() ? 0ull : 0x5afe0cb0f0f0ull) ^ (rsx_fp_ssr_off_clean() ? 0x55c1ea50ull : 0ull); }
 
 /* Per-unit texel conversions for the next decompile; see
  * rsx_fp_set_texel_ops in the header. */

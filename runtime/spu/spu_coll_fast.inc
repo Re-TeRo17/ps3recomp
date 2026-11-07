@@ -60,17 +60,18 @@ static inline __attribute__((always_inline)) u128 cf_csflt_orig(u128 a, int i8) 
 static inline __attribute__((always_inline)) u128 cf_cuflt_orig(u128 a, int i8) { return spu_cuflt(a, i8); }
 static inline __attribute__((always_inline)) u128 cf_csflt(u128 a, int i8)
 {
-    if (!(i8 >= 29 && i8 <= 120)) return cf_csflt_orig(a, i8);
+    if (!(i8 >= 29 && i8 <= 250)) return cf_csflt_orig(a, i8);    /* rissa128: scale 129/145/147/155 del motore; test_cvt: 2,9G confronti, 0 differenze */
     const __m128 k = _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(127 - 155 + i8) << 23)));
     return cf_st(_mm_castps_si128(_mm_mul_ps(_mm_cvtepi32_ps(cf_ld(a)), k)));
 }
 static inline __attribute__((always_inline)) u128 cf_cuflt(u128 a, int i8)
 {
-    if (!(i8 >= 29 && i8 <= 120)) return cf_cuflt_orig(a, i8);
-    const __m128i v = cf_ld(a);
-    if (__builtin_expect(_mm_movemask_ps(_mm_castsi128_ps(v)) != 0, 0)) return cf_cuflt_orig(a, i8);
-    const __m128 k = _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(127 - 155 + i8) << 23)));
-    return cf_st(_mm_castps_si128(_mm_mul_ps(_mm_cvtepi32_ps(v), k)));
+    if (!(i8 >= 29 && i8 <= 249)) return cf_cuflt_orig(a, i8);
+    /* rissa128: anche col bit 31: RZ(v) = 2 * RZ(v >> 1), il fattore 2 entra nella scala */
+    const __m128i v = cf_ld(a), hi = _mm_srli_epi32(v, 31);
+    const __m128 f = _mm_cvtepi32_ps(_mm_srlv_epi32(v, hi));
+    const __m128i sc = _mm_add_epi32(_mm_set1_epi32((int)((uint32_t)(127 - 155 + i8) << 23)), _mm_slli_epi32(hi, 23));
+    return cf_st(_mm_castps_si128(_mm_mul_ps(f, _mm_castsi128_ps(sc))));
 }
 #undef spu_csflt
 #undef spu_cuflt

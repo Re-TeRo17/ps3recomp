@@ -45,6 +45,9 @@ void     vm_watch_touch(uint32_t ea, uint32_t len);
  * 1 when it was a watched page (now writable, marked written). */
 int      vm_watch_fault(uintptr_t addr, int is_write);
 void     vm_watch_stats(uint64_t* faults, uint64_t* pages_protected);
+/* logv2: the watch's work since the last call (then zeroed): faults handled, ms spent in vm_watch_fault (the exception dispatch itself is not
+ * included), VirtualProtect/mprotect calls made. Meant for one caller (the present, once per frame). */
+void     rsx_texwatch_v2_frame(unsigned* faults, double* ms, unsigned* protects);
 /* metro131: one write counter per 1 MB chunk of the guest space (4096 of them), bumped whenever a page of the chunk is written (fault or
  * vm_watch_touch). NULL where there is none. An entry that was validated with every page watched and finds the counters of the chunks it
  * lies in unchanged has not been written since: no page walk needed. */

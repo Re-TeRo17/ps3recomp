@@ -1205,26 +1205,52 @@ extern "C" void ppu_report_guest_lrs(void)
  * return addresses (frames of leaf lifted functions that never saved lr are
  * simply absent). Best-effort, unlocked, diagnostics only. */
 static bool ppu_dump_readable(uint32_t ea, uint32_t n);
+/* frz107: optional per-thread extra dump (the game's main sets it; only called from the stall dump). */
+extern "C" void (*g_ppu_chain_hook)(unsigned tid, const uint64_t* gpr, uint64_t lr, uint64_t ctr, uint32_t cia) = nullptr;
 extern "C" void ppu_report_guest_chains(int depth)
 {
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
-        char buf[512]; int p = snprintf(buf, sizeof buf, "[CHAIN] tid %-3u cia=%08X lr=%08X sp=%08X r2=%08X r3=%08X chain:",
-                                        (unsigned)c->thread_id, (uint32_t)c->cia, (uint32_t)c->lr, (uint32_t)c->gpr[1],
-                                        (uint32_t)c->gpr[2], (uint32_t)c->gpr[3]);
+        char buf[768]; int p = snprintf(buf, sizeof buf, "[CHAIN] tid %-3u cia=%08X lr=%08X ctr=%08X sp=%08X r2=%08X r3=%08X r4=%08X r5=%08X r6=%08X r29=%08X r30=%08X r31=%08X chain:",
+                                        (unsigned)c->thread_id, (uint32_t)c->cia, (uint32_t)c->lr, (uint32_t)c->ctr, (uint32_t)c->gpr[1],
+                                        (uint32_t)c->gpr[2], (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5], (uint32_t)c->gpr[6],
+                                        (uint32_t)c->gpr[29], (uint32_t)c->gpr[30], (uint32_t)c->gpr[31]);
         uint32_t sp = (uint32_t)c->gpr[1];
-        for (int d = 0; d < depth && p < (int)sizeof buf - 12 && sp && ppu_dump_readable(sp, 4); d++) {
-            uint32_t bc; memcpy(&bc, vm_base + sp, 4); bc = __builtin_bswap32(bc);
-            if (!bc || bc <= sp || !ppu_dump_readable(bc + 16, 4)) break;
-            uint32_t l; memcpy(&l, vm_base + bc + 16, 4); l = __builtin_bswap32(l);
-            p += snprintf(buf + p, sizeof buf - p, " %08X", l);
+        const uint32_t sp0 = sp; int nchain = 0;
+        /* frz107 fix: the PS3 back chain / saved lr are 64-bit BIG-endian slots; the pointer is the LOW word (+4, lr at +0x14).
+         * The old code read the high word (+0, always 0) and so the chain was always empty. */
+        for (int d = 0; d < depth && p < (int)sizeof buf - 12 && sp && ppu_dump_readable(sp, 8); d++) {
+            uint32_t bc; memcpy(&bc, vm_base + sp + 4, 4); bc = __builtin_bswap32(bc);
+            if (!bc || bc <= sp || !ppu_dump_readable(bc + 0x14, 4)) break;
+            uint32_t l; memcpy(&l, vm_base + bc + 0x14, 4); l = __builtin_bswap32(l);
+            p += snprintf(buf + p, sizeof buf - p, " %08X", l); nchain++;
             sp = bc;
         }
+        if (!nchain && sp0 && ppu_dump_readable(sp0, 32)) {   /* fallback: raw guest stack words at sp */
+            p += snprintf(buf + p, sizeof buf - p, " (empty) stk@sp:");
+            for (int k = 0; k < 8; k++) { uint32_t w; memcpy(&w, vm_base + sp0 + k * 4, 4); p += snprintf(buf + p, sizeof buf - p, " %08X", __builtin_bswap32(w)); }
+        }
         fprintf(stderr, "%s\n", buf);
+        if (g_ppu_chain_hook) g_ppu_chain_hook((unsigned)c->thread_id, c->gpr, c->lr, c->ctr, (uint32_t)c->cia);
     }
     fflush(stderr);
+}
+/* frz107: the first guest PPU thread whose lr or cia lies in [lo,hi) (anim_hle.c watchdog). Unlocked, best effort. */
+extern "C" int ppu_find_guest_thread_in(uint32_t lo, uint32_t hi, uint32_t* tid, uint32_t* r1, uint32_t* r2, uint32_t* r31)
+{
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        const uint32_t lr = (uint32_t)c->lr, cia = (uint32_t)c->cia;
+        if ((lr >= lo && lr < hi) || (cia >= lo && cia < hi)) {
+            *tid = (uint32_t)c->thread_id; *r1 = (uint32_t)c->gpr[1]; *r2 = (uint32_t)c->gpr[2]; *r31 = (uint32_t)c->gpr[31];
+            return 1;
+        }
+    }
+    return 0;
 }
 /* Break every reservation on ea's word (real-PPC granule semantics on a store).
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
@@ -1308,6 +1334,7 @@ extern "C" uint32_t g_ww_dyn;
  * which spares every indirect call a thread-local store of g_active_ctx --
  * a call on macOS, ~3% of the game thread. The plain forms are for callers
  * without one. */
+extern "C" int g_anim_stress_us; extern "C" volatile uint32_t g_anim_stress_line; extern "C" void anim_stress_pause(void);   /* frz107: anim_hle.c */
 extern "C" int ppu_stwcx32_ctx(ppu_context* self, uint64_t ea, uint32_t expected, uint32_t val);
 extern "C" int ppu_stdcx64_ctx(ppu_context* self, uint64_t ea, uint64_t expected, uint64_t val);
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
@@ -1334,6 +1361,8 @@ extern "C" int ppu_stwcx32_ctx(ppu_context* self, uint64_t ea, uint32_t expected
      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
      * reverse), and the reserving SPU gets its lost-reservation event. */
     int coh = spu_coh_is_reserved((uint32_t)ea);
+    {   /* frz107 ANIM_HLE_STRESS */
+      if (g_anim_stress_us && ((uint32_t)ea & ~127u) == g_anim_stress_line) anim_stress_pause(); }
     /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
      * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
      * PPU hammering the same 128-byte line is one of only two agents that can

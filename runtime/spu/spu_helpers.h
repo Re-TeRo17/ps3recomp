@@ -578,6 +578,28 @@ static inline uint32_t spu__fma_lane(uint32_t x, uint32_t y, uint32_t z, uint32_
     if (!nz) return spu__sf_pack(sp, p, ex + ey);
     return spu__sf_sum(sp, p, ex + ey, sz, mz, ez);
 }
+/* rissa128: redo of a host (MXCSR RZ|DAZ|FTZ) float result, ONLY in the lanes that left the range where the host result is
+ * the SPU result (|r| >= 0x7F7FFFFF: an exponent-255 operand or an overflow); every other lane keeps the host result with
+ * -0 made +0. The redo lanes use the integer-exact reference above, so no MXCSR change is needed (the old redo switched
+ * MXCSR twice and recomputed all 4 lanes: fxvis wid9 does rsqrt Newton steps on xyzw vectors whose w lane holds
+ * extended-range garbage, ~33M redos a run). op: 0 fa, 1 fs, 2 fm, 3 fma, 4 fms, 5 fnms. tests/spu_rz_lanes_test.c. */
+static inline __attribute__((noinline)) u128 spu__rz_redo_lanes(int op, u128 a, u128 b, u128 c, u128 h) {
+    u128 r;
+    for (int i = 0; i < 4; i++) {
+        const uint32_t v = h._u32[i], t = v & 0x7FFFFFFFu;
+        if (t <= 0x7F7FFFFEu) { r._u32[i] = t ? v : 0u; continue; }
+        const uint32_t x = a._u32[i], y = b._u32[i], z = c._u32[i];
+        switch (op) {
+        case 0:  r._u32[i] = spu__fa_lane(x, y); break;
+        case 1:  r._u32[i] = spu__fa_lane(x, y ^ 0x80000000u); break;
+        case 2:  r._u32[i] = spu__fm_lane(x, y); break;
+        case 3:  r._u32[i] = spu__fma_lane(x, y, z, 0, 0); break;
+        case 4:  r._u32[i] = spu__fma_lane(x, y, z, 0, 0x80000000u); break;
+        default: r._u32[i] = spu__fma_lane(x, y, z, 0x80000000u, 0); break;
+        }
+    }
+    return r;
+}
 /* Fast path, exact by construction, for the common case where every operand is an ordinary
  * normal single (biased exponent 1..254): the value is formed in double precision and truncated
  * by masking the 29 low significand bits, which is truncation toward zero of the magnitude.
@@ -1151,8 +1173,10 @@ static inline __attribute__((always_inline)) __m128 spu__rz_ld(u128 a) { return 
 static inline __attribute__((always_inline)) u128 spu__rz_fin(__m128 rf, int op, u128 a, u128 b, u128 c) {
     __m128i r = _mm_castps_si128(rf);
     const __m128i t = _mm_and_si128(r, _mm_set1_epi32(0x7FFFFFFF));
-    if (__builtin_expect(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(t, _mm_set1_epi32(0x7F7FFFFE)))) != 0, 0))
-        return spu__rz_exact(op, a, b, c, 1);
+    if (__builtin_expect(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(t, _mm_set1_epi32(0x7F7FFFFE)))) != 0, 0)) {
+        u128 h; _mm_storeu_si128((__m128i*)h._u32, r);
+        return spu__rz_redo_lanes(op, a, b, c, h);          /* rissa128: only the out-of-range lanes, no MXCSR switch */
+    }
     r = _mm_andnot_si128(_mm_cmpeq_epi32(t, _mm_setzero_si128()), r);      /* -0 -> +0 */
     u128 v; _mm_storeu_si128((__m128i*)v._u32, r); return v;
 }
@@ -1171,10 +1195,36 @@ static inline int64_t spu__sf_key(uint32_t x) {
     return (x & 0x80000000u) ? -m : m;
 }
 static inline int64_t spu__sf_mag(uint32_t x) { return (x & 0x7F800000u) ? (int64_t)(x & 0x7FFFFFFFu) : 0; }
-SPU__SF_V2(spu_fceq,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcgt,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmeq, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmgt, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fceq_ref,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcgt_ref,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmeq_ref, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmgt_ref, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+#if defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+#include <immintrin.h>
+/* rissa128: the same keys 4 lanes at once (the *_ref forms above are the reference; spu_fc_vec_test.c compares them).
+ * mag = x & 7FFFFFFF, 0 when the biased exponent is 0 (SPU: no denormals); key = sign ? -mag : mag -- fits in int32,
+ * so the signed 32-bit compare orders keys exactly like the int64 scalar keys. */
+static inline __attribute__((always_inline)) __m128i spu__fc_mag(__m128i x) {
+    const __m128i m  = _mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i ez = _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    return _mm_andnot_si128(ez, m);
+}
+static inline __attribute__((always_inline)) __m128i spu__fc_key(__m128i x) {
+    const __m128i s = _mm_srai_epi32(x, 31);
+    return _mm_sub_epi32(_mm_xor_si128(spu__fc_mag(x), s), s);
+}
+#define SPU__FC_VEC(name, kf, cmp) static inline u128 name(u128 a, u128 b) { __m128i x, y; memcpy(&x, &a, 16); memcpy(&y, &b, 16);     const __m128i r = cmp(kf(x), kf(y)); u128 o; memcpy(&o, &r, 16); return o; }
+SPU__FC_VEC(spu_fceq,  spu__fc_key, _mm_cmpeq_epi32)
+SPU__FC_VEC(spu_fcgt,  spu__fc_key, _mm_cmpgt_epi32)
+SPU__FC_VEC(spu_fcmeq, spu__fc_mag, _mm_cmpeq_epi32)
+SPU__FC_VEC(spu_fcmgt, spu__fc_mag, _mm_cmpgt_epi32)
+#undef SPU__FC_VEC
+#else
+#define spu_fceq  spu_fceq_ref
+#define spu_fcgt  spu_fcgt_ref
+#define spu_fcmeq spu_fcmeq_ref
+#define spu_fcmgt spu_fcmgt_ref
+#endif
 #undef SPU__SF_V2
 #undef SPU__SF_V3
 
@@ -1230,10 +1280,37 @@ static inline u128 spu_cfltu(u128 a, int i8) { return spu__cfl_vec(a, i8, 1); }
 static inline u128 spu_cflts(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
 static inline u128 spu_cfltu(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
 #endif
-static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
+static inline u128 spu_csflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
     r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
-static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
+static inline u128 spu_cuflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
     r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
+#if defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS)
+/* rissa128: fast path when every lane is exact in a float (|v| < 2^24) and v * 2^-(155-i8) stays normal (scale 0..126):
+ * the conversion and the power-of-two multiply are then exact under any rounding mode, so they equal the truncated
+ * reference bit for bit (zero -> +0 both ways). Anything else takes the reference. spu_fc_vec_test.c compares them. */
+static inline u128 spu_cuflt(u128 a, int i8) {
+    const int k = 155 - (i8 & 0xFF);
+    __m128i x; memcpy(&x, &a, 16);
+    if (__builtin_expect(k >= 0 && k <= 126 && _mm_testz_si128(x, _mm_set1_epi32((int)0xFF000000u)), 1)) {
+        const __m128 f = _mm_mul_ps(_mm_cvtepi32_ps(x), _mm_castsi128_ps(_mm_set1_epi32((127 - k) << 23)));
+        u128 o; memcpy(&o, &f, 16); return o;
+    }
+    return spu_cuflt_ref(a, i8);
+}
+static inline u128 spu_csflt(u128 a, int i8) {
+    const int k = 155 - (i8 & 0xFF);
+    __m128i x; memcpy(&x, &a, 16);
+    const __m128i ax = _mm_abs_epi32(x);    /* INT_MIN stays negative -> fails the test below */
+    if (__builtin_expect(k >= 0 && k <= 126 && _mm_testz_si128(ax, _mm_set1_epi32((int)0xFF000000u)), 1)) {
+        const __m128 f = _mm_mul_ps(_mm_cvtepi32_ps(x), _mm_castsi128_ps(_mm_set1_epi32((127 - k) << 23)));
+        u128 o; memcpy(&o, &f, 16); return o;
+    }
+    return spu_csflt_ref(a, i8);
+}
+#else
+#define spu_cuflt spu_cuflt_ref
+#define spu_csflt spu_csflt_ref
+#endif
 
 /* fi -- Floating Interpolate (SPU ISA v1.2, p. 219; frest/frsqest output
  * format p. 215; single-precision rules section 9.1).

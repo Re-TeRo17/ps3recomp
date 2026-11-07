@@ -60,6 +60,7 @@ extern SPU_THREAD_LOCAL int g_spu_rz;
 
 static __thread L2* t_s;           /* driver del thread */
 static __thread L2* t_s_cur;       /* per la lettura memoria */
+static __thread const uint8_t* t_rr_ov; static __thread uint32_t t_rr_ea, t_rr_n;   /* rissa128: overlay del record salvato (riesecuzione diagnostica) */
 static int s_mode = -1;
 static unsigned s_waitms = 50;
 
@@ -82,10 +83,32 @@ static int sync_page_ok(uint32_t ea, uint32_t n)
     for (int i = 0; i < (pg[0] == pg[1] ? 1 : 2); i++)
         if (!((g_vm_page_bitmap[pg[i] >> 3] >> (pg[i] & 7)) & 1)) { ok = 0; break; }
     if (ok) return 1;
+    /* rissa128: cache delle pagine da 64 KB gia' viste committate da VirtualQuery. Prima ogni GET fuori dal bitmap del vm faceva una
+     * VirtualQuery (chiamata al kernel, lock dello spazio di indirizzi): ~18 GET/ticket, e due thread col motore nativo insieme
+     * (main + raw 110) si contendevano il lock -> motore 5x piu' lento (sync 10+8 us -> 37+72 us; anello 141 us/ticket).
+     * La memoria guest non si decommitta mai (vm.h: solo MEM_RELEASE di tutto all'uscita), quindi un "si'" resta valido. */
+    static volatile uint8_t s_pg_ok[65536 / 8];
+    static int s_pgc = -1;    /* SPU_PG_CACHE=1, o acceso da SPU_COLL_RING=3 (che ne ha bisogno); spento di default come ogni ottimizzazione nuova */
+    if (s_pgc < 0) { const char* e = getenv("SPU_PG_CACHE"); const char* r = getenv("SPU_COLL_RING"); s_pgc = (e && e[0] == '1') || (r && r[0] == '3'); }
+    if (s_pgc) {
+        int hit = 1;
+        for (int i = 0; i < (pg[0] == pg[1] ? 1 : 2); i++)
+            if (!((s_pg_ok[pg[i] >> 3] >> (pg[i] & 7)) & 1)) { hit = 0; break; }
+        if (hit) return 1;
+    }
+    /* regioni committate piu' piccole di 64 KB: ultime 8 regioni viste, per thread */
+    static __thread uint64_t t_rg_lo[8], t_rg_hi[8]; static __thread unsigned t_rg_i;
+    if (s_pgc) for (int i = 0; i < 8; i++) if ((uint64_t)ea >= t_rg_lo[i] && (uint64_t)ea + n <= t_rg_hi[i]) return 1;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQuery(vm_base + ea, &mbi, sizeof mbi) == 0) return 0;
     if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    {
+        const uintptr_t rb = (uintptr_t)mbi.BaseAddress - (uintptr_t)vm_base, re = rb + mbi.RegionSize;
+        t_rg_lo[t_rg_i & 7] = rb; t_rg_hi[t_rg_i & 7] = re; t_rg_i++;
+        for (uintptr_t p = (rb + 0xFFFFu) >> 16; ((p + 1) << 16) <= re && p < 65536u; p++)
+            __atomic_fetch_or(&s_pg_ok[p >> 3], (uint8_t)(1u << (p & 7)), __ATOMIC_RELAXED);
+    }
     return ((uint8_t*)mbi.BaseAddress + mbi.RegionSize) >= (vm_base + ea + n);
 #else
     return 0;
@@ -100,6 +123,10 @@ static void sync_rd_live(uint32_t ea, uint8_t* dst, uint32_t n)
     if (n <= 512u) {
         int it = 0;
         while (it < 8 && memcmp(dst, vm_base + ea, n) != 0) { memcpy(dst, vm_base + ea, n); it++; }
+    }
+    if (__builtin_expect(t_rr_ov != NULL, 0)) {
+        const uint32_t lo = ea > t_rr_ea ? ea : t_rr_ea, hi = (ea + n < t_rr_ea + t_rr_n) ? ea + n : t_rr_ea + t_rr_n;
+        if (lo < hi) memcpy(dst + (lo - ea), t_rr_ov + (lo - t_rr_ea), hi - lo);
     }
 }
 
@@ -183,13 +210,11 @@ static inline void sync_tblock(uint8_t* priv, const uint8_t* raw, uint32_t b)
         memcpy(priv + o + q, (x | y) ? raw + o + q : s_tmpl110 + o + q, 16);
     }
 }
+static void sync_tmpl_init(void);
 static void sync_ls110_fast(L2* l, const uint8_t* raw, int full)
 {
     uint8_t* priv = l->ls110;
-    if (!s_tmpl110) {
-        s_tmpl110 = (uint8_t*)_aligned_malloc(L2_LS_SIZE, 64);
-        memset(s_tmpl110, 0, L2_LS_SIZE); memcpy(s_tmpl110 + 0x60, k_l2_bin110, sizeof k_l2_bin110);
-    }
+    sync_tmpl_init();
     if (!full) {
         for (uint32_t w = 0; w < sizeof s_S / sizeof s_S[0]; w++) {
             uint64_t m = s_S[w];
@@ -227,9 +252,12 @@ static uint32_t s_blkhist[L2_LS_SIZE / 64];
 static double s_t_fullcopy; static volatile long s_n_fullcopy;
 static void sync_tmpl_init(void)
 {
-    if (s_tmpl110) return;
-    s_tmpl110 = (uint8_t*)_aligned_malloc(L2_LS_SIZE, 64);
-    memset(s_tmpl110, 0, L2_LS_SIZE); memcpy(s_tmpl110 + 0x60, k_l2_bin110, sizeof k_l2_bin110);
+    /* rissa128: pubblicato solo quando e' pronto: main (slot sincrono) e raw 110 (SPU_COLL_RING=3) ci arrivano insieme */
+    if (__atomic_load_n(&s_tmpl110, __ATOMIC_ACQUIRE)) return;
+    uint8_t* t = (uint8_t*)_aligned_malloc(L2_LS_SIZE, 64);
+    memset(t, 0, L2_LS_SIZE); memcpy(t + 0x60, k_l2_bin110, sizeof k_l2_bin110);
+    uint8_t* exp = NULL;
+    if (!__atomic_compare_exchange_n(&s_tmpl110, &exp, t, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) _aligned_free(t);
 }
 static void sync_full_fast(uint8_t* priv, const uint8_t* raw)
 {

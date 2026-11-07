@@ -180,6 +180,8 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+/* rissa127: called BEFORE an SPU PUT lands (ea, LS source, size); SPU_COLL_RING=2 compares the native log at the ticket's last PUT */
+void (*g_spu_ring_preput)(uint32_t ea, const uint8_t* src, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -848,6 +850,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
+        { extern int g_anim_stress_us; extern volatile uint32_t g_anim_stress_line; extern void anim_stress_pause(void);   /* frz107 ANIM_HLE_STRESS */
+          if (g_anim_stress_us && (ea & ~127u) == g_anim_stress_line) anim_stress_pause(); }
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -911,6 +915,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        { extern int g_anim_stress_us; extern volatile uint32_t g_anim_stress_line; extern void anim_stress_pause(void);   /* frz107 ANIM_HLE_STRESS */
+          if (g_anim_stress_us && (ea & ~127u) == g_anim_stress_line) anim_stress_pause(); }
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
@@ -1479,10 +1485,20 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     {
         static int s_spin_us = -1;
         if (s_spin_us < 0) { const char* e = getenv("SPU_CHWAIT_SPIN_US"); s_spin_us = e ? atoi(e) : 0; if (s_spin_us < 0) s_spin_us = 0; }
-        if (s_spin_us > 0) {
+        /* rissa127 SPU_CHWAIT_SPIN_RAW_US=<us> (default 0 = off): the same poll, ONLY for the two raw collision SPUs (images 110/111),
+         * short, and yielding the core (SwitchToThread) on every round so a ready thread -- the audio synth above all -- is not starved.
+         * In a Rykan V fight those two threads sat 75% of the time asleep in this function while the PPU main waited ~8 ms a frame
+         * for their query results: the hand-offs, not the compute, were the cost. (SPU_CHWAIT_SPIN_US=150 on every SPU thread was the
+         * 31/10 audio-crackle suspect; the crackles then turned out to follow the CPU load.) */
+        static int s_spin_raw = -1;
+        if (s_spin_raw < 0) { const char* e = getenv("SPU_CHWAIT_SPIN_RAW_US"); s_spin_raw = e ? atoi(e) : 0; if (s_spin_raw < 0) s_spin_raw = 0; }
+        const int raw_coll = s_spin_raw > 0 && (ctx->image_id == 110 || ctx->image_id == 111);
+        const int spin_us = s_spin_us > 0 ? s_spin_us : (raw_coll ? s_spin_raw : 0);
+        if (spin_us > 0) {
             LARGE_INTEGER q0, q, fq; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&fq);
-            const long long lim = (long long)s_spin_us * fq.QuadPart / 1000000;
+            const long long lim = (long long)spin_us * fq.QuadPart / 1000000;
             for (;;) {
+                if (raw_coll && s_spin_us <= 0) SwitchToThread();
                 for (int i = 0; i < 16; i++) _mm_pause();
                 if (spu_ch_ready(ctx, channel)) {
                     if (g_c37_on > 0) { LARGE_INTEGER c37q1, c37f; QueryPerformanceCounter(&c37q1); QueryPerformanceFrequency(&c37f);
@@ -2512,11 +2528,25 @@ SPU_THREAD_LOCAL int g_spu_force_interp;   /* SPU_INTERP_WID (spurs_policy.c) */
 SPU_THREAD_LOCAL int g_spu_fast_fp;        /* host float ops in SPU_FAST_FP_TLS images (spu_helpers.h) */
 SPU_THREAD_LOCAL int g_spu_rz;             /* this thread runs MXCSR=RZ|DAZ|FTZ; SPU_RZ_FP_TLS images use the host float ops (spu_helpers.h) */
 /* SPU_RZ_FP exact-path redos (an exponent-255 operand or an overflow); a line at 1, 2, 4, 8, ... so a hot spot shows up */
+/* rissa128 SPU_RZ_TRACE=<n>: log the first n exact-path redos (op, operands, result) of the modules that call it */
+int g_spu_rz_trace;
+static volatile long s_rz_tr_n;
+__attribute__((constructor)) static void spu_rz_trace_init(void) { const char* e = getenv("SPU_RZ_TRACE"); g_spu_rz_trace = e ? atoi(e) : 0; }
+void spu_rz_slow_trace(int op, const void* a, const void* b, const void* c, const void* r)
+{
+    const long k = __atomic_add_fetch(&s_rz_tr_n, 1, __ATOMIC_RELAXED);
+    if (k > g_spu_rz_trace) { g_spu_rz_trace = 0; return; }
+    const uint32_t *A = (const uint32_t*)a, *B = (const uint32_t*)b, *C = (const uint32_t*)c, *R = (const uint32_t*)r;
+    fprintf(stderr, "[rz-trace] op=%d a=%08X %08X %08X %08X b=%08X %08X %08X %08X c=%08X %08X %08X %08X r=%08X %08X %08X %08X\n", op,
+            A[0], A[1], A[2], A[3], B[0], B[1], B[2], B[3], C[0], C[1], C[2], C[3], R[0], R[1], R[2], R[3]);
+}
+/* rissa128: per-thread counter. The shared atomic was 21.7% of wid9 (fxvis) in a Rykan V fight: 3 SPURS lanes hit the
+ * exact path thousands of times a frame and the one cache line bounced between cores. The log now counts per thread. */
 void spu_rz_slow_note(void)
 {
-    static volatile long n;
-    long v = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
-    if ((v & (v - 1)) == 0) { fprintf(stderr, "[spu-rz] %ld op(s) fell back to the exact FP path\n", v); fflush(stderr); }
+    static SPU_THREAD_LOCAL long n;
+    const long v = ++n;
+    if ((v & (v - 1)) == 0 && v >= 1024) { fprintf(stderr, "[spu-rz] tid %lu: %ld op(s) fell back to the exact FP path\n", (unsigned long)GetCurrentThreadId(), v); fflush(stderr); }
 }
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
@@ -3767,10 +3797,26 @@ void spu_indirect_branch_full(spu_context* ctx)
                     uint32_t en = PMR32(sea + 0xB0);
                     uint32_t sig = PMR16(sea + 0x70);
                     uint32_t mypr = PMR8(sea + 0xB00 + cur * 0x20 + 0x18 + lane);
+                    /* SPURS_PM_STARVE_MS=<n> (default 0 = off): a workload pinned to THIS lane only (priority nonzero on no other lane) and
+                     * LOWER than ours is starved while a shared higher-priority job holds the lane (ToD 07/11 Sargasso: wid 11 prio 7 on all
+                     * lanes ran 3.6 s on lane 0 while the anim consumer wid 0, prio 4 on lane 0 only, was kicked: PPU parked in func_0048DA58,
+                     * only the anim watchdog moved it, one command per second). After n ms of this run the poll yields to it anyway. */
+                    static int s_starve_ms = -1;
+                    if (s_starve_ms < 0) { const char* e = getenv("SPURS_PM_STARVE_MS"); s_starve_ms = e ? atoi(e) : 0; if (s_starve_ms < 0) s_starve_ms = 0; }
+                    int starve_ok = 0;
+                    if (s_starve_ms > 0) {
+                        extern unsigned long long ps3_ms_now(void); extern SPU_THREAD_LOCAL unsigned long long g_spurs_pm_t0_ms;
+                        starve_ok = g_spurs_pm_t0_ms && ps3_ms_now() - g_spurs_pm_t0_ms >= (unsigned long long)s_starve_ms;
+                    }
                     for (uint32_t w = 0; w < 16 && !yield; w++) {
                         if (w == cur || !(en & (0x80000000u >> w)) || PMR8(sea + 0x80 + w) != 2) continue;
                         uint32_t pr = PMR8(sea + 0xB00 + w * 0x20 + 0x18 + lane);
-                        if (!pr || pr < mypr) continue;
+                        if (!pr) continue;
+                        if (pr < mypr) {
+                            int pinned = starve_ok;
+                            for (uint32_t o = 0; o < 8 && pinned; o++) if (o != lane && PMR8(sea + 0xB00 + w * 0x20 + 0x18 + o)) pinned = 0;
+                            if (!pinned) continue;
+                        }
                         uint32_t maxc = PMR8(sea + 0x50 + w);
                         if (!maxc || PMR8(sea + 0x20 + w) >= maxc) continue;
                         if (PMR8(sea + 0x00 + w) || (sig & (0x8000u >> w))) yield = 1;

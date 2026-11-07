@@ -468,6 +468,7 @@ struct SpursPmSlot {
     spu_lifted_entry_fn fn;
     int image_id, busy, chained;
     long long last_end;   /* QPC at the end of this lane's previous run */
+    long long t_start;    /* QPC at the start of the run in progress (0 = none): logv2 longest job */
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
@@ -496,6 +497,7 @@ static struct SpursInst {
     u8 active[16], idle[16];
     u32 dispatches[16]; unsigned long long stats_t0;
     u32 cursor, pass_no;
+    long long pass_qpc;   /* SPURS_WAKE_GUARD: QPC of the kernel's last scheduling pass */
     /* SPURS_WID_STATS: host time inside the PM per workload, and dispatches
      * made by a pass that followed a 1 ms timeout (kick seen late). */
     long long run_qpc[16], max_qpc[16]; u32 late[16], wakes_to, wakes_cv, handoffs;
@@ -1981,6 +1983,93 @@ static int spurs_dispatch_slot(struct SpursInst* si, u32 sn, u32 enabled, int ti
  * Admission and lifecycle state are serialized per instance. Guest execution
  * never runs under that lock, and only a genuine return releases contention. */
 static int getenv_cpu_stats_cached(void) { static int s = -1; if (s < 0) s = getenv("SPURS_CPU_STATS") ? 1 : 0; return s; }
+
+/* SPURS_WAKE_GUARD=1 (default 0): the PM workers sleep at most SPURS_WAKE_GUARD_US (default 500, rounded UP to whole ms: the
+ * condvar wait is in ms) instead of INFINITE; on a timeout a worker with a free lane re-checks the ready bytes and, if there is a
+ * kicked workload, dispatches it itself (same lock order as SPURS_HANDOFF). No spin. Every 5 s:
+ * "[spurs-guard] timeouts N, found work M, max wait ms X, stale S" (S>0: the coordinator had not looked for > 4 ms while work was
+ * ready = lost kick / blocked coordinator). Only the multi-SPU instance. */
+static int spurs_wake_guard_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char* e = getenv("SPURS_WAKE_GUARD");
+        if (e && e[0] == '1') { const char* u = getenv("SPURS_WAKE_GUARD_US"); int us = u ? atoi(u) : 500; if (us < 1) us = 500; ms = (us + 999) / 1000; if (ms < 1) ms = 1; }
+        else ms = 0;
+    }
+    return ms;
+}
+static int spurs_quick_kicked(struct SpursInst* si);
+static struct { unsigned long long to, found, stale; long long maxgap; ULONGLONG t0; } s_wg;
+static void spurs_guard_scan(struct SpursInst* si, struct SpursPmSlot* slot)   /* si->lock held */
+{
+    static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    s_wg.to++;
+    if (spurs_quick_kicked(si)) {
+        const long long gap = si->pass_qpc ? q.QuadPart - si->pass_qpc : 0;   /* time since the coordinator's last pass */
+        spl_acq(&s_workload_registry_lock, __func__, __LINE__);
+        const int st = spurs_dispatch_slot(si, slot->spu_num, vm_read32(si->ea + SPURS_WKL_ENABLED), 1);
+        spl_rel(&s_workload_registry_lock);
+        if (st) { s_wg.found++; if (gap > s_wg.maxgap) s_wg.maxgap = gap; if (gap * 1000 > 4 * f.QuadPart) s_wg.stale++; }
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!s_wg.t0) s_wg.t0 = now;
+    else if (now - s_wg.t0 >= 5000) {
+        fprintf(stderr, "[spurs-guard] timeouts %llu, found work %llu, max wait ms %.2f, stale %llu (coordinator gap > 4 ms)\n",
+                s_wg.to, s_wg.found, (double)s_wg.maxgap * 1000.0 / (double)f.QuadPart, s_wg.stale);
+        s_wg.to = s_wg.found = s_wg.stale = 0; s_wg.maxgap = 0; s_wg.t0 = now;
+    }
+}
+
+/* logv2: longest SPU run of the last ~1-2 s (multi-SPU instance) plus the oldest run still in progress, for the hitch/tick records.
+ * Unlocked, diagnostic. */
+static struct { volatile ULONGLONG sec; volatile long long cq, pq; volatile unsigned cw, ci, pw, pi; } s_jl;
+static void spurs_jl_note(long long d, u32 wid, int img)
+{
+    const ULONGLONG sec = GetTickCount64() / 1000;
+    if (sec != s_jl.sec) { s_jl.pq = s_jl.sec + 1 == sec ? s_jl.cq : 0; s_jl.pw = s_jl.cw; s_jl.pi = s_jl.ci; s_jl.cq = 0; s_jl.sec = sec; }
+    if (d > s_jl.cq) { s_jl.cq = d; s_jl.cw = wid; s_jl.ci = (unsigned)img; }
+}
+int spurs_v2_longest_job(char* out, size_t n)
+{
+    static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    long long best = 0; unsigned w = 0, im = 0; int run = 0;
+    const ULONGLONG ns = GetTickCount64() / 1000;
+    if (s_jl.sec + 1 >= ns) { best = s_jl.cq; w = s_jl.cw; im = s_jl.ci; }
+    if (s_jl.sec == ns && s_jl.pq > best) { best = s_jl.pq; w = s_jl.pw; im = s_jl.pi; }
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    for (int i = 0; i < MAX_SPURS_INST; i++) if (s_inst[i].nspus > 1 && s_inst[i].kernel_live)
+        for (u32 k = 0; k < s_inst[i].nspus && k < 6; k++) {
+            const long long t0 = s_inst[i].slots[k].t_start;
+            if (s_inst[i].slots[k].busy && t0 && q.QuadPart - t0 > best) { best = q.QuadPart - t0; w = s_inst[i].slots[k].wid; im = (unsigned)s_inst[i].slots[k].image_id; run = 1; }
+        }
+    if (!best) { if (n) out[0] = 0; return 0; }
+    return snprintf(out, n, "\"spu_longest\":{\"wid\":%u,\"img\":%u,\"ms\":%.1f,\"running\":%d}", w, im, (double)best * 1000.0 / (double)f.QuadPart, run);
+}
+/* [stall] dump (called from spurs_policy_dump_stall): which lane runs which workload and for how long, and each workload's
+ * ready/active/priority bytes. Lock-free, diagnostic. A lane busy with a shared workload for seconds while a lane-pinned workload
+ * has ready>0 and active=0 is the starvation of 07/11 (see SPURS_PM_STARVE_MS in spu_channels.c). */
+void spurs_stall_dump_lanes(void)
+{
+    static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        if (s_inst[i].nspus < 2 || !s_inst[i].kernel_live) continue;
+        for (u32 k = 0; k < s_inst[i].nspus && k < 6; k++) {
+            const long long t0 = s_inst[i].slots[k].t_start;
+            fprintf(stderr, "[spurs-stall] lane %u inst %08X busy=%d wid=%u running %.1f ms\n", k, s_inst[i].ea, (int)s_inst[i].slots[k].busy,
+                    (unsigned)s_inst[i].slots[k].wid, t0 ? (double)(q.QuadPart - t0) * 1000.0 / (double)f.QuadPart : 0.0);
+        }
+        for (u32 w = 0; w < 16; w++) {
+            if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != s_inst[i].ea) continue;
+            const u32 ea = s_inst[i].ea; u32 pr = 0;
+            for (u32 sn = 0; sn < s_inst[i].nspus && sn < 4; sn++) pr = (pr << 8) | vm_read8(ea + SPURS_WKL_INFO1 + w * SPURS_WKL_INFO_SZ + 0x18 + sn);
+            fprintf(stderr, "[spurs-stall] wid %u ready=%u active=%u maxc=%u prio=%08X\n", w, vm_read8(ea + SPURS_WKL_READY1 + w),
+                    (unsigned)s_inst[i].active[w], vm_read8(ea + SPURS_WKL_MAXCONT + w), pr);
+        }
+    }
+}
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
@@ -2002,12 +2091,17 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { extern void tl_name(const char*, int); char nb[64]; snprintf(nb, sizeof nb, "SPURS %08X lane%u", si->ea, (unsigned)slot->spu_num); tl_name(nb, 100 + (int)slot->spu_num + (si->nspus > 1 ? 0 : 50)); }   /* TOD_TIMELINE */
     spl_acq(&si->lock, __func__, __LINE__);
     for (;;) {
-        while (!slot->busy && !si->stopping)
-            spl_sleep(spurs_slot_wake() ? &slot->wake_cv : &si->wake, &si->lock, INFINITE, __func__, __LINE__);
+        while (!slot->busy && !si->stopping) {
+            const int gms = si->nspus > 1 ? spurs_wake_guard_ms() : 0;
+            if (!gms) spl_sleep(spurs_slot_wake() ? &slot->wake_cv : &si->wake, &si->lock, INFINITE, __func__, __LINE__);
+            else if (!spl_sleep(spurs_slot_wake() ? &slot->wake_cv : &si->wake, &si->lock, (DWORD)gms, __func__, __LINE__) && !slot->busy && !si->stopping)
+                spurs_guard_scan(si, slot);
+        }
         if (si->stopping && !slot->busy) break;
         spl_rel(&si->lock);
         { extern void ps3_cpu_note(void); ps3_cpu_note(); }
         LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
+        slot->t_start = q0.QuadPart;
         static SPU_THREAD_LOCAL long long hk[4]; static unsigned long long h_acc[5];   /* SPURS_CPU_STATS: where the hand-off goes (lane 0) */
         if (getenv_cpu_stats_cached() && slot->spu_num == 0 && slot->chained && hk[0] && q0.QuadPart - hk[0] < 20000) {
             h_acc[0] += hk[1] - hk[0]; h_acc[1] += hk[2] - hk[1]; h_acc[2] += hk[3] - hk[2]; h_acc[3] += q0.QuadPart - hk[3]; h_acc[4]++; }
@@ -2060,7 +2154,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
                                 a_wall[x] * us / n, s_cyc[0][x] / n / 3590.0, a_ra[x][0] / n, a_ra[x][1] / n, a_ra[x][2] / n, a_ra[x][3] * us / n,
                                 a_ra[x][4] / n, a_ra[x][5] * us / n, a_pl[x] / n, a_st[x] / n);
                       }
-                      memset(a_wall, 0, sizeof a_wall); memset(a_ra, 0, sizeof a_ra); memset(a_pl, 0, sizeof a_pl); memset(a_st, 0, sizeof a_st); }
+                      /* rissa128: sizeof of the ARRAYS: these are pointers, sizeof cleared 8 bytes (w0 only) and every other wid's [lrun] kept accumulating */
+                      memset(a_wallA[ii], 0, sizeof a_wallA[ii]); memset(a_raA[ii], 0, sizeof a_raA[ii]); memset(a_plA[ii], 0, sizeof a_plA[ii]); memset(a_stA[ii], 0, sizeof a_stA[ii]); }
                     { extern void spu_ra_dump_reset(void); spu_ra_dump_reset(); }
                     if (h_acc[4]) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); double us = 1e6 / (double)f.QuadPart / (double)h_acc[4];
                         fprintf(stderr, "[lhand] n=%llu lock_si=%.1fus bookkeeping=%.1fus dispatch=%.1fus to_next_run=%.1fus\n", (unsigned long long)h_acc[4], h_acc[0] * us, h_acc[1] * us, h_acc[2] * us, h_acc[3] * us);
@@ -2084,6 +2179,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             }
         }
         QueryPerformanceCounter(&q1);
+        slot->t_start = 0;
+        if (si->nspus > 1) spurs_jl_note(q1.QuadPart - q0.QuadPart, slot->wid, slot->image_id);
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         spl_acq(&si->lock, __func__, __LINE__);
@@ -2167,6 +2264,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         u32 ea = si->ea;
         spl_acq(&s_workload_registry_lock, __func__, __LINE__);
         si->pass_no++;
+        if (spurs_wake_guard_ms()) { LARGE_INTEGER pq; QueryPerformanceCounter(&pq); si->pass_qpc = pq.QuadPart; }
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
         for (u32 sn_i = 0; sn_i < si->nspus; sn_i++) {
             /* SPURS_LANE_AFFINITY=1: lanes are filled last-first, and each lane first takes a workload that is eligible
@@ -2351,20 +2449,33 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
           uint8_t* buf = len ? (uint8_t*)malloc(len) : NULL;
           if (buf && GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
               ULONG ids[256], n = 0, mine[2], nm = 0; BYTE last_core = 0;
+              /* 1.2 (issue #10): with TOD_PCORES on (default) a hybrid CPU only uses its fastest core class (main.cpp pcores_setup):
+               * the reserved core and the default sets are taken among those CPUs only (before, the last core was an E-core: nm=1, skipped). */
+              BYTE top = 0;
+              { const char* pe = getenv("TOD_PCORES");
+                if (!(pe && pe[0] == '0'))
+                    for (ULONG off = 0; off < len; ) {
+                        SYSTEM_CPU_SET_INFORMATION* c = (SYSTEM_CPU_SET_INFORMATION*)(buf + off);
+                        if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass > top) top = c->CpuSet.EfficiencyClass;
+                        off += c->Size;
+                    } }
               for (ULONG off = 0; off < len; ) {
                   SYSTEM_CPU_SET_INFORMATION* c = (SYSTEM_CPU_SET_INFORMATION*)(buf + off);
-                  if (c->Type == CpuSetInformation && c->CpuSet.CoreIndex > last_core) last_core = c->CpuSet.CoreIndex;
+                  if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass >= top && c->CpuSet.CoreIndex > last_core) last_core = c->CpuSet.CoreIndex;
                   off += c->Size;
               }
               for (ULONG off = 0; off < len; ) {
                   SYSTEM_CPU_SET_INFORMATION* c = (SYSTEM_CPU_SET_INFORMATION*)(buf + off);
-                  if (c->Type == CpuSetInformation) {
+                  if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass >= top) {
                       if (c->CpuSet.CoreIndex == last_core) { if (nm < 2) mine[nm++] = c->CpuSet.Id; }
                       else if (n < 256) ids[n++] = c->CpuSet.Id;
                   }
                   off += c->Size;
               }
-              if (n >= 6 && nm >= 1) {
+              /* crash116: the reserved core needs at least 2 logical CPUs (one for the worker, one for the coordinator): with 1 (e.g. an E-core
+               * without SMT on a hybrid Intel) both would share it at HIGHEST priority. Always logged (issue #5). */
+              fprintf(stderr, "[cellSpurs] solo core: core=%d nm=%lu\n", (int)last_core, (unsigned long)nm);
+              if (n >= 6 && nm >= 2) {
                   done = 1;
                   SetProcessDefaultCpuSets(GetCurrentProcess(), ids, n);
                   { extern void ps3_ccx_reapply_default(void); ps3_ccx_reapply_default(); }

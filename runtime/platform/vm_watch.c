@@ -24,6 +24,8 @@ static volatile LONG* s_gen;      /* writes seen, per page                     *
 static uint8_t*       s_prot;     /* 1: read-only now                          */
 static uint32_t*      s_quar;     /* GetTickCount64 of the last write, or 0    */
 static volatile LONGLONG s_faults, s_protected;
+static volatile LONGLONG s_wf_ticks, s_wf_prot;   /* logv2: QPC ticks spent in vm_watch_fault, VirtualProtect calls made */
+static LONGLONG s_wf_f0, s_wf_t0, s_wf_p0;         /* values at the last rsx_texwatch_v2_frame */
 static volatile LONG s_cgen[4097];   /* [4096] = prof102: global write epoch (every page write) */
 
 void vm_watch_init(uint8_t* base, uint64_t size)
@@ -61,6 +63,7 @@ static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
     BEACON_WAIT("vm_watch_protect");
     const BOOL pok = VirtualProtect(a, n, PAGE_READONLY, &old);
     BEACON_POP();
+    InterlockedIncrement64(&s_wf_prot);
     if (!pok) {
         for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 0;
         return 0;
@@ -105,6 +108,7 @@ void vm_watch_touch(uint32_t ea, uint32_t len)
         if (s_prot[p]) {
             DWORD old;
             VirtualProtect(s_base + ((uint64_t)p << WP_SHIFT), 1u << WP_SHIFT, PAGE_READWRITE, &old);
+            InterlockedIncrement64(&s_wf_prot);
             s_prot[p] = 0;
         }
         InterlockedIncrement(&s_gen[p]);
@@ -119,17 +123,33 @@ int vm_watch_fault(uintptr_t addr, int is_write)
     const uint32_t p = (uint32_t)((addr - (uintptr_t)s_base) >> WP_SHIFT);
     if (p >= WP_COUNT || !s_prot[p]) return 0;
     (void)is_write;   /* a read cannot fault on a read-only page; whatever it was, open it */
+    LARGE_INTEGER q0, q1;
+    QueryPerformanceCounter(&q0);
     DWORD old;
     BEACON_WAIT("vm_watch_fault");
     const BOOL fok = VirtualProtect(s_base + ((uint64_t)p << WP_SHIFT), 1u << WP_SHIFT, PAGE_READWRITE, &old);
     BEACON_POP();
+    InterlockedIncrement64(&s_wf_prot);
     if (!fok) return 0;
     s_prot[p] = 0;
     InterlockedIncrement(&s_gen[p]);
     InterlockedIncrement(&s_cgen[p >> 8]); InterlockedIncrement(&s_cgen[4096]);
     { const uint32_t now = (uint32_t)GetTickCount64(); s_quar[p] = now ? now : 1u; }
     InterlockedIncrement64(&s_faults);
+    QueryPerformanceCounter(&q1);
+    InterlockedAdd64(&s_wf_ticks, (LONGLONG)(q1.QuadPart - q0.QuadPart));
     return 1;
+}
+
+void rsx_texwatch_v2_frame(unsigned* faults, double* ms, unsigned* protects)
+{
+    static double s_qpf_ms;   /* QPC ticks per ms */
+    if (s_qpf_ms == 0.0) { LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); s_qpf_ms = (double)fr.QuadPart / 1000.0; }
+    const LONGLONG f = s_faults, t = s_wf_ticks, p = s_wf_prot;
+    if (faults) *faults = (unsigned)(f - s_wf_f0);
+    if (ms) *ms = (double)(t - s_wf_t0) / s_qpf_ms;
+    if (protects) *protects = (unsigned)(p - s_wf_p0);
+    s_wf_f0 = f; s_wf_t0 = t; s_wf_p0 = p;
 }
 
 int vm_commit_reserved(void* p, uint64_t n)
@@ -180,6 +200,8 @@ static volatile uint32_t* s_gen;             /* writes seen, per page         */
 static volatile uint8_t*  s_prot;            /* 1: read-only now              */
 static volatile uint32_t* s_quar;            /* ms stamp of the last write, 0 */
 static volatile uint64_t  s_faults, s_protected;
+static volatile uint64_t  s_wf_ns, s_wf_prot;   /* logv2: ns spent in vm_watch_fault, mprotect calls made */
+static uint64_t s_wf_f0, s_wf_t0, s_wf_p0;
 
 static uint32_t wp_now_ms(void)
 {
@@ -216,6 +238,7 @@ static int wp_protect_run(uint32_t p0, uint32_t p1)   /* pages [p0, p1] */
     /* Marked before the protection takes effect: a write that faults the
      * instant it does must find the page marked. */
     for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 1;
+    __atomic_add_fetch(&s_wf_prot, 1u, __ATOMIC_RELAXED);
     if (mprotect(s_base + off, (size_t)n, PROT_READ) != 0) {
         for (uint32_t p = p0; p <= p1; p++) s_prot[p] = 0;
         return 0;
@@ -252,6 +275,7 @@ uint64_t vm_watch_arm(uint32_t ea, uint32_t len, uint32_t* unwatched)
 
 static void wp_open(uint32_t p, uint32_t now)
 {
+    __atomic_add_fetch(&s_wf_prot, 1u, __ATOMIC_RELAXED);
     mprotect(s_base + ((uint64_t)p << s_shift), (size_t)1 << s_shift, PROT_READ | PROT_WRITE);
     s_quar[p] = now;          /* before the flag drops: a racing fault sees a written page */
     s_prot[p] = 0;
@@ -277,8 +301,11 @@ int vm_watch_fault(uintptr_t addr, int is_write)
     const uint32_t p = (uint32_t)((addr - (uintptr_t)s_base) >> s_shift);
     if (p >= s_count) return 0;
     if (s_prot[p]) {
+        struct timespec ta, tb; clock_gettime(CLOCK_MONOTONIC, &ta);
         wp_open(p, wp_now_ms());
         __atomic_add_fetch(&s_faults, 1u, __ATOMIC_RELAXED);
+        clock_gettime(CLOCK_MONOTONIC, &tb);
+        __atomic_add_fetch(&s_wf_ns, (uint64_t)(tb.tv_sec - ta.tv_sec) * 1000000000ull + (uint64_t)tb.tv_nsec - (uint64_t)ta.tv_nsec, __ATOMIC_RELAXED);
         return 1;
     }
     /* Not protected now, but the watch opened it before: another thread's
@@ -296,6 +323,15 @@ void vm_watch_stats(uint64_t* faults, uint64_t* pages_protected)
 {
     if (faults) *faults = s_faults;
     if (pages_protected) *pages_protected = s_protected;
+}
+
+void rsx_texwatch_v2_frame(unsigned* faults, double* ms, unsigned* protects)
+{
+    const uint64_t f = s_faults, t = s_wf_ns, p = s_wf_prot;
+    if (faults) *faults = (unsigned)(f - s_wf_f0);
+    if (ms) *ms = (double)(t - s_wf_t0) / 1e6;
+    if (protects) *protects = (unsigned)(p - s_wf_p0);
+    s_wf_f0 = f; s_wf_t0 = t; s_wf_p0 = p;
 }
 
 /* POSIX guest memory is mapped read-write up front; nothing to commit. */

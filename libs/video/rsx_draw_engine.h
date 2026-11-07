@@ -487,6 +487,12 @@ void rsx_b2p_add(int counter, unsigned long long v);
 #define RSX_B2P_LEAVE()     do { if (g_b2p_on) rsx_b2p_leave(); } while (0)
 #define RSX_B2P_ADD(c, v)   do { if (g_b2p_on) rsx_b2p_add((c), (v)); } while (0)
 
+/* RSX_LANES>=2 (lane109): why a speculative lane gave a chunk back to the coordinator (see rsx_lane_abort in rsx_draw_engine.c). */
+enum { RSX_LAB_NONE = 0, RSX_LAB_TEXNEW, RSX_LAB_TEXCHG, RSX_LAB_STANDIN, RSX_LAB_PIPENEW, RSX_LAB_PIPEWAIT, RSX_LAB_VCPROMOTE, RSX_LAB_PRO,
+       RSX_LAB_ZCLEAR, RSX_LAB_OWNSNAP, RSX_LAB_ZSNAP, RSX_LAB_JOIN, RSX_LAB_VIEWNEW, RSX_LAB_SAMPNEW, RSX_LAB_STAGE, RSX_LAB_QUERY, RSX_LAB_ZOVER,
+       RSX_LAB_ZPACK, RSX_LAB_ZOWN, RSX_LAB_OTHER, RSX_LAB_N };
+void rsx_lane_abort(int why);   /* longjmp out of a speculative lane draw; no-op elsewhere */
+int  rsx_lane_spec(void);       /* 1 on a lane thread that is executing speculatively */
 #ifdef __cplusplus
 }
 #endif

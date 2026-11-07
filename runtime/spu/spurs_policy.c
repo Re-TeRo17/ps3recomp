@@ -43,6 +43,7 @@ static void spu_interp_pm_entry(spu_context* ctx)
  * (per worker, including the exit classification used by the caller). */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+SPU_THREAD_LOCAL unsigned long long g_spurs_pm_t0_ms = 0;   /* SPURS_PM_STARVE_MS: ps3_ms_now() at the start of this run (spu_channels.c poll) */
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 /* Contexts are resident per (instance, workload, physical SPU). Workload IDs
@@ -155,6 +156,27 @@ void spurs_policy_release_instance(uint32_t ea)
         break;
     }
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
+}
+
+/* frz107: [stall] dump of the resident policy-module contexts (one per instance/workload/lane): image id, pc, reservation.
+ * Best-effort and lock-free (a context can be freed under us: SEH guard); only called from the stall probe. */
+void spurs_stall_dump_lanes(void);   /* libs/spurs/cellSpurs.c */
+void spurs_policy_dump_stall(void)
+{
+    __try { spurs_stall_dump_lanes(); } __except (1) { fprintf(stderr, "[spurs-stall] fault while dumping the lanes\n"); }
+    __try {
+        for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
+            struct PmInstance* pi = &s_pm_instances[i];
+            if (!pi->used) continue;
+            for (unsigned w = 0; w < 16; w++) for (unsigned n = 0; n < 6; n++) {
+                struct PmSlot* sl = &pi->slots[w][n];
+                spu_context* c = sl->ctx;
+                if (!c) continue;
+                fprintf(stderr, "[spurs-stall] inst %08X wid %u lane %u image_id=%d pc=%05X resv_valid=%d resv_ea=%08X data=%llX\n",
+                        pi->ea, w, n, c->image_id, (unsigned)(c->pc & 0x3FFFF), c->resv_valid, c->resv_ea, (unsigned long long)sl->data);
+            }
+        }
+    } __except (1) { fprintf(stderr, "[spurs-stall] fault while walking the policy slots\n"); }
 }
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
@@ -295,6 +317,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
+    { extern unsigned long long ps3_ms_now(void); g_spurs_pm_t0_ms = ps3_ms_now(); }
 
     /* RUN/END tracing: thousands of policy dispatches per second made these
      * unconditional fprintf+fflush pairs a real fraction of movie playback.

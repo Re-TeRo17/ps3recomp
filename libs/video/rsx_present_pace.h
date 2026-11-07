@@ -66,6 +66,26 @@ void rsx_present_pace(void);
  * it returns at once (now and until this is turned off again). */
 void rsx_present_pace_hurry(int on);
 
+/* ---- RSX_PACE_VBLANK=1 (default off): the real vertical blank ----
+ * The fixed 60.000 Hz timers of the port (the flip pace, GCM_FLIP_PACE_HZ) and a real display
+ * (59.94, 60.00x, 119.88 ...) beat against each other: every 1/|f_display - 60| seconds a
+ * frame is shown twice or never. With this on, the flip pace follows the display: its period
+ * is the measured refresh period (DwmGetCompositionTimingInfo: exact rate and the time of the
+ * last vblank) times the whole number of refreshes that comes nearest to the wanted period,
+ * and each flip is released a fixed lead before a vblank of that grid. Used only when the wanted
+ * period is a whole multiple of the refresh within 2%; otherwise the fixed timer stays.
+ *   RSX_PACE_VBLANK_LEAD_PCT=<n>  lead before the vblank, % of the paced period (default 60)
+ *   RSX_PACE_VBLANK_LOG=1         every 5 s: grid period, locked/unlocked flips, late flips */
+int rsx_vblank_lock_on(void);
+/* v-sync on (1) or off (0): the lock applies only with v-sync on. Called by the backend whenever it reads RSX_VSYNC. */
+void rsx_vblank_set_vsync(int on);
+/* The wanted flip period (seconds) -> 1 and the released time grid if the lock applies. now/out in QPC ticks.
+ * *target is the QPC tick at which the next flip is to be released (never before 'now'); *period_ticks the paced period. */
+int rsx_vblank_next_release(double want_period_s, long long now_qpc, long long* target, long long* period_ticks);
+/* The compositor's timing now (DwmGetCompositionTimingInfo, read at most every 200 ms): refresh period in seconds,
+ * the QPC tick of the last vblank, the refresh counter. 0 when it is not there. */
+int rsx_vblank_snapshot(double* period_s, long long* vblank_qpc, unsigned long long* refresh_count);
+
 #ifdef __cplusplus
 }
 #endif

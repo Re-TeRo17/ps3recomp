@@ -10,6 +10,7 @@
 
 #ifdef _WIN32
 #include <intrin.h>
+#include <xmmintrin.h>
 #endif
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
@@ -1001,8 +1002,10 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
     return off;
 }
 
+extern void rsx_lanes_boundary(int kind);   /* RSX_LANES (lane107) */
 static void nv3089_blit(void)
 {
+    rsx_lanes_boundary(2);
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
@@ -1254,6 +1257,7 @@ static void gcm_report_copies_flush(void)
 
 static void nv0039_copy(void)
 {
+    rsx_lanes_boundary(2);
     const u32 len = s_nv0039.len, lines = s_nv0039.lines ? s_nv0039.lines : 1u;
     const u32 in_pitch = s_nv0039.pitch_in ? s_nv0039.pitch_in : len;
     const u32 out_pitch = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
@@ -1382,7 +1386,11 @@ static void gcm_sub1_observe(u32 method, u32 data)
     }
 }
 
-static void gcm_2d_method(u32 subch, u32 method, u32 data)
+/* walk106: RSX_WALK_PROF buckets (rsx_draw_engine.c); 6 = other */
+extern int g_wkp_on; extern int rsx_wkp_enter(int); extern void rsx_wkp_leave(int); extern void rsx_wkp_pass_begin(void); extern void rsx_wkp_pass_end(void);
+#define WKP_ENTER(b) (g_wkp_on > 0 ? rsx_wkp_enter(b) : -1)
+#define WKP_LEAVE(o) do { if ((o) >= 0) rsx_wkp_leave(o); } while (0)
+static void gcm_2d_method_impl(u32 subch, u32 method, u32 data)
 {
     rsx_draw_engine_b2_drain();   /* RSX_DRAW_SPLIT=2: 2D copies read/write guest memory the queued draws may not have consumed yet */
     if (subch == 1) {                       /* NV0039 memory to memory */
@@ -1524,6 +1532,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
                subch, method);
 }
+static void gcm_2d_method(u32 subch, u32 method, u32 data) { const int wo_ = WKP_ENTER(6); gcm_2d_method_impl(subch, method, data); WKP_LEAVE(wo_); }
 
 /* Present gate for the ticker: a flip is ready once the drain has consumed
  * everything up to put. The guest blocks in its own WaitFlip right after
@@ -1774,7 +1783,7 @@ unsigned long long ps3_qpc_us(void)
     return (unsigned long long)(n.QuadPart / (f.QuadPart / 1000000));
 }
 
-static void gcm_ref_publish_one(void)
+static void gcm_ref_publish_one_impl(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
@@ -1790,6 +1799,7 @@ static void gcm_ref_publish_one(void)
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
 }
+static void gcm_ref_publish_one(void) { const int wo_ = WKP_ENTER(6); gcm_ref_publish_one_impl(); WKP_LEAVE(wo_); }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
  * ref register (GCM_CONTROL+8). The 60 Hz present-thread ticker publishes only
@@ -1866,9 +1876,87 @@ void cellGcm_ref_on_poll(void)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
+extern int rsx_dispatch_direct_ok(void); extern int rsx_dispatch_direct_run(unsigned method, unsigned count, int incr, const unsigned char* be);   /* walk109 RSX_DISP_DIRECT (rsx_dispatch.c) */
 extern int g_wp_fl; extern unsigned long long g_wp_c[6], g_wp_meths, g_wp_runs, g_wp_runw, g_wp_cmds;
 static int g_fifo_run = -1;
 static int g_fifo_block = -1;   /* RSX_FIFO_BLOCK */
+
+/* walk108: decomposition of the walker's parse bucket (RSX_WALK_PROF=1, [walkprof5] every 2 s). Own rdtsc counters, no engine file involved.
+ * Block loop: per command decode time (from the end of the previous engine call to the start of the next one), engine call time, per class
+ * (0 const window 0x1EFC-0x1F7C, 1 program window 0x0B80, 2 begin/end 0x1808, 3 other one-word commands, 4 other runs). Slow path: commands,
+ * time (engine calls inside included), by break reason and top methods. */
+extern int g_wkp_on;
+typedef struct GcmPP {
+    unsigned long long cmds[5], words[5], dec[5], call[5];
+    unsigned long long nop, blk_enter, blk_noprog, setup, slow_n, slow_cyc, slow_w, brk[8], passes, pass_cyc;
+    unsigned slowm[2048];
+    unsigned long long slowk[8];   /* slow commands by kind: 0 jump 1 call 2 ret 3 type0 count0 4 type2 5 type0 subch!=0 6 other 7 flip words */
+} GcmPP;
+static GcmPP s_pp;
+/* walk108: RSX_WALK_PARSE2=1: the block loop prefetches the ring ahead of the decode (RSX_WALK_PF = bytes ahead, default 512) and decides
+ * the "upload window" test inline instead of calling rsx_draw_engine_upload_window per command; =2 also calls the engine's test and counts
+ * differences ([walkprof5] parse2 check). Same commands go to the engine in the same order. */
+static int g_wp2 = -1, g_wp2_pf = 512, g_wp2_bits = 15;   /* bits: 1 prefetch + inline window test, 2 non-incrementing commands in the block loop, 4 zero (count 0) words stepped over in the block loop, 8 CALL/RET followed in the block loop */ static unsigned long long g_wp2_chk, g_wp2_mis;
+static int g_wp2_plain, g_wp2_off;
+static void gcm_wp2_env(void)
+{
+    const char* e = getenv("RSX_WALK_PARSE2"); g_wp2 = (e && e[0]) ? atoi(e) : 0;
+    const char* f = getenv("RSX_WALK_PF"); if (f && f[0]) g_wp2_pf = atoi(f);
+    const char* bt = getenv("RSX_WALK_P2BITS"); if (bt && bt[0]) g_wp2_bits = atoi(bt);
+    const char* ff = getenv("RSX_FIFO_FAST");
+    g_wp2_plain = (ff && ff[0] && ff[0] != '0' && !getenv("RSX_METHOD_HIST") && !getenv("RSX_METHOD_TRACE_FRAME") && !getenv("RSX_CONST_LOG")) ? 1 : 0;
+    g_wp2_off = getenv("RSX_MCNT") ? 1 : 0;      /* upload_window answers 0 for everything */
+    if (g_wp2) fprintf(stderr, "[walker] RSX_WALK_PARSE2=%d bits %d prefetch %d bytes (plain windows %d)\n", g_wp2, g_wp2_bits, g_wp2_pf, g_wp2_plain);
+}
+static inline int gcm_win_inline(u32 m, u32 count)
+{
+    if (!count || g_wp2_off) return 0;
+    const u32 end = m + count * 4u;
+    if ((m >= 0x1F00u && end <= 0x1F80u) || (m >= 0x0B80u && end <= 0x0C00u)) return 1;
+    return g_wp2_plain && ((m >= 0x1A00u && end <= 0x1C00u) || (m >= 0x1680u && end <= 0x16C0u) || (m >= 0x1740u && end <= 0x1780u));
+}
+static int s_pp_on = -1;   /* RSX_WALK_PP=1 (its own rdtsc cost is taken out in the report, but it is not in the other tables) */
+static inline int gcm_pp_cls(u32 m, u32 c) { return (m >= 0x1EFCu && m < 0x1F80u) ? 0 : (m >= 0x0B80u && m < 0x0C00u) ? 1 : m == 0x1808u ? 2 : c == 1 ? 3 : 4; }
+static void gcm_pp_report(void)
+{
+    static unsigned long long tsc0 = 0, lastf = 0; static GcmPP l; static LONGLONG q0 = 0;
+    extern u32 g_rsx_engine_frame;
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+    if (!q0) { q0 = c.QuadPart; tsc0 = __rdtsc(); lastf = g_rsx_engine_frame; l = s_pp; return; }
+    if ((double)(c.QuadPart - q0) / (double)f.QuadPart < 2.0) return;
+    const unsigned long long q = __rdtsc();
+    const double secs = (double)(c.QuadPart - q0) / (double)f.QuadPart, hz = (double)(q - tsc0) / secs;
+    const double fr = (double)(g_rsx_engine_frame - lastf); const double N = fr > 0 ? fr : 1.0;
+    const double k = 1000.0 / hz / N;                         /* cycles -> ms per frame */
+    static double rd = -1.0;
+    if (rd < 0) { unsigned long long a = __rdtsc(); for (int i = 0; i < 20000; i++) (void)__rdtsc(); rd = (double)(__rdtsc() - a) / 20000.0; }
+    static const char* cn[5] = { "const", "prog", "begend", "one", "run" };
+    fprintf(stderr, "[walkprof5] per frame (%.1f frames, rdtsc %.1f cyc): passes %.1f | block-loop entries %.0f (no progress %.0f) setup %.2f ms |",
+            fr, rd, (double)(s_pp.passes - l.passes) / N, (double)(s_pp.blk_enter - l.blk_enter) / N, (double)(s_pp.blk_noprog - l.blk_noprog) / N, (double)(s_pp.setup - l.setup) * k);
+    double dtot = 0, ctot = 0, ntot = 0;
+    for (int i = 0; i < 5; i++) {
+        const double n = (double)(s_pp.cmds[i] - l.cmds[i]), w = (double)(s_pp.words[i] - l.words[i]);
+        const double d = (double)(s_pp.dec[i] - l.dec[i]) - n * rd, cl = (double)(s_pp.call[i] - l.call[i]) - n * rd;
+        dtot += d; ctot += cl; ntot += n;
+        fprintf(stderr, " %s: cmds %.0f words %.0f dec %.2f ms (%.1f cyc/cmd) call %.2f ms |", cn[i], n / N, w / N, d * k, n > 0 ? d / n : 0.0, cl * k);
+    }
+    fprintf(stderr, " block total: cmds %.0f decode %.2f ms (%.1f cyc/cmd) engine %.2f ms\n", ntot / N, dtot * k, ntot > 0 ? dtot / ntot : 0.0, ctot * k);
+    fprintf(stderr, "[walkprof5] zero words stepped over in the block loop per frame %.0f\n", (double)(s_pp.nop - l.nop) / N);
+    fprintf(stderr, "[walkprof5] slow path per frame: cmds %.0f words %.0f time %.2f ms (engine calls included) | breaks: flagbits %.0f count0/subch %.0f page/put %.0f special-range %.0f | pass total %.2f ms\n",
+            (double)(s_pp.slow_n - l.slow_n) / N, (double)(s_pp.slow_w - l.slow_w) / N, (double)(s_pp.slow_cyc - l.slow_cyc) * k,
+            (double)(s_pp.brk[0] - l.brk[0]) / N, (double)(s_pp.brk[1] - l.brk[1]) / N, (double)(s_pp.brk[2] - l.brk[2]) / N, (double)(s_pp.brk[3] - l.brk[3]) / N,
+            (double)(s_pp.pass_cyc - l.pass_cyc) * k);
+    if (g_wp2 == 2) fprintf(stderr, "[walkprof5] parse2 check: %llu window tests, %llu differ from rsx_draw_engine_upload_window\n", g_wp2_chk, g_wp2_mis);
+    fprintf(stderr, "[walkprof5] slow kinds per frame: jump %.0f call %.0f ret %.0f nop(count0) %.0f NI %.0f subch!=0 %.0f other %.0f flipword %.0f\n",
+            (double)(s_pp.slowk[0] - l.slowk[0]) / N, (double)(s_pp.slowk[1] - l.slowk[1]) / N, (double)(s_pp.slowk[2] - l.slowk[2]) / N, (double)(s_pp.slowk[3] - l.slowk[3]) / N,
+            (double)(s_pp.slowk[4] - l.slowk[4]) / N, (double)(s_pp.slowk[5] - l.slowk[5]) / N, (double)(s_pp.slowk[6] - l.slowk[6]) / N, (double)(s_pp.slowk[7] - l.slowk[7]) / N);
+    { static unsigned prev[2048]; unsigned cur[2048]; memcpy(cur, prev, sizeof cur); fprintf(stderr, "[walkprof5] slow top (cmds/frame):");
+      for (int top = 0; top < 8; top++) { unsigned b = 0, bv = 0; for (unsigned i = 0; i < 2048; i++) { unsigned d = s_pp.slowm[i] - cur[i]; if (d > bv) { bv = d; b = i; } }
+          if (!bv) break; fprintf(stderr, " %04X x%.0f", b << 2, bv / N); cur[b] = s_pp.slowm[b]; }
+      memcpy(prev, s_pp.slowm, sizeof prev);
+      fprintf(stderr, "\n"); }
+    l = s_pp; q0 = c.QuadPart; tsc0 = q; lastf = g_rsx_engine_frame;
+}
 void cellGcm_rsx_process_fifo(void)
 {
     if (!TryAcquireSRWLockExclusive(&s_gcm_fifo_lock)) {
@@ -1877,11 +1965,23 @@ void cellGcm_rsx_process_fifo(void)
         BEACON_POP();
     }
     BEACON_PUSH("process_fifo");
+    { /* walk108: RSX_WALKER_CORE=<n> pins the thread that walks the FIFO to logical processor n (SetThreadAffinityMask); i<n> only sets the ideal processor. Default off. */
+      static _Thread_local int pinned; static int env_init, core = -1, ideal;
+      if (!env_init) { env_init = 1; const char* e = getenv("RSX_WALKER_CORE"); if (e && e[0]) { if (e[0] == 'i' || e[0] == 'I') { ideal = 1; e++; } core = atoi(e); } }
+      if (core >= 0 && !pinned) { pinned = 1;
+          if (ideal) SetThreadIdealProcessor(GetCurrentThread(), (DWORD)core);
+          else SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << core);
+          fprintf(stderr, "[walker] RSX_WALKER_CORE: thread %lu %s processor %d\n", (unsigned long)GetCurrentThreadId(), ideal ? "ideal" : "affinity", core); } }
+    if (g_wkp_on != 0) rsx_wkp_pass_begin();
+    if (s_pp_on < 0) { const char* e_ = getenv("RSX_WALK_PP"); s_pp_on = (e_ && e_[0] && e_[0] != '0') ? 1 : 0; }
+    const unsigned long long pp0_ = s_pp_on > 0 ? __rdtsc() : 0;
     { extern unsigned long long g_wp_fifo_cyc, g_wp_fifo_calls; static int wp = -1;   /* RSX_WPROF (rsx_draw_engine.c) */
       if (wp < 0) { const char* e = getenv("RSX_WPROF"); wp = (e && e[0] && e[0] != '0') ? 1 : 0;
                     const char* h = getenv("RSX_HITCH_LOG"); if (h && atof(h) > 0.0) wp = 1; }   /* surf54: the [hitch] line prints the fifo pass too */
       if (wp) { const unsigned long long a = __rdtsc(); gcm_rsx_process_fifo_unlocked(); g_wp_fifo_cyc += __rdtsc() - a; g_wp_fifo_calls++; }
       else gcm_rsx_process_fifo_unlocked(); }
+    if (g_wkp_on > 0) { extern uint32_t g_rsx_engine_frame; extern void rsx_dsp_wc_pass_end(unsigned); rsx_wkp_pass_end(); rsx_dsp_wc_pass_end(g_rsx_engine_frame); }
+    if (s_pp_on > 0) { s_pp.passes++; s_pp.pass_cyc += __rdtsc() - pp0_; gcm_pp_report(); }
     BEACON_POP();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
@@ -2112,7 +2212,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
     /* GCM_SUBCH1_2D, as the word loop reads it: subchannel 1 is 3D unless set
      * (Drakengard 3 sets it). */
     if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
+    unsigned long long s_slow_t0 = 0;
     while (s_fifo_getoff != put && budget-- > 0) {
+        unsigned long long it_ = 0;
+        if (s_pp_on > 0) { it_ = __rdtsc(); if (s_slow_t0) { s_pp.slow_cyc += it_ - s_slow_t0; s_slow_t0 = 0; } }
         if (s_fifo_getoff == s_pos_flip_io) {
             gcm_fire_pos_flip();
             if (put < s_fifo_getoff || put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
@@ -2149,29 +2252,76 @@ static void gcm_rsx_process_fifo_unlocked(void)
             const u8* base = vm_ptr8(ea);
             const u32 off0 = s_fifo_getoff;
             u32 off = off0, last = off0;
+            if (g_wp2 < 0) gcm_wp2_env();
+            static int park_env = -1; if (park_env < 0) park_env = getenv("GCM_PARK_WATCH") ? 1 : 0;
+            const int p2_ = g_wp2;
+            const int bpf_ = p2_ && (g_wp2_bits & 1), bni_ = p2_ && (g_wp2_bits & 2) && g_fifo_run > 0, bnop_ = p2_ && (g_wp2_bits & 4), bcall_ = p2_ && (g_wp2_bits & 8) && !park_env;
+            const int pp_ = s_pp_on > 0;                 /* walk108: parse decomposition counters (RSX_WALK_PROF=1) */
+            unsigned long long tp_ = 0;
+            if (pp_) { tp_ = __rdtsc(); s_pp.blk_enter++; s_pp.setup += tp_ - it_; }
             while (off != put && off != s_pos_flip_io && budget > 0 && (u64)off + 4ull <= pg_end) {
                 const u8* hp = base + (off - off0);
+                if (bpf_) _mm_prefetch((const char*)hp + g_wp2_pf, _MM_HINT_T0);
                 const u32 w_ = ((u32)hp[0] << 24) | ((u32)hp[1] << 16) | ((u32)hp[2] << 8) | (u32)hp[3];
-                if (w_ & 0xE0000003u) break;
+                if (bcall_) {   /* walk108: RET / CALL as the slow path does them (stepping s_fifo_calloff), then the outer loop re-maps the new position */
+                    if (w_ == 0x00020000u) {
+                        last = off; off = s_fifo_calloff; s_fifo_calloff = 0; budget--;
+                        if (g_wp_fl > 0) g_wp_cmds++;
+                        if (pp_) s_pp.nop++;
+                        break;
+                    }
+                    if ((w_ & 0xE0000003u) == 2u) {
+                        const u32 tgt_ = w_ & 0x1FFFFFFCu;
+                        if (gcm_io2ea(tgt_)) {
+                            last = off; s_fifo_calloff = off + 4u; off = tgt_; budget--;
+                            if (g_wp_fl > 0) g_wp_cmds++;
+                            if (pp_) s_pp.nop++;
+                            break;
+                        }
+                    }
+                }
+                int ni_ = 0;   /* walk108: type 2 (non-incrementing) command, the same engine call the slow path makes for it */
+                if (w_ & 0xE0000003u) { if (bni_ && (w_ & 0xE0000003u) == 0x40000000u) ni_ = 1; else { if (pp_) s_pp.brk[0]++; break; } }
                 const u32 count_ = (w_ >> 18) & 0x7FF;
-                if (!count_ || ((w_ >> 13) & 7u)) break;
+                if (!count_) {
+                    if (bnop_ && !ni_ && w_ != 0x00020000u) {   /* walk108: a command with no words (zero padding): the slow path only steps over it (RET, 0x00020000, stays there) */
+                        last = off; off += 4u; budget--;
+                        if (g_wp_fl > 0) g_wp_cmds++;
+                        if (pp_) s_pp.nop++;
+                        continue;
+                    }
+                    if (pp_) s_pp.brk[1]++;
+                    break;
+                }
+                if ((w_ >> 13) & 7u) { if (pp_) s_pp.brk[1]++; break; }
                 const u32 method_ = w_ & 0x1FFCu;
                 const u32 nxt = off + 4u + count_ * 4u;
-                if ((u64)nxt > pg_end || (off < put && nxt > put)) break;
-                if (rsx_draw_engine_upload_window(method_, count_)) {
+                if ((u64)nxt > pg_end || (off < put && nxt > put)) { if (pp_) s_pp.brk[2]++; break; }
+                unsigned long long ta_ = 0; int cl_ = 0;
+                int win_;
+                if (ni_) win_ = 0;
+                else if (p2_ && (g_wp2_bits & 1)) { win_ = gcm_win_inline(method_, count_);
+                           if (p2_ == 2) { g_wp2_chk++; if (win_ != rsx_draw_engine_upload_window(method_, count_)) g_wp2_mis++; } }
+                else win_ = rsx_draw_engine_upload_window(method_, count_);
+                if (win_) {
+                    if (pp_) { ta_ = __rdtsc(); cl_ = gcm_pp_cls(method_, count_); }
                     if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_upload_run(method_, count_, hp + 4); g_wp_c[1] += __rdtsc() - a_; g_wp_runs++; g_wp_runw += count_; }
                     else rsx_draw_engine_upload_run(method_, count_, hp + 4);
                 } else {
-                    const u32 mend_ = method_ + count_ * 4u;
+                    const u32 mend_ = ni_ ? method_ + 4u : method_ + count_ * 4u;
                     if (mend_ > 0x2000u || (method_ < 0x70u && mend_ > 0x50u) || (method_ < 0x1A8u + 4u && mend_ > 0x1A8u) ||
                         (method_ < 0x17CCu && mend_ > 0x17C8u) || (method_ < 0x1804u && mend_ > 0x1800u) ||
-                        (method_ < 0x1D78u && mend_ > 0x1D6Cu)) break;
-                    if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_method_run(method_, count_, 1, hp + 4); g_wp_c[4] += __rdtsc() - a_; g_wp_meths += count_; }
-                    else rsx_draw_engine_method_run(method_, count_, 1, hp + 4);
+                        (method_ < 0x1D78u && mend_ > 0x1D6Cu)) { if (pp_) s_pp.brk[3]++; break; }
+                    if (pp_) { ta_ = __rdtsc(); cl_ = gcm_pp_cls(method_, count_); }
+                    if (g_wp_fl) { const unsigned long long a_ = __rdtsc(); rsx_draw_engine_method_run(method_, count_, ni_ ? 0 : 1, hp + 4); g_wp_c[4] += __rdtsc() - a_; g_wp_meths += count_; }
+                    else if (rsx_dispatch_direct_ok()) rsx_dispatch_direct_run(method_, count_, ni_ ? 0 : 1, hp + 4);   /* walk109: RSX_DISP_DIRECT */
+                    else rsx_draw_engine_method_run(method_, count_, ni_ ? 0 : 1, hp + 4);
                 }
+                if (pp_) { const unsigned long long tb_ = __rdtsc(); s_pp.dec[cl_] += ta_ - tp_; s_pp.call[cl_] += tb_ - ta_; tp_ = tb_; s_pp.cmds[cl_]++; s_pp.words[cl_] += count_; }
                 if (g_wp_fl > 0) g_wp_cmds++;
                 last = off; off = nxt; budget--;
             }
+            if (pp_ && off == off0) { s_pp.blk_noprog++; s_slow_t0 = __rdtsc(); s_pp.slow_n++; }
             if (off != off0) {
                 if (last < put) s_last_ring_off = last + 4;
                 s_fifo_getoff = off;
@@ -2192,6 +2342,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_i++;
         u32 type = w >> 29;
         if (g_wp_fl > 0) g_wp_cmds++;
+        if (s_pp_on > 0) s_pp.slowk[type == 1 ? 0 : (w & 3) == 2 ? 1 : w == 0x00020000u ? 2 : (w & 0xFFFF0000u) == 0xFEAD0000u ? 7 : type == 0 && !((w >> 18) & 0x7FF) ? 3 : type == 2 ? 4 : type == 0 && ((w >> 13) & 7) ? 5 : 6]++;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -2360,6 +2511,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            if (s_pp_on > 0) { s_pp.slowm[(method >> 2) & 2047]++; s_pp.slow_w += count; }
             /* GCM_SUB1_STATS=1: commands and words seen on subchannel 1, per method, every 5 s. */
             { static int s1st = -1; static u64 t0; static u32 nb, nw; static u32 mc[2048];
               if (s1st < 0) s1st = getenv("GCM_SUB1_STATS") ? 1 : 0;

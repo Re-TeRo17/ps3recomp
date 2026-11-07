@@ -45,6 +45,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -133,6 +139,51 @@
 #define DMA_HANDLE_MAIN         0xFEED0001u
 
 u32 g_dsp_mcnt_on, g_dsp_hist_slow[0x800], g_dsp_hist_plain[0x800];   /* RSX_MCNT=1: per-method call counts */
+
+/* ---- RSX_WALK_PROF=1 (walk107): where the words of the VP constant window (0x1F00-0x1F7C) and of the other methods go. Walker thread only.
+ * wc[]: 0 upload_run const words, 1 upload_run program words, 2 single-method const words (rsx_dispatch_method), 3 single 0x1EFC,
+ * 4 single program words, 5 single other, 6 state_run words, 7 const_run (RSX_VPC_BLOCK) words, 8 const_run calls, 9 upload_run calls (const),
+ * 10 single-method calls, 11 plain_run words, 12 const_run words refused (fell back). singles[]: histogram of the single-method words. */
+int g_dsp_wc_on = -1;
+static unsigned long long s_wc[16], s_wc_sing[0x800];
+#define WC_ON() (g_dsp_wc_on > 0)
+static void dsp_wc_env(void)
+{
+    const char* w = getenv("RSX_WALK_PROF"), *e3 = getenv("RSX_WPROF");
+    g_dsp_wc_on = ((w && w[0] && w[0] != '0') || (e3 && e3[0] == '3')) ? 1 : 0;
+}
+/* RSX_VPC_BLOCK: 0 off (default), 1 on, 2 check (both paths, compare, keep the old result). */
+static int s_vpc_mode = -1;
+static int s_vpc_mism, s_vpc_chk;
+static void dsp_vpc_env(void)
+{
+    const char* e = getenv("RSX_VPC_BLOCK");
+    s_vpc_mode = (e && e[0]) ? atoi(e) : 0;
+    if (s_vpc_mode < 0 || s_vpc_mode > 2) s_vpc_mode = 0;
+    if (s_vpc_mode) fprintf(stderr, "[vpcblock] RSX_VPC_BLOCK=%d: runs into the VP constant window go over in blocks (SIMD byteswap)%s\n", s_vpc_mode, s_vpc_mode == 2 ? ", CHECK" : "");
+}
+void rsx_dsp_wc_pass_end(unsigned frame)
+{
+    if (g_dsp_wc_on <= 0) return;
+    static unsigned f0; static unsigned long long l[16], ls[0x800]; static unsigned long long t0;
+    const unsigned long long now = GetTickCount64();
+    if (!t0) { t0 = now; f0 = frame; memcpy(l, s_wc, sizeof l); memcpy(ls, s_wc_sing, sizeof ls); return; }
+    if (now - t0 < 2000) return;
+    const double N = frame > f0 ? (double)(frame - f0) : 1.0;
+    unsigned long long d[16]; for (int i = 0; i < 16; i++) d[i] = s_wc[i] - l[i];
+    fprintf(stderr, "[walkprof4] words/frame: upload_run const %.0f prog %.0f | single const %.0f 0x1EFC %.0f prog %.0f other %.0f | state_run %.0f | const_run %.0f (calls %.0f, refused %.0f) | upload_run const calls %.0f single calls %.0f | vpc_block %d checked %d mism %d\n",
+            d[0] / N, d[1] / N, d[2] / N, d[3] / N, d[4] / N, d[5] / N, d[6] / N, d[7] / N, d[8] / N, d[12] / N, d[9] / N, d[10] / N, s_vpc_mode, s_vpc_chk, s_vpc_mism);
+    fprintf(stderr, "[walkprof4] singles top:");
+    unsigned long long cp[0x800]; for (int i = 0; i < 0x800; i++) cp[i] = s_wc_sing[i] - ls[i];
+    for (int k = 0; k < 14; k++) {
+        unsigned long long best = 0; unsigned bi = 0;
+        for (unsigned i = 0; i < 0x800; i++) if (cp[i] > best) { best = cp[i]; bi = i; }
+        if (!best) break;
+        fprintf(stderr, " %04X x%.0f", bi * 4u, (double)best / N); cp[bi] = 0;
+    }
+    fputc('\n', stderr);
+    memcpy(l, s_wc, sizeof l); memcpy(ls, s_wc_sing, sizeof ls); t0 = now; f0 = frame;
+}
 static u32 dma_to_location(u32 handle)
 {
     return handle == DMA_HANDLE_MAIN ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
@@ -159,6 +210,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     g_rsx_dsp_vtx_gen++;
     memset(rsx, 0, sizeof(*rsx));
+    memset(rsx->reg_dirty, 0xFF, sizeof rsx->reg_dirty);   /* walk108: everything is new to the snapshot */
     if (sink)
         rsx->sink = *sink;
 
@@ -248,6 +300,7 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
+    memset(rsx->reg_dirty, 0xFF, sizeof rsx->reg_dirty);
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -292,6 +345,7 @@ static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
 {
     u32 w; memcpy(&w, &v, 4);
     rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2] = w;
+    rsx_dsp_dirty_range(rsx, (M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2, 1);
 }
 
 static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
@@ -420,6 +474,7 @@ static int imm_flush(rsx_dispatch* rsx, u32 saved[RSX_DSP_NUM_VERTEX_ATTR])
         /* type 2 (float), size 4, stride 0 = tightly packed; 0x2 = disabled */
         rsx->regs[(M_VTXFMT >> 2) + a] = (s_imm_touched & (1u << a)) ? 0x42u : 0x2u;
     }
+    rsx_dsp_dirty_range(rsx, M_VTXFMT >> 2, RSX_DSP_NUM_VERTEX_ATTR);
     g_rsx_dsp_vtx_gen++;
     if (log) { static int n = 0; if (n < 40 && ++n)
         fprintf(stderr, "[imm] prim=%u verts=%u attrs=0x%04X bytes=%u v0=(%g %g %g %g)\n", rsx->current_primitive,
@@ -431,6 +486,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
     if (g_dsp_mcnt_on) g_dsp_hist_slow[(method >> 2) & 0x7FF]++;
+    if (g_dsp_wc_on < 0) dsp_wc_env();
+    if (WC_ON()) {
+        s_wc[10]++; s_wc_sing[(method >> 2) & 0x7FF]++;
+        if (method >= 0x1F00u && method < 0x1F80u) s_wc[2]++;
+        else if (method == 0x1EFCu) s_wc[3]++;
+        else if (method >= 0x0B80u && method < 0x0C00u) s_wc[4]++;
+        else s_wc[5]++;
+    }
     const u32 idx = method >> 2;
     /* regs[] covers methods 0..0xFFFC (subchannel bits included). A larger
      * value is not a method -- and indexing with it wrote past regs[] into
@@ -446,6 +509,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
     if (dsp_vtx_tracked(method) && rsx->regs[idx] != arg) g_rsx_dsp_vtx_gen++;
     rsx->regs[idx] = arg;
+    rsx->reg_dirty[idx >> 10] |= 1ull << ((idx >> 4) & 63u);   /* walk108 */
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00)) {
         vtx_const_fold(rsx, method, arg);
@@ -459,6 +523,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_INST && method < M_VP_UPLOAD_INST + 32 * 4) {
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        rsx_dsp_dirty_range(rsx, M_VP_UPLOAD_FROM_ID >> 2, 1);
         const u32 pos = *load * 4 + lane;
         if (pos < RSX_DSP_VP_WORDS) {
             rsx->vp[pos] = arg;
@@ -533,6 +598,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                 {
                     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
                         rsx->regs[(M_VTXFMT >> 2) + a] = imm_saved[a];
+                    rsx_dsp_dirty_range(rsx, M_VTXFMT >> 2, RSX_DSP_NUM_VERTEX_ATTR);
                     g_rsx_dsp_vtx_gen++;
                 }
             imm_reset();
@@ -603,12 +669,142 @@ static inline u32 dsp_be32(const u8* p)
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
 }
 
+/* ---- RSX_VPC_BLOCK (walk107): a run of words in the VP constant window, in blocks. ----------------------------------------------------
+ * The title writes its constants as ONE command that starts at TRANSFORM_CONSTANT_LOAD (0x1EFC) and goes on over 0x1F00..: the run never lies
+ * wholly inside the window, so rsx_dispatch_upload_run refused it and every word went through rsx_draw_engine_method / rsx_dispatch_method
+ * (21-24 ns each). Here the part of a run inside 0x1F00-0x1F7C is stored at once: byteswapped into regs[], the same words copied into
+ * constants[] (constants[slot][lane] is flat: word w goes to flat index slot0*4 + w), const_lo/hi updated once, const_gen += words written.
+ * Same result as the word-by-word path of rsx_dispatch_method / upload_run, which stays as the reference (RSX_VPC_BLOCK=2 runs both and compares). */
+static void dsp_bswap_copy(u32* dst, const u8* be, u32 n)
+{
+    u32 i = 0;
+#if defined(__SSSE3__) || (defined(__AVX2__))
+    const __m128i sh = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (; i + 4 <= n; i += 4) {
+        const __m128i v = _mm_loadu_si128((const __m128i*)(be + i * 4u));
+        _mm_storeu_si128((__m128i*)(dst + i), _mm_shuffle_epi8(v, sh));
+    }
+#endif
+    for (; i < n; i++) { u32 v; memcpy(&v, be + i * 4u, 4); dst[i] = __builtin_bswap32(v); }
+}
+
+/* reference: what rsx_dispatch_upload_run does for a run wholly inside the constant window */
+static void dsp_const_ref(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
+{
+    const u32 slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+    const u32 mark = g_rsx_canvas_mark;
+    u32 word = (method - M_VP_UPLOAD_CONST) >> 2, written = 0;
+    for (u32 i = 0; i < count; i++, word++) {
+        const u32 v = dsp_be32(be + i * 4u);
+        rsx->regs[(method >> 2) + i] = v;
+        const u32 slot = slot0 + (word >> 2);
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
+            rsx->constants[slot][word & 3] = v;
+            written++;
+            if (slot < rsx->const_lo) rsx->const_lo = slot;
+            if (slot > rsx->const_hi) rsx->const_hi = slot;
+            if (mark) dsp_canvas_mark(rsx, slot, word & 3, v);
+        }
+    }
+    rsx->const_gen += written;
+}
+
+static void dsp_const_blk(rsx_dispatch* rsx, u32 method, u32 n, const u8* be)
+{
+    u32* r = &rsx->regs[method >> 2];
+    dsp_bswap_copy(r, be, n);
+    const u32 slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+    const u32 w0 = (method - M_VP_UPLOAD_CONST) >> 2;
+    const u64 fi = (u64)slot0 * 4u + w0, fmax = (u64)RSX_DSP_NUM_CONSTANTS * 4u;
+    if (fi >= fmax) return;
+    u32 valid = n; if (fi + valid > fmax) valid = (u32)(fmax - fi);
+    memcpy(&rsx->constants[0][0] + fi, r, (size_t)valid * 4u);
+    const u32 lo = slot0 + (w0 >> 2), hi = slot0 + ((w0 + valid - 1u) >> 2);
+    if (lo < rsx->const_lo) rsx->const_lo = lo;
+    if (hi > rsx->const_hi) rsx->const_hi = hi;
+    rsx->const_gen += valid;
+}
+
+/* The part of the run [method, method+count*4) that lies in 0x1F00-0x1F7C, from `method` (which is inside it); returns the words taken. */
+static u32 dsp_const_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
+{
+    static int log = -1;
+    if (log < 0) log = getenv("RSX_CONST_LOG") ? 1 : 0;
+    u32 n = (M_VP_UPLOAD_CONST + 32u * 4u - method) >> 2; if (n > count) n = count;
+    if (log || g_rsx_canvas_mark) { if (WC_ON()) s_wc[12] += n; return 0; }
+    if (s_vpc_mode == 2) {
+        const u32 w0 = (method - M_VP_UPLOAD_CONST) >> 2, slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        u32 regs0[32], regs1[32];
+        const u32 mi = method >> 2;
+        memcpy(regs0, &rsx->regs[mi], n * 4u);
+        const u32 lo0 = rsx->const_lo, hi0 = rsx->const_hi, gen0 = rsx->const_gen, cm0 = rsx->canvas_mark_at;
+        const u32 s_lo = slot0 + (w0 >> 2), s_hi = slot0 + ((w0 + n - 1u) >> 2);
+        const u32 ns = (s_lo < RSX_DSP_NUM_CONSTANTS) ? ((s_hi < RSX_DSP_NUM_CONSTANTS ? s_hi : RSX_DSP_NUM_CONSTANTS - 1u) - s_lo + 1u) : 0u;
+        u32 c0[9][4], c1[9][4];   /* a run inside the window (<= 32 words) touches at most 8 slots */
+        const u32 nsc = ns > 9 ? 9u : ns;
+        if (nsc) memcpy(c0, rsx->constants[s_lo], nsc * 16u);
+        dsp_const_ref(rsx, method, n, be);                                 /* the old result, left in place */
+        memcpy(regs1, &rsx->regs[mi], n * 4u);
+        const u32 lo1 = rsx->const_lo, hi1 = rsx->const_hi, gen1 = rsx->const_gen, cm1 = rsx->canvas_mark_at;
+        if (nsc) memcpy(c1, rsx->constants[s_lo], nsc * 16u);
+        memcpy(&rsx->regs[mi], regs0, n * 4u);                             /* back to the state before, then the block path */
+        rsx->const_lo = lo0; rsx->const_hi = hi0; rsx->const_gen = gen0; rsx->canvas_mark_at = cm0;
+        if (nsc) memcpy(rsx->constants[s_lo], c0, nsc * 16u);
+        dsp_const_blk(rsx, method, n, be);
+        int bad = memcmp(&rsx->regs[mi], regs1, n * 4u) != 0 || rsx->const_lo != lo1 || rsx->const_hi != hi1 || rsx->const_gen != gen1 || rsx->canvas_mark_at != cm1;
+        if (nsc && memcmp(rsx->constants[s_lo], c1, nsc * 16u)) bad = 1;
+        if (bad) {
+            s_vpc_mism++;
+            if (s_vpc_mism <= 8) fprintf(stderr, "[vpcblock] MISMATCH method 0x%04X n %u slot0 %u: lo %u/%u hi %u/%u gen %u/%u\n", method, n, slot0, rsx->const_lo, lo1, rsx->const_hi, hi1, rsx->const_gen, gen1);
+            memcpy(&rsx->regs[mi], regs1, n * 4u);                         /* keep the old path's answer */
+            rsx->const_lo = lo1; rsx->const_hi = hi1; rsx->const_gen = gen1; rsx->canvas_mark_at = cm1;
+            if (nsc) memcpy(rsx->constants[s_lo], c1, nsc * 16u);
+        }
+        s_vpc_chk++;
+    } else {
+        dsp_const_blk(rsx, method, n, be);
+    }
+    if (WC_ON()) { s_wc[7] += n; s_wc[8]++; }
+    return n;
+}
+
+/* program window (0x0B80-0x0BFC): the old per-word loop (reference) and the block version */
+static void dsp_inst_ref(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
+{
+    u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+    for (u32 i = 0; i < count; i++) {
+        const u32 m = method + i * 4u, v = dsp_be32(be + i * 4u);
+        rsx->regs[m >> 2] = v;
+        const u32 lane = ((m - M_VP_UPLOAD_INST) >> 2) & 3;
+        const u32 pos = *load * 4 + lane;
+        if (pos < RSX_DSP_VP_WORDS) { rsx->vp[pos] = v; rsx->vp_gen++; }
+        if (lane == 3) (*load)++;
+    }
+}
+static void dsp_inst_blk(rsx_dispatch* rsx, u32 method, u32 n, const u8* be)
+{
+    u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+    dsp_bswap_copy(&rsx->regs[method >> 2], be, n);
+    const u32 lane0 = ((method - M_VP_UPLOAD_INST) >> 2) & 3u;
+    const u32 l0 = *load;                                /* read after the register copy: the run can include FROM_ID itself? (no: window only) */
+    const u64 pos0 = (u64)l0 * 4u + lane0;
+    if (pos0 < RSX_DSP_VP_WORDS) {
+        u32 nv = n; if (pos0 + nv > RSX_DSP_VP_WORDS) nv = (u32)(RSX_DSP_VP_WORDS - pos0);
+        memcpy(&rsx->vp[pos0], &rsx->regs[method >> 2], (size_t)nv * 4u);
+        rsx->vp_gen += nv;
+    }
+    *load = l0 + ((lane0 + n) >> 2);
+}
+
 int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
 {
     static int log = -1;
     if (log < 0) log = getenv("RSX_CONST_LOG") ? 1 : 0;
     if (log || !count) return 0;
     const u32 end = method + count * 4u;
+    rsx_dsp_dirty_range(rsx, method >> 2, count); rsx_dsp_dirty_range(rsx, M_VP_UPLOAD_FROM_ID >> 2, 1);   /* walk108 */
+    if (g_dsp_wc_on < 0) dsp_wc_env();
+    if (WC_ON()) { if (method >= M_VP_UPLOAD_CONST) { s_wc[0] += count; s_wc[9]++; } else s_wc[1] += count; }
     if (method >= M_VP_UPLOAD_CONST && end <= M_VP_UPLOAD_CONST + 32u * 4u) {
         const u32 slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
         const u32 mark = g_rsx_canvas_mark;
@@ -630,6 +826,27 @@ int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* 
     }
     if (method >= M_VP_UPLOAD_INST && end <= M_VP_UPLOAD_INST + 32u * 4u) {
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        if (s_vpc_mode < 0) dsp_vpc_env();
+        if (s_vpc_mode > 0 && count <= 32u) {
+            /* RSX_VPC_BLOCK: the program words of the run in one block (positions are consecutive: pos0 + i, the load pointer advances once per 4 lanes) */
+            if (s_vpc_mode == 2) {
+                const u32 mi = method >> 2; u32 r0[32], r1[32], v0[32], v1[32];
+                const u32 l0 = *load, g0 = rsx->vp_gen, pos0 = l0 * 4u + (((method - M_VP_UPLOAD_INST) >> 2) & 3u);
+                u32 nv = pos0 < RSX_DSP_VP_WORDS ? (RSX_DSP_VP_WORDS - pos0 < count ? RSX_DSP_VP_WORDS - pos0 : count) : 0u;
+                memcpy(r0, &rsx->regs[mi], count * 4u); if (nv) memcpy(v0, &rsx->vp[pos0], nv * 4u);
+                dsp_inst_ref(rsx, method, count, be);
+                memcpy(r1, &rsx->regs[mi], count * 4u); if (nv) memcpy(v1, &rsx->vp[pos0], nv * 4u);
+                const u32 l1 = *load, g1 = rsx->vp_gen;
+                memcpy(&rsx->regs[mi], r0, count * 4u); if (nv) memcpy(&rsx->vp[pos0], v0, nv * 4u); *load = l0; rsx->vp_gen = g0;   /* back, then the block */
+                *load = l0; dsp_inst_blk(rsx, method, count, be);
+                const int bad = memcmp(&rsx->regs[mi], r1, count * 4u) || (nv && memcmp(&rsx->vp[pos0], v1, nv * 4u)) || *load != l1 || rsx->vp_gen != g1;
+                if (bad) { s_vpc_mism++; if (s_vpc_mism <= 8) fprintf(stderr, "[vpcblock] MISMATCH inst method 0x%04X n %u load %u/%u gen %u/%u\n", method, count, *load, l1, rsx->vp_gen, g1);
+                           memcpy(&rsx->regs[mi], r1, count * 4u); if (nv) memcpy(&rsx->vp[pos0], v1, nv * 4u); *load = l1; rsx->vp_gen = g1; }
+                s_vpc_chk++;
+            } else dsp_inst_blk(rsx, method, count, be);
+            if (WC_ON()) s_wc[13] += count;
+            return 1;
+        }
         for (u32 i = 0; i < count; i++) {
             const u32 m = method + i * 4u, v = dsp_be32(be + i * 4u);
             rsx->regs[m >> 2] = v;
@@ -660,6 +877,7 @@ int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* b
     if (!((method >= 0x1A00u && end <= 0x1C00u) || (method >= 0x1680u && end <= 0x16C0u) ||
           (method >= 0x1740u && end <= 0x1780u)))
         return 0;
+    rsx_dsp_dirty_range(rsx, method >> 2, count);   /* walk108 */
     u32* r = &rsx->regs[method >> 2];
     for (u32 i = 0; i < count; i++) {
         const u32 v = dsp_be32(be + i * 4u);
@@ -673,6 +891,8 @@ int rsx_dispatch_plain_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* b
  * it) does nothing for but store the word and count a change of a vertex-tracked register: not a constant fold,
  * not an upload window, not a case of the switch, not an engine-side special (queries, semaphore release,
  * snapshot stats, branch bits). Built once; a run of them outside BEGIN/END is stored in one loop. */
+extern rsx_dispatch* g_rsx_dsp_main;
+void rsx_dispatch_main_note(rsx_dispatch* rsx);
 static unsigned char s_plain[0x800];
 static int s_plain_ready;
 static void dsp_plain_build(void)
@@ -703,10 +923,47 @@ static void dsp_plain_build(void)
  * BEGIN/END is refused (imm_note wants to see each word). */
 u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, const u8* be)
 {
+    if (!g_rsx_dsp_main) rsx_dispatch_main_note(rsx);
     if (rsx->in_begin_end) return 0;
     if (!s_plain_ready) dsp_plain_build();
+    if (method < 0x10000u) rsx_dsp_dirty_range(rsx, method >> 2, incr ? count : 1u);   /* walk108: over-marks when the run stops early */
     u32 i = 0;
     if (incr) {
+        if (s_vpc_mode < 0) dsp_vpc_env();
+        if (s_vpc_mode > 0) {
+            /* RSX_VPC_BLOCK: plain words, then the constant window in one block, alternating over the whole run */
+            u32 tot = 0;
+            while (tot < count) {
+                const u32 m = method + tot * 4u;
+                if (m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) {
+                    const u32 k = dsp_const_run(rsx, m, count - tot, be + tot * 4u);
+                    if (!k) break;
+                    tot += k;
+                    continue;
+                }
+                if (m >= 0x2000u) break;
+                const unsigned char* cl = &s_plain[m >> 2];
+                u32* r = &rsx->regs[m >> 2];
+                u32 lim = count - tot;
+                if (m + lim * 4u > 0x2000u) lim = (0x2000u - m) >> 2;
+                if (m < M_VP_UPLOAD_CONST && m + lim * 4u > M_VP_UPLOAD_CONST) lim = (M_VP_UPLOAD_CONST - m) >> 2;   /* stop at the window */
+                u32 j = 0, chg = 0;
+                for (; j < lim; j++) {
+                    const unsigned c = cl[j];
+                    if (!c) break;
+                    u32 v; memcpy(&v, be + (tot + j) * 4u, 4);
+                    v = __builtin_bswap32(v);
+                    chg += (c == 2u) & (r[j] != v);
+                    if (g_dsp_mcnt_on) g_dsp_hist_plain[((m >> 2) + j) & 0x7FF]++;
+                    r[j] = v;
+                }
+                if (chg) g_rsx_dsp_vtx_gen++;
+                tot += j;
+                if (WC_ON()) s_wc[6] += j;
+                if (j < lim || !j) break;   /* a non-plain word (or the end): back to the caller */
+            }
+            return tot;
+        }
         /* one pass over a consecutive run: class byte per register (1 plain, 2 plain + vertex-tracked) */
         if (method >= 0x2000u || method + count * 4u > 0x2000u) {
             for (; i < count; i++) {
@@ -732,6 +989,7 @@ u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, c
             r[i] = v;
         }
         if (chg) g_rsx_dsp_vtx_gen++;
+        if (WC_ON()) s_wc[6] += i;
         return i;
     }
     for (; i < count; i++) {
@@ -743,6 +1001,56 @@ u32 rsx_dispatch_state_run(rsx_dispatch* rsx, u32 method, u32 count, int incr, c
         *r = v;
     }
     return i;
+}
+
+/* RSX_DISP_DIRECT=1 (walk109): the walker's block loop hands a command straight to the dispatcher instead of going through
+ * rsx_draw_engine_method_run -> eng_method_run_impl -> rsx_draw_engine_method -> eng_method_impl for every word. Per-command
+ * overhead measured at Apogee: ~30.000 one-word commands (0x1824 index batch x19.4K, 0x1808 begin/end x10.8K, 0x1814 x1K) and ~15.000
+ * short runs per frame. The engine wrapper does nothing for these but store/forward (hist and trace are env diagnostics, the capture
+ * flag is tested here too, queries/branch bits/invalidate stats are the excluded methods below), so the call order and effect are the
+ * same as the wrapper's. The dispatcher pointer is the one the engine passed to rsx_dispatch_state_run the first time (the engine only
+ * calls it once g.ready); until then, and whenever a diagnostic or a capture is on, 0 is returned and the caller uses the engine path. */
+rsx_dispatch* g_rsx_dsp_main;
+extern int g_rsx_capture_on;
+extern int g_wkp_on;
+extern void rsx_draw_engine_method(u32 method, u32 arg);
+extern int rsx_wkp_enter(int b);
+extern void rsx_wkp_leave(int o);
+void rsx_dispatch_main_note(rsx_dispatch* rsx) { if (!g_rsx_dsp_main) g_rsx_dsp_main = rsx; }
+int rsx_dispatch_direct_ok(void)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        const char* e = getenv("RSX_DISP_DIRECT");
+        ok = (e && e[0] && e[0] != '0' && !getenv("RSX_METHOD_HIST") && !getenv("RSX_MCNT") && !getenv("RSX_METHOD_TRACE_FRAME") && !getenv("RSX_FIFO_RUN_SLOW")) ? 1 : 0;
+        if (e && e[0] && e[0] != '0') fprintf(stderr, "[walker] RSX_DISP_DIRECT=%s: %s\n", e, ok ? "block-loop commands go straight to the dispatcher" : "refused (a per-method diagnostic is on)");
+    }
+    return ok && g_rsx_dsp_main && !g_rsx_capture_on;
+}
+int rsx_dispatch_direct_run(u32 method, u32 count, int incr, const u8* be)
+{
+    rsx_dispatch* const rsx = g_rsx_dsp_main;
+    const int wo = g_wkp_on > 0 ? rsx_wkp_enter(1 /* WKP_DISP */) : -1;
+    if (count == 1) {
+        const u32 m = method & 0x1FFCu;
+        if (m == 0x1824u || m == 0x1808u || m == 0x1814u || m == 0x1818u) {
+            rsx_dispatch_method(rsx, m, dsp_be32(be));
+            if (wo >= 0) rsx_wkp_leave(wo);
+            return 1;
+        }
+    }
+    u32 i = 0;
+    while (i < count) {
+        i += rsx_dispatch_state_run(rsx, incr ? method + i * 4u : method, count - i, incr, be + i * 4u);
+        if (i >= count) break;
+        const u32 m = (incr ? method + i * 4u : method) & 0x1FFCu;
+        const u32 arg = dsp_be32(be + i * 4u);
+        if (m == 0x1824u || m == 0x1808u || m == 0x1814u || m == 0x1818u) rsx_dispatch_method(rsx, m, arg);
+        else rsx_draw_engine_method(m, arg);
+        i++;
+    }
+    if (wo >= 0) rsx_wkp_leave(wo);
+    return 1;
 }
 
 /* ---- getters ----------------------------------------------------------- */

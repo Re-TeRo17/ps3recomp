@@ -208,6 +208,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
  * adopted inside the callee cannot leak into the caller's continuation. A
  * persistent LS-0xA00 workload module (module_img_a00) is re-applied since the
  * plain restore would undo it. */
+#undef spu_img_restore
 void spu_img_restore(spu_context* ctx, int32_t saved_img)
 {
     ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;

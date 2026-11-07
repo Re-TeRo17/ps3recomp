@@ -42,6 +42,8 @@ typedef struct DrawSnap {
 
 /* 0 = off (plain path); else bit0 split, bit1 check, bit2 read-log, bit3 (8) draw executor thread B2. Env read once. */
 int  snap_mode(void);
+/* RSX_B2_SLOTS=<n>: slots of the B2 job ring (default 256; 64..1024, power of two). Read once; the VP ring and the constants log scale with it. */
+u32  snap_b2_slots(void);
 void snap_init(void);
 rsx_dispatch* snap_view(void);
 /* D side: capture the state of the draw ending now. Consumes live->const_lo/hi (the draw side owns them afterwards). */
@@ -50,6 +52,8 @@ DrawSnap* snap_fill(rsx_dispatch* live);
 DrawSnap* snap_fill_into(DrawSnap* dst, rsx_dispatch* live);
 /* Draw side: bring `view` up to the state of `s` (view regs not in the whitelist stay poisoned). */
 void snap_apply(const DrawSnap* s, rsx_dispatch* view);
+void snap_apply_v(const DrawSnap* s, rsx_dispatch* view, u32* vp_ver);   /* lane109: apply a job on a lane's private view (vp_ver = that view's VP version cache) */
+void snap_view_copy(rsx_dispatch* dst, const rsx_dispatch* src);   /* lane109: whitelisted registers, scalars, constants (not the VP words) */
 rsx_dispatch* snap_view_new(void);
 void snap_apply_prep(const DrawSnap* s, rsx_dispatch* view, u32* vp_ver);
 /* Diagnostics around one draw (no-ops unless the mode asks). `view` is what the draw reads. */
