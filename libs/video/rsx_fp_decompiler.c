@@ -414,8 +414,15 @@ static const char* input_expr(u32 input_src)
     case 0x0: /* WPOS: the RSX window origin is the bottom-left (the title computes
                * height - y to address top-down depth/colour images), D3D's is the
                * top-left. fp_alpha.y carries the surface height (engine path). */
+    {   /* WPOS.w: the RSX gives 1/w (as GL's gl_FragCoord.w), D3D's SV_Position.w is w. Ratchet ToD's ground fog
+         * (Kreeli) divides WPOS.w by the scene depth read back as colour; with w instead of 1/w the ratio is off by
+         * orders of magnitude and the fog layer saturated to an opaque flat sheet. On by default; RSX_WPOS_W_RCP=0 passes w. */
+        static int rcp = -1; if (rcp < 0) { const char* e = getenv("RSX_WPOS_W_RCP"); rcp = (e && e[0] == '0') ? 0 : 1; }
+        if (rcp) return s_wpos_flip ? "float4(input.position.x, fp_alpha.y - input.position.y, input.position.z, 1.0 / input.position.w)"
+                                    : "float4(input.position.xyz, 1.0 / input.position.w)";
         return s_wpos_flip ? "float4(input.position.x, fp_alpha.y - input.position.y, input.position.zw)"
                            : "input.position";
+    }
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
@@ -431,7 +438,7 @@ static const char* input_expr(u32 input_src)
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
                      int buffered, u32 constant_slot, char* buf, u32 bufsz)
 {
-    char base[96];
+    char base[160];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
@@ -447,7 +454,7 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
             snprintf(base, sizeof(base), "float4(0,0,0,0)");
     }
 
-    char swz[160];
+    char swz[224];
     snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
     const char* pre = "";
