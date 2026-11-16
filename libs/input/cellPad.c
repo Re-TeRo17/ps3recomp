@@ -114,6 +114,8 @@ static volatile int s_host_pad0;            /* a real pad is on port 0 */
 /* g_cellPad_input_block: while non-zero port 0 reads as an untouched pad (nothing
  * pressed, sticks centred) -- the port's overlay owns the input. */
 volatile int g_cellPad_input_block;
+/* alert10: called once per GetData of port 0 with the words handed to the guest (after PAD_REPLAY): may clear bits / centre sticks */
+void (*volatile g_cellPad_filter)(u16* button);
 
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user)
 {
@@ -131,6 +133,107 @@ int cellPad_host_kind(u32 port)
 /* ---------------------------------------------------------------------------
  * XInput backend
  * -----------------------------------------------------------------------*/
+
+/* Controller remapping (09/11, GitHub issue #26): the buttons of a host controller (XInput or SDL, never the keyboard,
+ * which has its own bindings) are rewritten before the guest sees them.
+ *   TOD_PAD_SWAP_R1R2=1   R1 <-> R2 on every controller (on a DualSense with "fire on R2" on, that swap already
+ *                         happened in the SDL backend and this one is skipped, or the two would cancel out)
+ *   TOD_PAD_SWAP_L1L2=1   L1 <-> L2 on every controller (zoom / strafe on the trigger)
+ *   PAD_MAP=GAME=PAD,...  free mapping in PS3 names: the game's button GAME is pressed with the controller's PAD
+ *                         (e.g. PAD_MAP=R1=R2,R2=R1,CROSS=SQUARE,SQUARE=CROSS). A button not named keeps its own.
+ *                         Names: SELECT L3 R3 START UP RIGHT DOWN LEFT L2 R2 L1 R1 TRIANGLE CIRCLE CROSS SQUARE
+ *                         (Xbox: A=CROSS B=CIRCLE X=SQUARE Y=TRIANGLE LB=L1 RB=R1 LT=L2 RT=R2 VIEW=SELECT MENU=START).
+ * Read again every second, so the F1 page / Options menu change it at once. Analog triggers follow: a game trigger fed
+ * by a physical trigger keeps its pull, fed by a button it reads full. */
+static const char* const kPadNames[16] = { "SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT",
+                                           "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE" };
+static int pad_name_bit(const char* s, size_t n)
+{
+    static const struct { const char* a; int b; } alias[] = { { "A", 14 }, { "B", 13 }, { "X", 15 }, { "Y", 12 }, { "LB", 10 },
+        { "RB", 11 }, { "LT", 8 }, { "RT", 9 }, { "VIEW", 0 }, { "BACK", 0 }, { "MENU", 3 }, { "OPTIONS", 3 } };
+    for (int b = 0; b < 16; b++) if (strlen(kPadNames[b]) == n && !_strnicmp(s, kPadNames[b], n)) return b;
+    for (unsigned k = 0; k < sizeof alias / sizeof alias[0]; k++) if (strlen(alias[k].a) == n && !_strnicmp(s, alias[k].a, n)) return alias[k].b;
+    return -1;
+}
+static u16  s_map_src[16];          /* the controller buttons that press the game's button b */
+static int  s_map_identity = 1, s_map_swap_r = 0;
+static void pad_map_refresh(void)
+{
+    static ULONGLONG last = 0; static char prev[512] = "\x01";
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 1000) return;
+    last = now;
+    const char* m = getenv("PAD_MAP"); const char* r = getenv("TOD_PAD_SWAP_R1R2"); const char* l = getenv("TOD_PAD_SWAP_L1L2");
+    char key[512];
+    snprintf(key, sizeof key, "%s|%s|%s", m ? m : "", r ? r : "", l ? l : "");
+    if (!strcmp(key, prev)) return;
+    snprintf(prev, sizeof prev, "%s", key);
+    u16 src[16];
+    for (int b = 0; b < 16; b++) src[b] = (u16)(1u << b);
+    const int sr = r && r[0] == '1', sl = l && l[0] == '1';
+    if (sl) { src[8] = (u16)(1u << 10); src[10] = (u16)(1u << 8); }
+    int bad = 0;
+    for (const char* p = m; p && *p; ) {
+        const char* e = strchr(p, ','); const size_t len = e ? (size_t)(e - p) : strlen(p);
+        const char* eq = (const char*)memchr(p, '=', len);
+        if (eq) {
+            const char* a = p; size_t an = (size_t)(eq - p); const char* b = eq + 1; size_t bn = len - an - 1;
+            while (an && (*a == ' ')) { a++; an--; } while (an && a[an - 1] == ' ') an--;
+            while (bn && (*b == ' ')) { b++; bn--; } while (bn && b[bn - 1] == ' ') bn--;
+            const int g = pad_name_bit(a, an), ph = pad_name_bit(b, bn);
+            if (g >= 0 && ph >= 0) src[g] = (u16)(1u << ph); else bad++;
+        } else if (len) bad++;
+        p = e ? e + 1 : NULL;
+    }
+    int ident = 1;   /* the map without the R1/R2 swap (that one depends on the port) */
+    for (int b = 0; b < 16; b++) { s_map_src[b] = src[b]; if (src[b] != (u16)(1u << b)) ident = 0; }
+    s_map_swap_r = sr; s_map_identity = ident;
+    fprintf(stderr, "[pad] remap: swap R1/R2 %s, L1/L2 %s, PAD_MAP \"%s\"%s\n", sr ? "on" : "off", sl ? "on" : "off",
+            m ? m : "", bad ? " (some entries not understood)" : "");
+}
+/* skip_r: this port already traded R1 / R2 (DualSense "fire on R2") */
+static void pad_host_remap(PadHostState* hs, int skip_r)
+{
+    pad_map_refresh();
+    const int do_r = s_map_swap_r && !skip_r;
+    if (s_map_identity && !do_r) return;
+    u16 src[16];
+    memcpy(src, s_map_src, sizeof src);
+    if (do_r) { const u16 t = src[9]; src[9] = src[11]; src[11] = t; }   /* after PAD_MAP: the game's R1 / R2 trade sources */
+    const u16 in = hs->buttons; const u8 tl = hs->trigger_l2, tr = hs->trigger_r2;
+    /* 10/11: the pressure of each physical button travels with it (a DualSense with fire on R2 puts the trigger's pull
+     * in press_r1: an L1/L2 swap on top must not turn it into a full press) */
+    u8 pr[16] = { 0 };
+    pr[4] = hs->press_up; pr[5] = hs->press_right; pr[6] = hs->press_down; pr[7] = hs->press_left;
+    pr[10] = hs->press_l1; pr[11] = hs->press_r1; pr[12] = hs->press_triangle; pr[13] = hs->press_circle;
+    pr[14] = hs->press_cross; pr[15] = hs->press_square; pr[8] = tl; pr[9] = tr;
+    u8 po[16] = { 0 };
+    u16 out = 0; u8 nl = 0, nr = 0;
+    for (int b = 0; b < 16; b++) {
+        if (!(in & src[b])) continue;
+        out |= (u16)(1u << b);
+        { int sb = 0; while (sb < 15 && src[b] != (u16)(1u << sb)) sb++;
+          po[b] = (sb >= 4 && pr[sb]) ? pr[sb] : 255; }   /* a source without pressure (SELECT, START, L3, R3) reads full */
+        if (b == 8 || b == 9) {
+            u8 v = 255;
+            if (src[b] == CELL_PAD_CTRL_L2) v = tl; else if (src[b] == CELL_PAD_CTRL_R2) v = tr;
+            if (b == 8) nl = v; else nr = v;
+        }
+    }
+    hs->buttons = out;
+    hs->trigger_l2 = (out & CELL_PAD_CTRL_L2) ? nl : 0;
+    hs->trigger_r2 = (out & CELL_PAD_CTRL_R2) ? nr : 0;
+    hs->press_up       = (out & CELL_PAD_CTRL_UP)       ? po[4]  : 0;
+    hs->press_down     = (out & CELL_PAD_CTRL_DOWN)     ? po[6]  : 0;
+    hs->press_left     = (out & CELL_PAD_CTRL_LEFT)     ? po[7]  : 0;
+    hs->press_right    = (out & CELL_PAD_CTRL_RIGHT)    ? po[5]  : 0;
+    hs->press_triangle = (out & CELL_PAD_CTRL_TRIANGLE) ? po[12] : 0;
+    hs->press_circle   = (out & CELL_PAD_CTRL_CIRCLE)   ? po[13] : 0;
+    hs->press_cross    = (out & CELL_PAD_CTRL_CROSS)    ? po[14] : 0;
+    hs->press_square   = (out & CELL_PAD_CTRL_SQUARE)   ? po[15] : 0;
+    hs->press_l1       = (out & CELL_PAD_CTRL_L1)       ? po[10] : 0;
+    hs->press_r1       = (out & CELL_PAD_CTRL_R1)       ? po[11] : 0;
+}
 
 #if PAD_BACKEND_XINPUT
 
@@ -228,6 +331,7 @@ static void pad_poll_xinput(void)
         s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        pad_host_remap(&s_host_state[i], 0);   /* issue #26 */
     }
 }
 
@@ -576,6 +680,7 @@ static void pad_sdl_read(PadHostState* st)
         hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
         if (swapped_r1 >= 0 && (btns & CELL_PAD_CTRL_R1)) hs->press_r1 = pad_sdl_trigger_to_u8(swapped_r1);   /* analog fire */
+        pad_host_remap(hs, swapped_r1 >= 0);   /* issue #26: R1/R2 already traded on a DualSense with fire on R2 */
     }
 }
 
@@ -1507,6 +1612,7 @@ emit:
         if (pr < 0) pr = (getenv("PAD_RECORD") || getenv("PAD_REPLAY")) ? 1 : 0;
         if (pr && port_no == 0) padrec_frame(data->button);
     }
+    if (port_no == 0 && g_cellPad_filter) g_cellPad_filter(data->button);   /* alert10: the port's own menu items (tod.exe) */
     { /* PAD_TRACE=1: log every change of the digital words handed to the guest (port 0). */
         static int tr = -1; static u16 l0 = 0xFFFF, l1 = 0xFFFF; static unsigned long long n = 0;
         if (tr < 0) tr = getenv("PAD_TRACE") ? 1 : 0;

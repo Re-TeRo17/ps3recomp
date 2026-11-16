@@ -29,6 +29,7 @@
 #include "rsx_vp_decompiler.h"
 extern volatile int g_rsx_pass_shadow;
 extern volatile u32 g_rsx_pass_cw, g_rsx_pass_ch;
+int rsx_pass_shadow(void); u32 rsx_pass_cw(void); u32 rsx_pass_ch(void);   /* rissa15g: the pass globals, or a lane's own pass (RSX_LANES_PROQ) */
 #ifndef CUT88_DEF_BMUL
 #define CUT88_DEF_BMUL 2.0f   /* cut88 (01/11): D3D12 slope-scaled bias of the Z16 shadow passes x3, bias x2 (RSX_SHADOW_BIAS_FIX=0 = the game's raw values) */
 #define CUT88_DEF_SMUL 3.0f
@@ -163,6 +164,8 @@ typedef struct {
     u32 last_frame;        /* g.frames when last bound or sampled          */
     u32 samp_frame;        /* rissa128: g.frames when a texture unit last read this zeta (snapshot or packed copy); RSX_LANES_ZPRE_SAMP */
     u8 snap_used, pack_used, snap_pre, pack_pre;   /* zmix: copy sampled by a draw since it was made; made by lc_zpre */
+    /* rissa15k RSX_ZSNAP_ALT=1: a second snapshot for a zeta sampled at two sizes (seed 37: 2.5 "other size" lane aborts per busy frame) */
+    u32 snap2, snap2_w, snap2_h; int snap2_valid; u8 snap2_used, snap2_pre;
 } eng_zdepth;
 
 typedef struct {
@@ -259,6 +262,7 @@ static unsigned s_tdec_pass, s_wp_dk;   /* prof102: which pass decodes a texture
 #define WP2_BEGIN(v) unsigned long long v = s_wp_on > 1 ? wp_tsc() : 0
 #define WP2_END(v, k) do { if (s_wp_on > 1) s_wp_cyc[k] += wp_tsc() - (v); } while (0)
 static u32 s_zgen = 1;                                       /* walk37: bumped when a depth target is created or moved to another address */
+static u32 s_zrec_n = 0;                                      /* 14/11 RSX_ZRECYCLE: idle depth targets moved to a new offset */
 static ENG_TLS struct { u32 loc, off, gen; } s_tex_znomatch[16];      /* per texture unit: no depth target at loc/off as of s_zgen */
 static u32 s_surf_gen = 1;                                   /* bumped when the surface set changes */
 static ENG_TLS struct { u32 loc, off, gen; } s_tex_nomatch[16];       /* per texture unit: no surface at loc/off as of gen */
@@ -486,7 +490,7 @@ typedef struct {
     u8 zact[ENG_MAX_ZDEPTHS];                                /* the real packed state of each touched slot after the block's last draw */
     unsigned long long b_miss, e_miss; u32 b_pipes, e_pipes, b_surfs, e_surfs, b_zd, e_zd, b_tex, e_tex;   /* "to do" ledger: counters at open / after the last draw */
 } EngLaneBlock;
-typedef struct { int valid_t; u32 epoch, n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot, sig[8]; } EngLanePro;
+typedef struct { int valid_t; u32 epoch, n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot, sig[8]; int pshadow; u32 pcw, pch; } EngLanePro;   /* pshadow/pcw/pch: the pass globals of that pass (RSX_LANES_PROQ) */
 /* lane111 RSX_LANES_ZOWN: a packed-zeta snapshot object made ahead by the coordinator (dst + its view), handed to a chunk of the pass that writes that zeta */
 typedef struct { u32 dst, view, depth, w, h, remap, fmt, gen; int live; } EngZent;
 /* rissa128 RSX_LANES_VCPRO=1: a vertex-cache entry a lane would promote (key + generation), queued instead of aborting the chunk */
@@ -774,7 +778,7 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
       /* cut88: Z16 shadow passes (g_rsx_pass_shadow: the zeta of the pass is Z16) get their slope/bias multiplied HERE, at draw time:
        * the D3D12 PSO is created/loaded from the cache without knowing the pass, so a multiplier in the PSO builder never acted.
        * RSX_POLY_Z16_MUL (bias) / RSX_POLY_Z16_SMUL (slope). Defaults set below. RSX_CUT88_LOG=1 prints the distinct pairs. */
-      if (rs->poly_offset_fill && g_rsx_pass_shadow) {
+      if (rs->poly_offset_fill && rsx_pass_shadow()) {
           static float zm = -1.f, zs = -1.f; static int lg = -1;
           if (zm < 0.f) { const char* fx = getenv("RSX_SHADOW_BIAS_FIX"); const int fxoff = fx && fx[0] == '0'; const char* e = getenv("RSX_POLY_Z16_MUL"); zm = e ? (float)atof(e) : fxoff ? 1.f : CUT88_DEF_BMUL; if (zm < 0.f) zm = 1.f;
               e = getenv("RSX_POLY_Z16_SMUL"); zs = e ? (float)atof(e) : fxoff ? 1.f : CUT88_DEF_SMUL; if (zs < 0.f) zs = 1.f; lg = getenv("RSX_CUT88_LOG") ? 1 : 0; }
@@ -1075,9 +1079,10 @@ unsigned g_rsx_frame_lock_n, g_rsx_frame_pclock_n, g_rsx_frame_pcsave_n;
 unsigned long long (*g_rsx_parked_hook)(void) = 0;   /* rissa128: bytes of parked MSAA twins (backend) */
 int (*g_rsx_vram_hook)(unsigned long long* used, unsigned long long* budget) = 0;   /* set by the D3D12 backend */
 unsigned long long (*g_rsx_target_info_hook)(u32 handle, int* has_twin) = 0;   /* rissa128 RSX_SURF_POOL2: host bytes of a colour target + whether an MSAA twin hangs on it (D3D12 backend) */
+unsigned long long (*g_rsx_obj_bytes_hook)(u32 handle, unsigned long long* twin) = 0;   /* 14/11 RSX_ZDUMP: host bytes of any object + its MSAA twin (D3D12 backend) */
 unsigned long long (*g_rsx_doomed_hook)(void) = 0;   /* rissa128 RSX_REAP: bytes already queued for release in the backend (not pressure for the governor) */ int (*g_rsx_placed_hook)(u32 handle) = 0; unsigned g_rsx_gov_ev[6];   /* RSX_RT_HEAP / RSX_DS_HEAP (backend): 0 committed, 1 placed in a heap with no MSAA twin (freeing it returns no VRAM), 2 placed with a twin. g_rsx_gov_ev: governor frees [colour committed, colour placed, depth committed, depth placed, colour skipped, depth skipped]; walker only */
 extern void rsx_d3d12_rel_frame(unsigned* rel_n, double* rel_ms, unsigned* reap_n, double* reap_ms, unsigned* backlog, unsigned long long* doomed);
-extern void rsx_d3d12_snap_frame(unsigned* nw, double* ms, unsigned* big, unsigned* hit, unsigned* pool_n);
+extern void rsx_d3d12_snap_frame(unsigned* nw, double* ms, unsigned* big, unsigned* hit, unsigned* pool_n, unsigned* ev, unsigned* rej, unsigned* pool_mb);
 const char* (*g_rsx_cache_dir_hook)(void) = 0;   /* hitch108: the PSO cache directory (set by the D3D12 backend) */
 unsigned long long (*g_rsx_cache_sig_hook)(void) = 0;   /* pso110: GPU + driver + compiler signature of the PSO cache */
 int (*g_rsx_cache_warm_hook)(void) = 0;                 /* pso110: 1 if the pipeline library was loaded from disk */
@@ -1127,7 +1132,7 @@ static u32 eng_zdepth_cap(void)
 
 /* rissa128 log v2: per-second engine counters in every tick ("eng": targets created/destroyed with their ms, zeta copies made, governor frees, pool reuse,
  * lane chunk aborts, pass-prologue pre-snapshots). Written from the walker and the coordinator without locks: statistics, not accounting. */
-static struct { unsigned rt_c, rt_d, zd_c, zd_d, snap, pack, gov_c, gov_z, rec, zpre, zpre_skip, sp_hit, sp_ev, sp_shit, rel_n, reap_n, backlog, sn_new, sn_big, sn_hit, sn_pool, zw, zw_small, zc_pre, zc_lazy, zd_would, zd_done; double rt_c_ms, rt_d_ms, zd_c_ms, zd_d_ms, rel_ms, reap_ms, sn_ms; unsigned long long doomed; unsigned wf_n, wf_pr, wf_max; double wf_ms; } s_v2e;
+static struct { unsigned rt_c, rt_d, zd_c, zd_d, snap, pack, gov_c, gov_z, rec, zpre, zpre_skip, sp_hit, sp_ev, sp_shit, rel_n, reap_n, backlog, sn_new, sn_big, sn_hit, sn_pool, sn_ev, sn_rej, sn_mb, zw, zw_small, zc_pre, zc_lazy, zd_would, zd_done; double rt_c_ms, rt_d_ms, zd_c_ms, zd_d_ms, rel_ms, reap_ms, sn_ms; unsigned long long doomed; unsigned wf_n, wf_pr, wf_max; double wf_ms; } s_v2e;
 static unsigned s_v2e_rel_n; static double s_v2e_rel_ms;   /* this frame's collect (hitch record) */
 static unsigned s_v2e_wf_n, s_v2e_wf_pr; static double s_v2e_wf_ms;   /* this frame's tex-watch faults (vm_watch.c): count, ms in the handler, protect calls */
 static unsigned s_wf_win_max; static double s_wf_win_ms;   /* the [frametime] window: most faults in one frame, handler ms */
@@ -1471,6 +1476,7 @@ static void eng_memo_v2(char* out, size_t n)
 }
 static void eng_zcopy_waste(u32 w, u32 h, int used) { if (!used) { s_v2e.zw++; if ((unsigned long long)w * h <= 512ull * 512ull) s_v2e.zw_small++; } }
 #define ZC_RETIRE(z) do { if ((z)->snapshot) eng_zcopy_waste((z)->snap_w, (z)->snap_h, (z)->snap_used); \
+                          if ((z)->snap2)    eng_zcopy_waste((z)->snap2_w, (z)->snap2_h, (z)->snap2_used); \
                           if ((z)->packed)   eng_zcopy_waste((z)->packed_w, (z)->packed_h, (z)->pack_used); } while (0)
 extern void rsx_d3d12_zmix_frame(unsigned out[9], double gpu[2]);
 static void eng_rt_destroy(u32 handle)
@@ -2272,6 +2278,13 @@ static void eng_note_pass(const rsx_dsp_surface* sf)
     g_rsx_pass_shadow = sf->depth_format == 1 && sf->zeta_location != 0xFFFFFFFFu;
     g_rsx_pass_cw = sf->clip_w; g_rsx_pass_ch = sf->clip_h;
 }
+/* rissa15g RSX_LANES_PROQ: the coordinator resolves the NEXT pass's prologue while lanes still record the previous pass, so the globals above
+ * may already name the next pass. A lane running a chunk under PROQ reads its own pass (set from the chunk's prologue in lc_run_chunk). */
+static ENG_TLS int t_pass_set, t_pass_shadow;
+static ENG_TLS u32 t_pass_cw, t_pass_ch;
+int rsx_pass_shadow(void) { return t_pass_set ? t_pass_shadow : g_rsx_pass_shadow; }
+u32 rsx_pass_cw(void) { return t_pass_set ? t_pass_cw : g_rsx_pass_cw; }
+u32 rsx_pass_ch(void) { return t_pass_set ? t_pass_ch : g_rsx_pass_ch; }
 static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
@@ -2388,6 +2401,31 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      * flickered. Move a depth target idle for four frames (g.frames counts
      * repeated presents too, so two could steal last frame's map), large enough, to
      * the new offset; nothing is made or freed. Its copies are stale. */
+    /* 14/11 RSX_ZRECYCLE=1 (default off): the same move at ANY table fill, before a free slot or a new target, choosing the
+     * smallest idle target that fits (at most 4x the area asked while the table is not nearly full). Wave brawl rz5 (4K scale 3
+     * MSAA x8): in bursts the game asks 300-577 new depth targets per second at moving offsets (0x0167..0x016A, guest 512-704 px,
+     * 15-40 MB each), the governor frees idle ones 8 per sweep, video memory 7.4 of 6.3 GB, 20-30 fps for 3-5 s. */
+    static int zrec = -1; if (zrec < 0) { const char* e = getenv("RSX_ZRECYCLE"); zrec = e && e[0] == '1'; }
+    if (slot == ENG_MAX_ZDEPTHS && zrec) {
+        const int nearly = g.n_zdepths >= eng_zdepth_cap() - 4;
+        const unsigned long long want_a = (unsigned long long)want_w * want_h;
+        int best = -1; unsigned long long best_a = 0;
+        for (u32 i = 0; i < g.n_zdepths; i++) {
+            const eng_zdepth* z = &g.zdepths[i];
+            if (!z->handle || z->location != location || z->w < want_w || z->h < want_h || z->last_frame + 4u > g.frames) continue;
+            const unsigned long long a = (unsigned long long)z->w * z->h;
+            if (!nearly && a > want_a * 4ull) continue;
+            if (best < 0 || a < best_a) { best = (int)i; best_a = a; }
+        }
+        if (best >= 0) {
+            eng_zdepth* z = &g.zdepths[best];
+            s_zrec_n++;
+            z->offset = offset; z->last_frame = g.frames; s_zgen++;
+            z->cleared = 0; z->had_write = 0; z->snapshot_valid = 0; z->snap2_valid = 0; z->packed_valid = 0;
+            lane_zev(LZ_RESET, (u32)best);
+            return (u32)best;
+        }
+    }
     if (slot == ENG_MAX_ZDEPTHS && g.n_zdepths >= eng_zdepth_cap() - 4) {
         for (u32 i = 0; i < g.n_zdepths; i++) {
             eng_zdepth* z = &g.zdepths[i];
@@ -2399,7 +2437,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
                   fprintf(stderr, "[rsx engine] zeta table nearly full: z%u 0x%08X -> 0x%08X (idle since frame %u)\n",
                           i, z->offset, offset, z->last_frame); }
             z->offset = offset; z->last_frame = g.frames; s_zgen++;
-            z->cleared = 0; z->had_write = 0; z->snapshot_valid = 0; z->packed_valid = 0;
+            z->cleared = 0; z->had_write = 0; z->snapshot_valid = 0; z->snap2_valid = 0; z->packed_valid = 0;
             lane_zev(LZ_RESET, i);
             return i;
         }
@@ -2419,6 +2457,20 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         slot = g.n_zdepths;
     }
 
+    /* 14/11 diagnostic, RSX_ZLOG=1 (off by default): the large depth targets made during the wave brawl
+     * (guest clip 1280x1024 at moving zeta offsets, 90 MB each at scale 3); prints at most 400 lines.
+     * RSX_ZLOG=<n> with n > 1: every creation with want_h >= n, at most 8000 lines. */
+    { static int zl = -1; static u32 zn = 0;
+      if (zl < 0) { const char* e = getenv("RSX_ZLOG"); zl = (e && *e) ? atoi(e) : 0; if (zl < 0) zl = 0; }
+      if (zl && want_h >= (zl == 1 ? 1000u : (u32)zl) && zn < (zl == 1 ? 400u : 8000u)) {
+          rsx_dsp_viewport zvp; rsx_dsp_surface zsf;
+          rsx_dsp_get_viewport(RV, &zvp); rsx_dsp_get_surface(RV, &zsf);
+          zn++;
+          fprintf(stderr, "[zlog] f%u z%u %u:0x%08X clip %ux%u want %ux%u %s vp %u,%u %ux%u ct %u c0 0x%08X canvas %ux%u nz %u\n",
+                  g.frames, slot, location, offset, rt_w, rt_h, want_w, want_h,
+                  slot < g.n_zdepths && g.zdepths[slot].handle ? "grow" : "new",
+                  zvp.x, zvp.y, zvp.w, zvp.h, zsf.color_target, zsf.color_offset[0], g.width, g.height, g.n_zdepths);
+      } }
     const double hp_t0 = hp_on() ? eng_now_ms() : 0.0;
     V2CTX(offset, location);
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
@@ -2431,6 +2483,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     ZC_RETIRE(z);
     if (z->handle) { const double t0_ = eng_now_ms(); g.be->depth_target_release(g.be->user, z->handle); s_hp.zd_d_n++; s_v2e.zd_d++; { const double d_ = eng_now_ms() - t0_; s_v2e.zd_d_ms += d_; s_v2e_zd_d_fr += d_; } }
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->snap2 && g.be->texture_release) g.be->texture_release(g.be->user, z->snap2);
+    z->snap2 = 0; z->snap2_valid = 0; z->snap2_w = z->snap2_h = 0;
     if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
     z->packed = 0; z->packed_valid = 0;
     z->location = location; z->offset = offset; s_zgen++;
@@ -2453,6 +2507,7 @@ static void eng_zdepth_free(u32 slot)
     ZC_RETIRE(z);
     if (z->handle) { const double t0_ = eng_now_ms(); g.be->depth_target_release(g.be->user, z->handle); s_hp.zd_d_n++; s_v2e.zd_d++; { const double d_ = eng_now_ms() - t0_; s_v2e.zd_d_ms += d_; s_v2e_zd_d_fr += d_; } }
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
+    if (z->snap2 && g.be->texture_release) g.be->texture_release(g.be->user, z->snap2);
     if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
     memset(z, 0, sizeof *z);
     z->location = ENG_FREE_LOCATION;
@@ -2476,14 +2531,46 @@ static void eng_zdepth_copy_size(const eng_zdepth* z, u32 tw, u32 th, u32* w, u3
     *h = (th && th < z->h) ? th : z->h;
 }
 
+/* rissa15j RSX_WFPROF: why a lane's depth snapshot / own packed copy was not ready (counted at the abort, lanes race: Interlocked) */
+static volatile int s_zab[8];   /* snap: 0 no object 1 other size 2 invalid, last made by zpre 3 invalid, last made lazily | own: 4 no zent 5 zent mismatch 6 second copy in chunk */
+static volatile int s_zab_small[4];
+static int zsnap_keep(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_ZSNAP_KEEP"); v = (e && e[0] == '1'); } return v; }
+static int zsnap_alt(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_ZSNAP_ALT"); v = (e && e[0] == '1'); if (v) fprintf(stderr, "[rsx engine] RSX_ZSNAP_ALT=1: a second depth snapshot per zeta for a second sampled size\n"); } return v; }
+static unsigned long long s_alt_hit, s_alt_swap;
 static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
     u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
     if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) return z->snapshot;
+    if (z->snap2_valid && z->snap2 && z->snap2_w == cw && z->snap2_h == ch) { if (!LANE->spec) s_alt_hit++; z->snap2_used = 1; return z->snap2; }
+    if (zsnap_alt() && !LANE->spec && z->snapshot && (z->snap_w != cw || z->snap_h != ch)) {
+        /* the other size: the current snapshot moves to the alternate slot, the alternate (if any) becomes the primary and is re-taken below */
+        u32 t; int v; u8 b;
+        t = z->snapshot; z->snapshot = z->snap2; z->snap2 = t;
+        t = z->snap_w; z->snap_w = z->snap2_w; z->snap2_w = t;
+        t = z->snap_h; z->snap_h = z->snap2_h; z->snap2_h = t;
+        v = z->snapshot_valid; z->snapshot_valid = z->snap2_valid; z->snap2_valid = v;
+        b = z->snap_used; z->snap_used = z->snap2_used; z->snap2_used = b;
+        b = z->snap_pre; z->snap_pre = z->snap2_pre; z->snap2_pre = b;
+        if (!z->snapshot) { z->snap_w = z->snap_h = 0; z->snapshot_valid = 0; }
+        s_alt_swap++;
+        if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) { lane_zev(LZ_SNAP, slot); return z->snapshot; }
+    }
+    if (LANE->spec) { const int k_ = !z->snapshot ? 0 : (z->snap_w != cw || z->snap_h != ch) ? 1 : z->snap_pre ? 2 : 3; __atomic_fetch_add(&s_zab[k_], 1, __ATOMIC_RELAXED); if (z->w <= 256) __atomic_fetch_add(&s_zab_small[k_], 1, __ATOMIC_RELAXED); }
     LANE_ABORT(RSX_LAB_ZSNAP);   /* lane109: taking a snapshot is a shared write */
     if (!g.be->depth_snapshot) return 0;
+    if (z->snapshot && z->snap_w == cw && z->snap_h == ch && zsnap_keep() && g.be->depth_resnap) {   /* RSX_ZSNAP_KEEP: the same texture, copied again */
+        V2CTX(z->offset, z->location);
+        if (g.be->depth_resnap(g.be->user, z->handle, z->snapshot, cw, ch, 0)) {
+            eng_zcopy_waste(z->snap_w, z->snap_h, z->snap_used);
+            s_v2e.snap++;
+            z->snap_used = 0; z->snap_pre = (u8)s_zc_pre; if (s_zc_pre) s_v2e.zc_pre++; else s_v2e.zc_lazy++;
+            z->snapshot_valid = 1;
+            lane_zev(LZ_SNAP, slot);
+            return z->snapshot;
+        }
+    }
     /* The previous image of this zeta is stale (a clear invalidated it), so
      * hand it back before resolving a new one. It never was: every shadow-map
      * clear leaked one backend texture -- a frame's worth of them per frame --
@@ -2517,6 +2604,17 @@ static u32 eng_zdepth_packed(u32 slot, u32 tw, u32 th)
     if (z->packed_valid && z->packed && z->packed_w == cw && z->packed_h == ch) return z->packed;
     LANE_ABORT(RSX_LAB_ZPACK);
     if (!g.be->depth_snapshot_rgba8) return 0;
+    if (z->packed && z->packed_w == cw && z->packed_h == ch && zsnap_keep() && g.be->depth_resnap) {   /* RSX_ZSNAP_KEEP */
+        V2CTX(z->offset, z->location);
+        if (g.be->depth_resnap(g.be->user, z->handle, z->packed, cw, ch, 1)) {
+            eng_zcopy_waste(z->packed_w, z->packed_h, z->pack_used);
+            s_v2e.pack++;
+            z->pack_used = 0; z->pack_pre = (u8)s_zc_pre; if (s_zc_pre) s_v2e.zc_pre++; else s_v2e.zc_lazy++;
+            z->packed_valid = 1;
+            lane_zev(LZ_PACK, slot);
+            return z->packed;
+        }
+    }
     if (z->packed) eng_zcopy_waste(z->packed_w, z->packed_h, z->pack_used);
     if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
     z->packed = 0;
@@ -2535,6 +2633,14 @@ static u32 eng_zdepth_packed(u32 slot, u32 tw, u32 th)
 /* lane111 RSX_LANES_ZOWN: the packed copy of the zeta this very pass writes, taken by a lane. Returns -1 (abort), 0 (no copy: the serial path returns 0 too), 1 (*view). The copy is a RECORD
  * with an object the coordinator made ahead (EngZent); the state of g.zdepths is the coordinator's, written at commit from the chunk's own_* fields. */
 extern void rsx_d3d12_zown_record(u32 depth, u32 dst);
+/* rissa15k RSX_LANES_ZDEM_ASK=1 (default off): with ZLEAN the demand of a pass (s_lc.zdem) refills only when an object is used, so once it hit 0
+ * (or VRAM pressure skipped every make) no object was ever made again and every own-zeta pass aborted (seed 37: 0 made, 2.9 aborts/frame, each a
+ * serial re-run of the chunk). A lane that needed an object and had none raises the demand of that zeta; the coordinator reads it at assign. */
+static volatile u8 s_zdem_ask[ENG_MAX_ZDEPTHS];
+static int lc_zdem_ask_on(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_LANES_ZDEM_ASK"); v = (e && e[0] == '1'); if (v) fprintf(stderr, "[lanes3-zlean] RSX_LANES_ZDEM_ASK=1: an own-zeta abort raises that pass's demand\n"); } return v; }
+/* rissa15k RSX_LANES_ZPRESS_PCT=<p> (default 80): ZLEAN stops making objects when VRAM use >= p% of the largest budget seen; at 4K MSAA x8 the
+ * game sits above 80% all the time, so nothing was made. An object replaces z->packed at commit (the old one is released): the extra is the stock. */
+static u32 lc_zpress_pct(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_LANES_ZPRESS_PCT"); v = (e && atoi(e) > 0) ? atoi(e) : 80; if (v != 80) fprintf(stderr, "[lanes3-zlean] RSX_LANES_ZPRESS_PCT=%d\n", v); } return (u32)v; }
 static int lane_zown_get(u32 slot, u32 ptw, u32 pth, u32 remap, u32 fmt, u32* view)
 {
     LaneState* const L = LANE; eng_zdepth* const z = &g.zdepths[slot];
@@ -2548,7 +2654,7 @@ static int lane_zown_get(u32 slot, u32 ptw, u32 pth, u32 remap, u32 fmt, u32* vi
         *view = v ? v : pk; return 1;
     }
     EngZent* const e = L->zent;
-    if (!e || !e->live || L->own_used || e->depth != z->handle || e->w != cw || e->h != ch || e->remap != remap || e->fmt != fmt) return -1;
+    if (!e || !e->live || L->own_used || e->depth != z->handle || e->w != cw || e->h != ch || e->remap != remap || e->fmt != fmt) { __atomic_fetch_add(&s_zab[(!e || !e->live) ? 4 : L->own_used ? 6 : 5], 1, __ATOMIC_RELAXED); if ((!e || !e->live) && slot < ENG_MAX_ZDEPTHS && lc_zdem_ask_on()) s_zdem_ask[slot] = 1; return -1; }
     rsx_d3d12_zown_record(z->handle, e->dst);
     L->own_used = 1; L->own_pk = e->dst; L->own_pk_valid = 1; L->own_w = cw; L->own_h = ch;
     lane_zev(LZ_PACK, slot);
@@ -2755,6 +2861,17 @@ void rsx_canvas_remap_set(u32 mark, float k, float x, float y)
 static volatile float s_content_aspect, s_screen_aspect, s_window_aspect;
 static unsigned s_frame_draws;   /* the frame's so far */
 static int s_frame_video;        /* the frame has drawn a movie's picture */
+/* uwfix (09/11): the movie flag of the frame the present is showing. The backend may encode and present a frame on its own
+ * thread (RSX_ENCODE_THREAD) after the walker has already reset s_frame_video for the next frame: reading s_frame_video there
+ * made a movie frame come out sometimes 16:9 and sometimes stretched (issue #3: menu and movies flickering at 21:9). The
+ * backend takes the flag when the frame is handed over (rsx_present_frame_video) and sets it here before the layout. */
+static volatile int s_layout_video;
+/* uwfix: the previous frame drew a movie. With RSX_LANES the movie quad and the UI draws of a frame may be prepared on different
+ * lanes, so the UI narrowing below and the hand-over also look at the last frame: a movie (the main menu's background is one)
+ * runs for many frames, and only its first and last frame can differ. */
+static int s_prev_video;
+int rsx_present_frame_video(void) { return s_frame_video || s_prev_video; }
+void rsx_present_set_layout_video(int v) { s_layout_video = v; }
 void rsx_present_set_content_aspect(float aspect) { s_content_aspect = aspect; }
 void rsx_present_set_screen_aspect(float aspect) { s_screen_aspect = aspect; }
 /* TOD_ASPECT (ultrawide): the whole frame is shown stretched to this shape (width / height) instead of its own;
@@ -2781,7 +2898,9 @@ static int eng_ui_vs(u64 h)
         }
     }
     if (off) return 0;
-    if (h == 0x6c32c359051fd3f2ULL || h == 0x0215538f9344e1b0ULL) return 1;
+    /* 09/11: b154452cb56566ea = the mirrored glyphs under the main menu's items (their reflection; 28 draws beside the 28 glyph
+     * draws in a menu frame, log/rykauto/runs/trmm.err); left out, the reflections came out stretched in ultrawide */
+    if (h == 0x6c32c359051fd3f2ULL || h == 0x0215538f9344e1b0ULL || h == 0xb154452cb56566eaULL) return 1;
     for (int i = 0; i < nex; i++) if (ex[i] == h) return 1;
     return 0;
 }
@@ -2804,6 +2923,12 @@ static int eng_ui_fullwidth(const float* c6, const float* c32, const u8* verts, 
         if (x < lo) lo = x;
         if (x > hi) hi = x;
     }
+    { static int lg = -1; static unsigned nl;   /* RSX_UI_BG_LOG=1: extent of small UI draws (letterbox study) */
+      if (lg < 0) lg = getenv("RSX_UI_BG_LOG") ? 1 : 0;
+      if (lg && n <= 8 && nl < 4000) { nl++;
+          const float* v0 = (const float*)verts;
+          fprintf(stderr, "[ui-bg] n=%u lo=%.1f hi=%.1f c6x=%.1f c32=(%.3g %.3g %.3g %.3g) v0=(%.3g %.3g %.3g)\n", n, (double)lo, (double)hi,
+                  (double)c6[0], (double)c32[0], (double)c32[1], (double)c32[2], (double)c32[3], (double)v0[0], (double)v0[1], (double)v0[2]); } }
     return (hi - lo) >= 0.95f * 1280.0f && lo <= 0.025f * 1280.0f && hi >= 0.975f * 1280.0f;
 }
 float rsx_present_window_aspect(void) { return s_window_aspect; }
@@ -2828,7 +2953,12 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
     const float sa = s_screen_aspect > 0.0f ? s_screen_aspect : wa;
     float scr[4];
     present_fit(sa, 0.0f, 0.0f, (float)ww, (float)wh, scr);
-    if (s_frame_shape > 0.0f && !s_frame_video) {
+    const int vid = s_layout_video;
+    { static int lg = -1, lastv = -1; static unsigned nv;   /* RSX_PRESENT_LAYOUT_LOG=1: each change of the movie flag */
+      if (lg < 0) lg = getenv("RSX_PRESENT_LAYOUT_LOG") ? 1 : 0;
+      if (lg && vid != lastv) { nv++; fprintf(stderr, "[present] movie %d (change %u), shape %.4f\n", vid, nv, (double)s_frame_shape); }
+      lastv = vid; }
+    if (s_frame_shape > 0.0f && !vid) {
         /* ultrawide: the whole frame, stretched to the chosen shape, in the middle of the screen (a movie keeps its own, below) */
         float dw[4];
         present_fit(s_frame_shape, scr[0], scr[1], scr[2], scr[3], dw);
@@ -2843,7 +2973,7 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
      * bars left out, or the whole frame ... */
     float ca = s_content_aspect;
     const float cr = ca / fa;
-    if (!(ca > 0.0f) || (cr > 0.99f && cr < 1.01f) || s_frame_video) ca = fa;
+    if (!(ca > 0.0f) || (cr > 0.99f && cr < 1.01f) || vid) ca = fa;
     { /* RSX_PRESENT_LAYOUT_LOG=1: each change of what is shown */
         static int log = -1;
         static float last_ca = -1.0f, last_sa = -1.0f;
@@ -2852,7 +2982,7 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
         n++;
         if (log && (ca != last_ca || sa != last_sa))
             fprintf(stderr, "[present] #%u: showing %.4f (content %.4f, movie %d), screen %.4f, window %ux%u\n",
-                    n, ca, s_content_aspect, s_frame_video, sa, ww, wh);
+                    n, ca, s_content_aspect, vid, sa, ww, wh);
         last_ca = ca; last_sa = sa;
     }
     float pic[4], dst[4];
@@ -2867,7 +2997,7 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
     int cropped = 0;
     { static int crop = -1;
       if (crop < 0) { const char* e = getenv("RSX_CROP_BARS"); crop = e ? atoi(e) : 0; if (crop < 0 || crop > 60) crop = 0; }
-      if (crop > 0 && !s_frame_video && ca == fa) {
+      if (crop > 0 && !vid && ca == fa) {
           const float cy = (float)fh * (float)crop / 720.0f;
           pic[1] += cy; pic[3] -= 2.0f * cy;
           ky = dst[3] / pic[3]; cropped = 1; } }
@@ -5105,6 +5235,7 @@ typedef struct {
     u32 vr_ok;                              /* metro131: vr below is a trusted validation's record */
     EngVR vr;
     u32 ep_ok, ep;                          /* prof102: global write epoch at the last trusted validation */
+    u64 pend; u32 pend_frame, touch_frame;  /* rissa15i RSX_VCACHE_NOCHURN: the last content not stored, its frame; the last store or skip */
 } EngVCEntry;
 typedef struct {
     int ok;
@@ -5926,6 +6057,7 @@ static void eng_vc_store_x(u64 key, const EngVCFill* f, const u8* verts,
         eng_vc_evict();
     EngVCEntry* e = eng_vc_slot(key);
     if (!e) return;
+    const int vsame = e->key == key;
     if (e->key) { eng_vc_free(e); s_vc_count--; if (s_vck) s_vck[e - s_vc] = 0; }
     const size_t vb = (size_t)n_verts * stride;
     const size_t ib = indexed ? (size_t)n_draw * sizeof(u32) : 0;
@@ -5980,6 +6112,8 @@ static void eng_vc_store_x(u64 key, const EngVCFill* f, const u8* verts,
     }
     e->key = key;
     if (s_vck) s_vck[e - s_vc] = key;
+    if (!vsame) { e->pend = 0; e->pend_frame = 0; }
+    e->touch_frame = g.frames;
     e->gen = ++s_vc_gen;
     e->content = f->content;
     e->watch_stamp = 0; e->watched = 0; e->vr_ok = 0; e->ep_ok = 0;   /* validated by hashing until a lookup arms the watch */
@@ -6004,6 +6138,32 @@ static void eng_vc_store_x(u64 key, const EngVCFill* f, const u8* verts,
     s_fstat.vc_store++; s_fstat.vc_bytes += vb + ib;
 }
 
+/* rissa15i RSX_VCACHE_NOCHURN=<n> (default 0 = off): in the slow seconds of a fight 200-700 misses per frame are stored and ~as many entries go
+ * stale (the same key, other bytes: vertices the guest rewrites every frame). Each store copies the vertices (and for a big entry makes a D3D12
+ * buffer), and on the lanes path every flush bumps s_lc.gen, so the finished chunks behind it are redone. A miss whose key already has an
+ * entry with other content, stored or skipped in the last n frames, is not stored: the draw uploads its own vertices as it does anyway.
+ * The same new content seen again in a later frame is stored (the bytes are stable again). Called only with every lane idle (flush, serial). */
+static unsigned long long s_vc_churn_skip;
+static int eng_vc_nochurn(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_VCACHE_NOCHURN"); v = e ? atoi(e) : 0; if (v < 0) v = 0;
+                 if (v) fprintf(stderr, "[vcache] RSX_VCACHE_NOCHURN=%d: a key whose bytes changed within %d frames is not stored again until they are stable\n", v, v); }
+    return v;
+}
+static int eng_vc_churn_skip(u64 key, u64 content)
+{
+    const int n = eng_vc_nochurn();
+    if (!n || !s_vc) return 0;
+    EngVCEntry* ex = eng_vc_slot(key);
+    if (!ex || ex->key != key || ex->content == content) return 0;
+    if (ex->pend == content && ex->pend_frame != g.frames) return 0;   /* the same new bytes in two frames: stable again, store */
+    if (g.frames - ex->touch_frame > (u32)n) return 0;                 /* unchanged for n frames: an ordinary update */
+    if (ex->pend != content) { ex->pend = content; ex->pend_frame = g.frames; }
+    ex->touch_frame = g.frames;
+    s_vc_churn_skip++;
+    return 1;
+}
 static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
                          u32 n_verts, u32 stride, u32 n_source_refs,
                          int indexed, const u32* indices, u32 n_draw)
@@ -6626,6 +6786,7 @@ static void eng_draw_stats_report(void)
             s_dstat.drop_pipeline, s_dstat.drop_empty, s_dstat.refs, s_dstat.verts, s_dstat.vbytes >> 10,
             s_vcstat.hit, s_vcstat.hit_watch, s_vcstat.miss, s_vcstat.uncacheable, s_vcstat.stored, s_vcstat.stale, s_vc_count, s_vc_bytes >> 20,
             s_vcstat.check_bad);
+    if (eng_vc_nochurn()) { fprintf(stderr, "[vcache] churn stores skipped %llu\n", s_vc_churn_skip); s_vc_churn_skip = 0; }
     if (s_vcchunk_on > 0) fprintf(stderr, "[m131] vc chunk shortcut: %llu hits (cum.), %llu verified, %llu bad\n", s_vcchunk_hit, s_vcchunk_chk, s_vcchunk_bad);
     memset(&s_vcstat, 0, sizeof s_vcstat);
     memset(&s_dstat, 0, sizeof s_dstat);
@@ -6716,8 +6877,104 @@ static void eng_ring_draw(const char* outcome, u32 prim, int indexed, u32 n_draw
     }
     eng_ring_push(line);
 }
+/* RSX_UI_TRACE_NEXT=<n> (vendor flicker, 09/11): counts the draws into the 1280x704 UI surfaces per frame; after a frame with
+ * exactly <n> of them (the weapon vendor's odd frame has 128, every 90 frames) the draw trace (RSX_DRAW_TRACE_FRAME) is armed
+ * on frames +88 .. +91, once, so the next odd frame and its neighbours are traced whole. [uiw] lines give the counts. */
+static u32 eng_trace_zeta(void) { rsx_dsp_surface z; rsx_dsp_get_surface(RV, &z); return z.zeta_offset; }
+static void eng_ui_watch(void)
+{
+    static int want = -1, armed;
+    static u32 lastf = 0xFFFFFFFFu, nd;
+    if (want < 0) { const char* e = getenv("RSX_UI_TRACE_NEXT"); want = e ? atoi(e) : 0; }
+    if (!want) return;
+    if (lastf != g.frames) {
+        { static u32 prevnd; if (lastf != 0xFFFFFFFFu && nd != prevnd) fprintf(stderr, "[uiw] f%u nd=%u (was %u)\n", lastf, nd, prevnd); prevnd = nd; }
+        if (lastf != 0xFFFFFFFFu && nd) {
+            if (s_dtrace_frame >= 0 && (long)lastf >= s_dtrace_frame - 2 && (long)lastf < s_dtrace_frame + 5)
+                fprintf(stderr, "[uiw] f%u nd=%u\n", lastf, nd);
+            if ((int)nd == want && !armed) { armed = 1; s_dtrace_frame = (long)lastf + 88; fprintf(stderr, "[uiw] f%u nd=%u -> trace f%ld..+3\n", lastf, nd, s_dtrace_frame); }
+        }
+        lastf = g.frames; nd = 0;
+    }
+    u32 tt[RSX_BE_MAX_COLOR_TARGETS]; const u32 tn = eng_current_target_set(tt);
+    rsx_dsp_surface tsf; rsx_dsp_get_surface(RV, &tsf);
+    if (tn && tsf.clip_w == 1280 && tsf.clip_h == 704) nd++;
+}
+/* TOD_BAREFOOT (09/11, the user's idea): Ratchet in his own suit with the bare feet of the striped cheat skin. The game draws
+ * each of Ratchet's mesh groups as ONE skinned draw (bf5: the suit body = 56 packets / 14106 refs / 2952 verts, boots
+ * included; the striped body = 91 / 23124 / 4806, group 47 of the hero's mask, which the host turns on as well). Here,
+ * after the index build and before the vertex cache stores it, the triangles are filtered by the bone their vertices
+ * follow most: the suit body loses the triangles of the foot bones (the boots), the striped body keeps only those.
+ * The foot bones are found from the mesh itself: the bones of the lowest vertices along the model's up axis.
+ * TOD_BAREFOOT_DIAG=1 prints, once per body, the extents and the bones at both ends of every axis. */
+static int eng_barefoot_body(u32 nv, u32 refs)
+{
+    if (nv == 2952 && refs == 14106) return 1;      /* the suit body (pezzo 1) */
+    if (nv == 4806 && refs == 23124) return 2;      /* the striped body (pezzo 47) */
+    return 0;
+}
+static void eng_barefoot(u32 prim, const rsx_vertex_layout_plan* lay, u32 n_draw, u32* idx)
+{
+    static int on = -1, diag = -1;
+    if (on < 0) { const char* e = getenv("TOD_BAREFOOT"); on = e && e[0] == '1'; const char* d = getenv("TOD_BAREFOOT_DIAG"); diag = d && d[0] == '1'; }
+    if ((!on && !diag) || prim != 5 || !idx || !LANE->dc.verts) return;
+    const int body = eng_barefoot_body(LANE->dc.n_verts, LANE->dc.n_source_refs);
+    if (!body) return;
+    const int sp = lay->slot_by_attr[0], sb = lay->slot_by_attr[1], sw = lay->slot_by_attr[2];
+    if (sp < 0 || sb < 0) return;
+    const u8* V = LANE->dc.verts; const u32 st = lay->stride, nv = LANE->dc.n_verts;
+    #define BF_F(v, s, k) (((const float*)(V + (size_t)(v) * st + (size_t)(s) * 16u))[k])
+    int dom_of_vertex = 0;
+    (void)dom_of_vertex;
+    static int printed[3];
+    if (diag && !printed[body]) {
+        printed[body] = 1;
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (u32 v = 0; v < nv; v++) for (int a = 0; a < 3; a++) { const float p = BF_F(v, sp, a); if (p < mn[a]) mn[a] = p; if (p > mx[a]) mx[a] = p; }
+        fprintf(stderr, "[barefoot] body %d: %u verts, x %.3g..%.3g y %.3g..%.3g z %.3g..%.3g, v0 bones %.0f %.0f %.0f %.0f w %.2f %.2f %.2f %.2f\n", body, nv,
+                mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], BF_F(0, sb, 0), BF_F(0, sb, 1), BF_F(0, sb, 2), BF_F(0, sb, 3),
+                sw >= 0 ? BF_F(0, sw, 0) : -1.0f, sw >= 0 ? BF_F(0, sw, 1) : -1.0f, sw >= 0 ? BF_F(0, sw, 2) : -1.0f, sw >= 0 ? BF_F(0, sw, 3) : -1.0f);
+        for (int a = 0; a < 3; a++) for (int end = 0; end < 2; end++) {
+            unsigned hist[256]; memset(hist, 0, sizeof hist);
+            const float lim = end ? mx[a] - (mx[a] - mn[a]) * 0.08f : mn[a] + (mx[a] - mn[a]) * 0.08f;
+            for (u32 v = 0; v < nv; v++) {
+                const float p = BF_F(v, sp, a);
+                if (end ? p < lim : p > lim) continue;
+                int best = 0; float bw = -1.0f;
+                for (int k = 0; k < 4; k++) { const float w = sw >= 0 ? BF_F(v, sw, k) : (k ? 0.0f : 1.0f); if (w > bw) { bw = w; best = k; } }
+                const int bone = (int)BF_F(v, sb, best); if (bone >= 0 && bone < 256) hist[bone]++;
+            }
+            char line[300]; int o = 0;
+            for (int b = 0; b < 256 && o < 260; b++) if (hist[b]) o += snprintf(line + o, sizeof line - o, " %d:%u", b, hist[b]);
+            line[o] = 0;
+            fprintf(stderr, "[barefoot] body %d axis %c %s 8%%: bones%s\n", body, "xyz"[a], end ? "top" : "bottom", line);
+        }
+    }
+    /* bf7: up is +y, the feet stand at y ~ 0 in both bodies (bind pose, model units ~17400 to the shoulders). A triangle of
+     * the suit body wholly below the cut goes (the boots); a triangle of the striped body stays only if it reaches below it
+     * (bare feet and ankles). TOD_BAREFOOT_CUT = the height in model units. Applied when the draw is converted, so the
+     * vertex cache keeps the filtered indices. */
+    if (on && n_draw >= 3) {
+        static float cut = -1.0f;
+        if (cut < 0.0f) { const char* c = getenv("TOD_BAREFOOT_CUT"); cut = c ? (float)atof(c) : 3000.0f;   /* bf8: 1500 leaves bits of the boots, 3000 is clean */
+                          fprintf(stderr, "[barefoot] on: cut at y %.0f\n", cut); }
+        u32 dropped = 0;
+        for (u32 t = 0; t + 2 < n_draw; t += 3) {
+            const u32 a = idx[t], b = idx[t + 1], c = idx[t + 2];
+            if (a >= nv || b >= nv || c >= nv) continue;
+            const float ya = BF_F(a, sp, 1), yb = BF_F(b, sp, 1), yc = BF_F(c, sp, 1);
+            const float lo = ya < yb ? (ya < yc ? ya : yc) : (yb < yc ? yb : yc), hi = ya > yb ? (ya > yc ? ya : yc) : (yb > yc ? yb : yc);
+            if ((body == 1 && hi < cut) || (body == 2 && lo >= cut)) { idx[t + 1] = a; idx[t + 2] = a; dropped++; }
+        }
+        static u32 logged[3];
+        if (logged[body]++ < 2) fprintf(stderr, "[barefoot] body %d: %u of %u triangles dropped\n", body, dropped, n_draw / 3);
+    }
+    #undef BF_F
+}
+
 static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_draw, u32 pipeline, u32 tex_mask)
 {
+    eng_ui_watch();
     eng_ring_draw(outcome, prim, indexed, n_draw, pipeline, tex_mask);
     /* RSX_TRACE_SKINNED_FROM=<frame>: from that frame on, the first 40 draws
      * into a full-size target that carry an unnormalised-byte attribute (a
@@ -6741,13 +6998,16 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
     rsx_be_render_state trs; rsx_draw_engine_decode_render_state(RV, &trs);
     u32 ttargets[RSX_BE_MAX_COLOR_TARGETS]; const u32 tnt = eng_current_target_set(ttargets);
     fprintf(stderr, "[draw-trace] f%u %s prim=%u packets=%u refs=%u verts=%u indexed=%d n=%u pipe=%u tex=0x%X idx(loc=%u off=0x%08X u32=%d)"
-            " target=s%d(%ux%u fmt%u) blend=%u(%X/%X eq%X) alpha=%u(f%X ref=0x%X fmt%u -> %.4g) depth=%u/%u cull=%u mask=0x%X",
+            " target=s%d(%ux%u fmt%u) blend=%u(%X/%X eq%X) alpha=%u(f%X ref=0x%X fmt%u -> %.4g) depth=%u/%u cull=%u mask=0x%X"
+            " st=%u(f%X ref%02X m%02X w%02X %X/%X/%X) zf=%X zeta=%08X",
             g.frames, outcome, prim, LANE->dc.n_packets, LANE->dc.n_source_refs, LANE->dc.n_verts, indexed, n_draw, pipeline, tex_mask,
             ia.location, ia.offset, ia.is_u32,
             tnt ? (int)ttargets[0] : -1, tnt ? g.surfaces[ttargets[0]].w : 0, tnt ? g.surfaces[ttargets[0]].h : 0,
             tnt ? (u32)g.surfaces[ttargets[0]].fmt : 0,
             trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.eq_rgb, trs.alpha_test_enable, trs.alpha_func, trs.alpha_ref_raw, trs.alpha_ref_format, (double)rsx_fp_alpha_ref(trs.alpha_ref_raw, trs.alpha_ref_format), trs.depth_test, trs.depth_write,
-            trs.cull_enable, trs.color_mask);
+            trs.cull_enable, trs.color_mask,
+            trs.stencil_enable, trs.s_func, rsx_dsp_reg(RV, M_STENCIL_FUNC_REF) & 0xFFu, trs.s_func_mask, trs.s_write_mask,
+            trs.s_fail, trs.s_zfail, trs.s_zpass, trs.depth_func, (unsigned)eng_trace_zeta());
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
     if (LANE->dc.n_verts && LANE->dc.n_verts <= 8 && LANE->dc.out_verts && LANE->dc.layout.stride) {
@@ -7237,6 +7497,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             LANE->dc.refs_remapped ? LANE->dc.ref_remap.occurrence_to_unique : NULL,
             LANE->indices);
         draw_indices = LANE->indices;
+        eng_barefoot(prim, &layout, n_draw, LANE->indices);   /* TOD_BAREFOOT (09/11): Ratchet's boots off, bare feet on */
     }
     WP2_END(_w56, 56);
     if (vc_check) {
@@ -7257,6 +7518,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         } else {
         eng_vcdbg_miss(&vcf);
         WP2_BEGIN(_w57);
+        if (!eng_vc_churn_skip(vc_key, vcf.content))
         eng_vc_store(vc_key, &vcf, LANE->dc.verts, LANE->dc.n_verts, layout.stride,
                      LANE->dc.n_source_refs, indexed, LANE->indices, n_draw);
         WP2_END(_w57, 57);
@@ -7456,7 +7718,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
      * (the post/composite quads use another one and keep the whole frame); RSX_UI_VS=<hex>[,<hex>...] adds hashes, RSX_UI_VP=0 turns it off. */
     {
         float ux = 0.0f, uw = W;
-        if (!pipeline_is_fixed && LANE->cur_pipe && s_frame_shape > 1.80f && LANE->cur_pipe->vp_hlsl && eng_ui_vs(LANE->cur_pipe->vp_hlsl)) {
+        /* uwfix: in a frame with a movie the present shows the frame at 16:9 (rsx_present_layout), so its UI keeps the whole frame */
+        if (!pipeline_is_fixed && LANE->cur_pipe && s_frame_shape > 1.80f && !(s_frame_video || s_prev_video)
+            && LANE->cur_pipe->vp_hlsl && eng_ui_vs(LANE->cur_pipe->vp_hlsl)) {
             if (eng_ui_fullwidth((const float*)RV->constants[6], (const float*)RV->constants[32], LANE->dc.out_verts, LANE->dc.n_verts, LANE->dc.layout.stride)) {
                 s_ui_bg_n++;     /* wide122: a full-width background keeps the whole frame */
             } else {
@@ -7685,7 +7949,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * shadow map, and no character cast a shadow. */
         if (!LANE->spec) {   /* lane109: a lane only logs the event; the coordinator applies it when the chunk closes, in order */
             g.zdepths[zslot].had_write = 1;
-            g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].snapshot_valid = 0; g.zdepths[zslot].snap2_valid = 0;
             g.zdepths[zslot].packed_valid = 0;
         }
         lane_zev(LZ_WRITE, zslot);
@@ -7695,12 +7959,20 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 #undef WP_MARK
 }
 
+static int b2_post_clear(u32 mask);
+static void sink_clear_body(u32 mask);
 static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
     if (!g.ready) return;
+    if (b2_post_clear(mask)) return;   /* rissa15c RSX_CLEAR_Q=1: queued as an ordered job, the walker does not wait */
     rsx_draw_engine_b2_drain();   /* RSX_DRAW_SPLIT=2: ordered after the queued draws, reads the live registers (RV == g.rsx here) */
     lanes_boundary(LN_B_CLEAR);
+    sink_clear_body(mask);
+}
+/* The clear itself: on the walker after a drain (RV == g.rsx), or on the executing thread as job kind 3 (RV == the job's view). */
+static void sink_clear_body(u32 mask)
+{
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (s_ring_on < 0) s_ring_on = (getenv("RSX_TRACE_ON_WHITE") || getenv("RSX_TRACE_ON_COLOR")) ? 1 : 0;
@@ -7787,7 +8059,7 @@ static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
             { static int cw = -1; if (cw < 0) { const char* e = getenv("RSX_CLEAR_COUNTS_WRITE"); cw = !(e && e[0] == '0'); }
               if (cw) g.zdepths[zslot].had_write = 1;
               else if (!partial) g.zdepths[zslot].had_write = 0; }
-            g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].snapshot_valid = 0; g.zdepths[zslot].snap2_valid = 0;
             g.zdepths[zslot].packed_valid = 0;
         }
     }
@@ -7999,8 +8271,13 @@ static void rsx_flip_pace(void)
         do { YieldProcessor(); QueryPerformanceCounter(&now); } while (now.QuadPart < next);
         { LARGE_INTEGER e; QueryPerformanceCounter(&e); s_pace_wait_ms = (double)(e.QuadPart - (next - left)) * 1000.0 / (double)f.QuadPart; }
         next += period;
-    } else
-        next = now.QuadPart + period;                               /* behind: no catch-up burst */
+    } else {
+        /* RSX_PACE_GRID=1 (15/11, off): behind by less than one period keeps the 60 Hz grid, so the frame after a late one
+         * is not held a full period from the late flip (the main waits on a report the walker writes after this pace). */
+        static int grid = -1; if (grid < 0) { const char* g_ = getenv("RSX_PACE_GRID"); grid = (g_ && *g_ == '1'); }
+        if (grid && next && now.QuadPart - next < period) next += period;
+        else next = now.QuadPart + period;                          /* behind: no catch-up burst */
+    }
 #endif
 }
 
@@ -8098,6 +8375,36 @@ static u32 eng_sp_keep(void)
 static void eng_surface_sweep(void)
 {
     static int on = -1; if (on < 0) { const char* e = getenv("RSX_RT_SWEEP"); on = !(e && e[0] == '0'); }
+    /* 14/11 RSX_ZDUMP=1 (diagnostic, off by default): every 300 presents, what the live depth targets hold (wave brawl: 236 depths = 5 GB).
+     * Per guest-size class (shadow <= 256x256 / mid / canvas >= 960x540): count, MB, MSAA twin MB, copies MB; per idle age; the 6 biggest. */
+    { static int zd = -1; static u32 zlast = ~0u;
+      if (zd < 0) { const char* e = getenv("RSX_ZDUMP"); zd = e && e[0] == '1'; }
+      if (zd && g_rsx_obj_bytes_hook && g.frames % 300u == 0u && zlast != g.frames) {
+          zlast = g.frames;
+          u32 cn[3] = {0}, an[4] = {0}; unsigned long long cb[3] = {0}, ct[3] = {0}, cs[3] = {0}, ab[4] = {0};
+          u32 top[6]; unsigned long long topb[6]; u32 nt = 0;
+          for (u32 i = 0; i < g.n_zdepths; i++) { const eng_zdepth* z = &g.zdepths[i];
+              if (!z->handle) continue;
+              unsigned long long tw = 0, t2 = 0; const unsigned long long b = g_rsx_obj_bytes_hook(z->handle, &tw);
+              unsigned long long cp = 0;
+              if (z->snapshot) cp += g_rsx_obj_bytes_hook(z->snapshot, &t2);
+              if (z->snap2) cp += g_rsx_obj_bytes_hook(z->snap2, &t2);
+              if (z->packed) cp += g_rsx_obj_bytes_hook(z->packed, &t2);
+              const int c = (z->w >= 960 && z->h >= 540) ? 2 : (z->w * z->h <= 256u * 256u) ? 0 : 1;
+              cn[c]++; cb[c] += b; ct[c] += tw; cs[c] += cp;
+              const u32 idle = g.frames - z->last_frame; const int a = idle < 4u ? 0 : idle < 30u ? 1 : idle < 120u ? 2 : 3;
+              an[a]++; ab[a] += b + tw + cp;
+              const unsigned long long all = b + tw + cp; u32 k = nt < 6 ? nt++ : 6;
+              if (k == 6) { if (all <= topb[5]) continue; k = 5; }
+              while (k > 0 && topb[k - 1] < all) { top[k] = top[k - 1]; topb[k] = topb[k - 1]; k--; }
+              top[k] = i; topb[k] = all; }
+          fprintf(stderr, "[zdump] f%u n %u/%u | shadow %u %lluMB tw %llu cp %llu | mid %u %lluMB tw %llu cp %llu | canvas %u %lluMB tw %llu cp %llu"
+                          " | idle<4 %u %lluMB 4-30 %u %lluMB 30-120 %u %lluMB 120+ %u %lluMB | rec %u\n", g.frames, g.n_zdepths, eng_zdepth_cap(),
+                  cn[0], cb[0] >> 20, ct[0] >> 20, cs[0] >> 20, cn[1], cb[1] >> 20, ct[1] >> 20, cs[1] >> 20, cn[2], cb[2] >> 20, ct[2] >> 20, cs[2] >> 20,
+                  an[0], ab[0] >> 20, an[1], ab[1] >> 20, an[2], ab[2] >> 20, an[3], ab[3] >> 20, s_zrec_n);
+          for (u32 k = 0; k < nt; k++) { const eng_zdepth* z = &g.zdepths[top[k]];
+              fprintf(stderr, "[zdump]   z%u %u:0x%08X %ux%u idle %u %lluMB\n", top[k], z->location, z->offset, z->w, z->h, g.frames - z->last_frame, topb[k] >> 20); }
+      } }
     /* vram124 RSX_VRAM_GOV=1 (default off): budget-aware governor. Over 85% of the DXGI budget the sweep runs every 8 presents and frees the
      * least recently used colour and depth targets idle for RSX_VRAM_GOV_IDLE presents (default 30; 8 when over 100%) instead of 600, at most 32
      * colour + 8 depth per run; a freed target is recreated if the game names it again. Log lines [vram-gov]. */
@@ -8133,10 +8440,16 @@ static void eng_surface_sweep(void)
     if (gov && hard) {
         const u32 thr = used > budget ? 8u : gov_idle; u32 nc = 0, nz = 0;
         static int gskip = -1; if (gskip < 0) { const char* e = getenv("RSX_GOV_SKIP_PLACED"); gskip = e && e[0] == '1'; }   /* default OFF (old behaviour: placed targets are evicted too, 0.05 ms to recreate and they open holes in the heaps); RSX_GOV_SKIP_PLACED=1 skips placed targets without a twin: tried in b46 n4/z2, worse (surface table 4-7x, VRAM stays hard, committed churn) */
+        /* RSX_GOV_MINKB=<kb> (default 0 = off): colour targets smaller than this many host KB (an MSAA twin counts) are not freed. Rissa a ondate
+         * 14/11 (rz2, 4K scale 3 MSAA x8): over 85% the governor freed 350-990 colour targets per 5 s, mostly shadow maps (32-96 guest px, 36-330 KB
+         * host) and 224x224 copy targets; video memory never fell under 85% and the game recreated 7-14 targets per frame (fps 15-40). */
+        static long long gmin = -1; if (gmin < 0) { const char* e = getenv("RSX_GOV_MINKB"); gmin = e ? atoll(e) * 1024ll : 0; if (gmin < 0) gmin = 0; }
         for (; nc < 32u; nc++) {
             int best = -1;
             for (u32 i = 0; i < g.n_surfaces; i++) { const eng_surface* t = &g.surfaces[i];
                 if (!t->handle || i == g.last_present_surface || t->last_frame + thr >= g.frames) continue;
+                if (gmin && g_rsx_target_info_hook) { int tw = 0; const unsigned long long b = g_rsx_target_info_hook(t->handle, &tw);
+                    if (!tw && b && b < (unsigned long long)gmin) continue; }
                 if (gskip && g_rsx_placed_hook && g_rsx_placed_hook(t->handle) == 1) { if (nc == 0) g_rsx_gov_ev[4]++; continue; }   /* a placed target with no twin: freeing it returns no VRAM (the heap stays), the game would only create it again */
                 if (best < 0 || t->last_frame < g.surfaces[best].last_frame) best = (int)i; }
             if (best < 0) break;
@@ -8161,8 +8474,10 @@ static void eng_surface_sweep(void)
         }
         /* the snapshot / packed copies of zetas not sampled for gov_idle*4 presents go too (the zeta stays; the copy is taken again on demand) */
         for (u32 i = 0; i < g.n_zdepths; i++) { eng_zdepth* z = &g.zdepths[i];
-            if (!z->handle || (!z->snapshot && !z->packed) || z->last_frame + thr * 4u >= g.frames) continue;
+            if (!z->handle || (!z->snapshot && !z->packed && !z->snap2) || z->last_frame + thr * 4u >= g.frames) continue;
             ZC_RETIRE(z);
+            if (z->snap2 && g.be->texture_release) g.be->texture_release(g.be->user, z->snap2);
+            z->snap2 = 0; z->snap2_valid = 0; z->snap2_w = z->snap2_h = 0;
             if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
             if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
             z->snapshot = 0; z->snapshot_valid = 0; z->snap_w = z->snap_h = 0; z->packed = 0; z->packed_valid = 0; z->packed_w = z->packed_h = 0; nz++; s_zgen++; }
@@ -8305,6 +8620,7 @@ static void eng_present_impl(u32 buffer_id)
     { extern double g_pw_ms[12]; const unsigned long long a_ = g_wp_fl > 0 ? wp_tsc() : 0; const int wb_ = WKP_ENTER(WKP_BEPRES); g.be->present(g.be->user, g.surfaces[target].handle); WKP_LEAVE(wb_); if (g_wp_fl > 0) g_pw_ms[11] += (double)(wp_tsc() - a_); }
     if (s_memo_stat) eng_memo_frame_end();   /* RSX_MEMO_STAT */
     g_rsx_frame_draws = s_frame_draws; s_frame_draws = 0;
+    s_prev_video = s_frame_video;
     s_frame_video = 0;
     /* DOD3_STUTTER_MS=<n>: a frame longer than n ms says what the walker did
      * in it -- texture uploads, vertex conversions stored, pipelines built --
@@ -8350,8 +8666,8 @@ static void eng_present_impl(u32 buffer_id)
                 { unsigned rn = 0, pn = 0, bl = 0; double rms = 0.0, pms = 0.0; unsigned long long dm = 0;
                   rsx_d3d12_rel_frame(&rn, &rms, &pn, &pms, &bl, &dm);
                   s_v2e_rel_n = rn; s_v2e_rel_ms = rms; s_v2e.rel_n += rn; s_v2e.rel_ms += rms; s_v2e.reap_n += pn; s_v2e.reap_ms += pms; s_v2e.backlog = bl; s_v2e.doomed = dm;
-                  unsigned sn = 0, sb = 0, sh = 0, sp = 0; double sms = 0.0; rsx_d3d12_snap_frame(&sn, &sms, &sb, &sh, &sp);
-                  s_v2e.sn_new += sn; s_v2e.sn_ms += sms; s_v2e.sn_big += sb; s_v2e.sn_hit += sh; s_v2e.sn_pool = sp;
+                  unsigned sn = 0, sb = 0, sh = 0, sp = 0, se = 0, sr = 0, smb = 0; double sms = 0.0; rsx_d3d12_snap_frame(&sn, &sms, &sb, &sh, &sp, &se, &sr, &smb);
+                  s_v2e.sn_new += sn; s_v2e.sn_ms += sms; s_v2e.sn_big += sb; s_v2e.sn_hit += sh; s_v2e.sn_pool = sp; s_v2e.sn_ev += se; s_v2e.sn_rej += sr; s_v2e.sn_mb = smb;
                   /* the tex-watch's page faults of this frame (they run on the writing thread, mostly the main PPU) */
                   rsx_texwatch_v2_frame(&s_v2e_wf_n, &s_v2e_wf_ms, &s_v2e_wf_pr);
                   s_v2e.wf_n += s_v2e_wf_n; s_v2e.wf_ms += s_v2e_wf_ms; s_v2e.wf_pr += s_v2e_wf_pr; if (s_v2e_wf_n > s_v2e.wf_max) s_v2e.wf_max = s_v2e_wf_n;
@@ -8643,6 +8959,7 @@ static void eng_query_method(u32 m, u32 arg)
 static unsigned long long s_b2_slots = 256ull, s_b2_mask = 255ull;
 #define B2_SLOTS s_b2_slots
 #define B2_IDX(i) ((unsigned long long)(i) & s_b2_mask)
+static unsigned long long s_clq_post, s_clq_exec;   /* RSX_CLEAR_Q: clears queued / executed */
 typedef struct EngJob {
     DrawSnap snap;
     eng_batch arr[ENG_MAX_BATCHES];
@@ -8650,7 +8967,7 @@ typedef struct EngJob {
     u32 n_arr, n_idx, n_packets, inl_bytes;
     unsigned vp_branch;
     u8 inl[RSX_DSP_INLINE_MAX_BYTES];
-    u32 kind, c_a, c_b;   /* 0 = draw; 1 = ordered guest write32 (c_a = address, c_b = value); 2 = query method (c_a = m, c_b = arg) */
+    u32 kind, c_a, c_b;   /* 0 = draw; 1 = ordered guest write32 (c_a = address, c_b = value); 2 = query method (c_a = m, c_b = arg); 3 = clear (c_a = mask, snap = registers) */
     volatile LONG pstate;   /* prep: 3 filling, 0 ready, 1 claimed, 2 done (RSX_DRAW_WORKERS) */
     unsigned long long seq_id;
     EngPre pre;
@@ -8769,6 +9086,16 @@ static void b2_exec_v(EngJob* j, rsx_dispatch* cview, u32* vpv)
     if (L->mode < 0) lane_mode_init(L);
     if (j->kind == 1) { extern void vm_write32(unsigned, unsigned); RSX_B2P_SET(B2P_CTRLW); vm_write32(j->c_a, j->c_b); s_b2_nctrl++; if (L->mode > 0 && L->blk.open) L->blk.n_label++; return; }
     if (j->kind == 2) { RSX_B2P_SET(B2P_CTRLQ); L->in_job = 1; eng_query_method(j->c_a, j->c_b); L->in_job = 0; if (!L->spec) s_b2_nctrl++; return; }
+    if (j->kind == 3) {   /* rissa15c RSX_CLEAR_Q: the clear, in queue order (never in a lane chunk: class 3 is serial) */
+        rsx_dispatch* const view = snap_view();
+        snap_apply(&j->snap, view);   /* the walker's delta: the following draws' snapshots no longer carry these registers */
+        if (j->blk && g_rsx_lanes_block_hook) g_rsx_lanes_block_hook(j->blk, j->pass, LN_B_CLEAR);   /* the boundary's own list, as lanes_boundary did */
+        g.rv = view;
+        sink_clear_body(j->c_a);
+        g.rv = &g.rsx;
+        s_b2_nctrl++; s_clq_exec++;
+        return;
+    }
     if (!L->spec) s_b2_njobs++;
     const double t0 = (s_wk_fast || L->spec) ? 0.0 : eng_now_ms();
     static unsigned hp_k_; const unsigned long long hp_c0 = (!L->spec && hp_on() && ((++hp_k_) & 7u) == 0u) ? wp_tsc() : 0ull;   /* reg60: 1 draw in 8 is timed (the rest costs nothing) */
@@ -8839,7 +9166,9 @@ typedef struct LcChunk {
     int marker;   /* lane111 RSX_LANES_LABELQ: no lane work, one label job the coordinator executes when the chunk reaches the head of the ring */
 } LcChunk;
 static struct {
-    int on, check, n, kmax, kmin, ready;
+    int on, check, n, kmax, kmin, ready, split; unsigned long long n_split;
+    int wr; long long wr_q[10];   /* rissa15g: why the coordinator waits on the lanes (the last lc_dispatch refusal), ticks per reason */
+    int proq; u32 proq_epoch; u64 proq_skip; unsigned long long n_proq, n_proq_fail, n_proq_gen, n_proq_fly; long long proq_q;   /* rissa15g RSX_LANES_PROQ */
     LaneState* ls[LC_MAXLANES]; void* be[LC_MAXLANES]; HANDLE thr[LC_MAXLANES];
     LcChunk ch[LC_NCH]; u32 head, cnt;
     HANDLE sem, done_ev; CRITICAL_SECTION qcs; LcChunk* q[LC_NCH + 4]; u32 qh, qn;
@@ -8868,6 +9197,23 @@ static int lc_job_class(const EngJob* j)   /* 0 draw, 1 query begin, 2 query rep
 }
 static inline EngJob* lc_job(u64 i) { return &s_b2_jobs[B2_IDX(i)]; }
 static inline LcChunk* lc_at(u32 k) { return &s_lc.ch[(s_lc.head + k) % LC_NCH]; }
+/* rissa15j RSX_WFPROF=1 (default off): what the walker waits on when the B2 ring is full (eng_b2_enqueue_impl). Each spin of the wait samples,
+ * time-weighted: the state of the ring's head chunk (none / queued / running / finished but not closed / abort / label marker), what the
+ * coordinator is doing (s_lc_ph), the jobs not yet handed to a chunk, the chunks and the chunks in flight. Read racily from the walker: a sampler. */
+static volatile int s_lc_ph;   /* 0 other 1 close+commit 2 dispatch 3 wait-lanes 4 idle 5 serial-job 6 serial-chunk 7 vc-flush */
+static struct { long long tot, hq[7], pq[8]; double und, nch, fl, hj; } s_wf;
+static int lc_wf_on(void) { static int v = -1; if (v < 0) { const char* e = getenv("RSX_WFPROF"); v = (e && e[0] == '1'); if (v) fprintf(stderr, "[lanes3-wf] RSX_WFPROF=1: sampling what the walker waits on when the ring is full\n"); } return v; }
+static void lc_wf_sample(unsigned long long p, long long dt)
+{
+    const u32 cnt = s_lc.cnt; int hc = 0, fl = 0; u32 hj = 0;
+    if (cnt && cnt <= LC_NCH) {
+        const LcChunk* c = lc_at(0); const LONG st = c->state; hj = c->njobs;
+        hc = c->marker ? 5 : st == LCS_QUEUED ? 1 : st == LCS_RUN ? 2 : st == LCS_OK ? 3 : st == LCS_ABORT ? 4 : 6;
+        for (u32 k = 0; k < cnt; k++) { const LONG s2 = lc_at(k)->state; if (s2 == LCS_QUEUED || s2 == LCS_RUN) fl++; }
+    }
+    s_wf.tot += dt; s_wf.hq[hc] += dt; s_wf.pq[s_lc_ph & 7] += dt;
+    s_wf.und += (double)(long long)(p - s_lc.next) * (double)dt; s_wf.nch += (double)cnt * (double)dt; s_wf.fl += (double)fl * (double)dt; s_wf.hj += (double)hj * (double)dt;
+}
 extern void rsx_d3d12_lane_init(void); extern int rsx_d3d12_lane_ok(void); extern u64 rsx_d3d12_lane_sig(void);
 extern u32 rsx_d3d12_lane_list_new(unsigned blk, unsigned pass); extern u32 rsx_d3d12_lane_epoch(void); extern void rsx_d3d12_lane_flatten(void);
 extern void rsx_d3d12_lane_list_select(u32 idx); extern void rsx_d3d12_lane_list_commit(u32 idx); extern void rsx_d3d12_lane_list_discard(u32 idx); extern u32 rsx_d3d12_lane_list_n(u32 idx);
@@ -8895,6 +9241,28 @@ static void lc_push(LcChunk* c)
     LeaveCriticalSection(&s_lc.qcs);
     ReleaseSemaphore(s_lc.sem, 1, NULL);
 }
+/* rissa15s RSX_LANES_SPIN=<us> (default 0 = off): lanes and coordinator spin up to <us> before the kernel wait, to cut the wake latency of the
+ * ~90 chunk hand-offs and ~50 serial drains per frame. s_lc_done_seq counts finished chunks so the coordinator can spin on it. */
+static volatile LONG s_lc_done_seq;
+/* rissa15h RSX_LANES_WWAKE=1 (default 0): the coordinator waiting on the lanes because the walker has not yet given it enough jobs
+ * (walker empty / query open / small chunk / every lane busy) slept on done_ev, woken only by a lane finishing or the 1 ms timeout:
+ * the walker's new jobs did not wake it. It now posts the producer index it needs in s_lc_wwant and the walker sets done_ev when it gets there. */
+static volatile long long s_lc_wwant; static int s_lc_wwake;
+static inline void lc_wwant_check(unsigned long long np)
+{
+    const long long ww = __atomic_load_n(&s_lc_wwant, __ATOMIC_SEQ_CST);
+    if (ww && (long long)np >= ww && InterlockedCompareExchange64(&s_lc_wwant, 0, ww) == ww) SetEvent(s_lc.done_ev);
+}
+static long long lc_spin_ticks(void)
+{
+    static long long t = -1;
+    if (t < 0) {
+        const char* e = getenv("RSX_LANES_SPIN"); const int us = e ? atoi(e) : 0;
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        t = us > 0 ? (long long)(us > 2000 ? 2000 : us) * f.QuadPart / 1000000 : 0;
+    }
+    return t;
+}
 /* a lane runs a chunk: speculative; anything shared and written is an abort */
 static void lc_run_chunk(LaneState* L, LcChunk* c)
 {
@@ -8914,13 +9282,14 @@ static void lc_run_chunk(LaneState* L, LcChunk* c)
     snap_view_copy(L->wview, c->view);
     t_rv = L->wview;
     L->spec = 1;
+    if (s_lc.proq) { t_pass_shadow = c->pro.pshadow; t_pass_cw = c->pro.pcw; t_pass_ch = c->pro.pch; t_pass_set = 1; }
     c->reason = 0;
     volatile int ok = 0;
     if (setjmp(L->ab) == 0) {
         for (u64 i = c->j0; i < c->j1; i++) b2_exec_v(lc_job(i), L->wview, &vpv);
         ok = 1;
     }
-    L->spec = 0; L->in_draw = 0; L->in_job = 0; s_draw_open = 0; t_rv = NULL;
+    L->spec = 0; L->in_draw = 0; L->in_job = 0; s_draw_open = 0; t_rv = NULL; t_pass_set = 0;
     rsx_d3d12_lane_be_end(be, ok);
     if (ok) {
         c->zused = L->own_used; c->zpk = L->own_pk; c->zw = L->own_w; c->zh = L->own_h; c->zvalid_end = L->own_pk_valid; c->zslot = L->pro.zslot;
@@ -8953,13 +9322,17 @@ static DWORD WINAPI lc_lane_main(LPVOID arg)
       if (af && af[0] == '1') SetThreadIdealProcessor(GetCurrentThread(), (DWORD)(2 + 2 * L->lane_id)); }
     for (;;) {
         const long long w0 = b2_qpc();
-        WaitForSingleObject(s_lc.sem, INFINITE);
+        int got = 0;
+        { const long long sp = lc_spin_ticks();
+          if (sp) { while (b2_qpc() - w0 < sp && !s_lc.stop) { if (*(volatile u32*)&s_lc.qn && WaitForSingleObject(s_lc.sem, 0) == WAIT_OBJECT_0) { got = 1; break; } YieldProcessor(); } } }
+        if (!got) WaitForSingleObject(s_lc.sem, INFINITE);
         InterlockedExchangeAdd64(&s_lc.lane_idle_q[L->lane_id], b2_qpc() - w0);
         if (s_lc.stop) break;
         LcChunk* c = lc_pop();
         if (!c) continue;
         c->lane = L->lane_id;
         lc_run_chunk(L, c);
+        InterlockedIncrement(&s_lc_done_seq);
         SetEvent(s_lc.done_ev);
     }
     return 0;
@@ -8988,6 +9361,9 @@ static void lc_init(void)
     const char* c = getenv("RSX_LANES_CHECK");
     { const char* km = getenv("RSX_LANES_KMIN"); s_lc.kmin = (km && atoi(km) >= 0) ? atoi(km) : 16; }
     s_lc.n = n; s_lc.kmax = kk; s_lc.check = (c && atoi(c) == 2) ? 1 : 0;
+    { const char* ww = getenv("RSX_LANES_WWAKE"); s_lc_wwake = (ww && ww[0] == '1') ? 1 : 0; if (s_lc_wwake) fprintf(stderr, "[lanes3] RSX_LANES_WWAKE=1: the walker wakes the coordinator when the jobs it waits for arrive\n"); }
+    { const char* pq = getenv("RSX_LANES_PROQ"); s_lc.proq = (pq && pq[0] && pq[0] != '0') ? 1 : 0; if (s_lc.proq) fprintf(stderr, "[lanes3] RSX_LANES_PROQ=1: pass prologues resolved by the coordinator without draining the lanes\n"); }
+    { const char* sp = getenv("RSX_LANES_SPLIT"); s_lc.split = (sp && atoi(sp) > 0) ? atoi(sp) : 0; if (s_lc.split) fprintf(stderr, "[lanes3] RSX_LANES_SPLIT=%d: a pass seen whole is split evenly over the idle lanes (chunks of at least %d)\n", s_lc.split, s_lc.split); }
     { const char* zp = getenv("RSX_LANES_ZPRE"); s_lc.zpre = !(zp && zp[0] == '0'); }
     { const char* ps = getenv("RSX_LANES_PIPESKIP"); s_lc_pipeskip = (ps && ps[0] == '1' && !s_lc.check) ? 1 : 0; }   /* lane113: a draw whose pipeline is still building is dropped in the lane (as the serial path does) instead of aborting the chunk */
     { const char* zr = getenv("RSX_LANES_ZOWN_LRU"); s_lc.zlru = (zr && zr[0] == '1') ? 1 : 0; }   /* lane115 */
@@ -9029,7 +9405,7 @@ static int getenv_lanes_nodupfix(void) { static int v = -1; if (v < 0) { const c
 static void lc_vc_flush(void)
 {
     if (!s_lc.vcq_n && !s_lc.vpq_n) return;
-    const long long q0 = b2_qpc();
+    const long long q0 = b2_qpc(); const int ph_ = s_lc_ph; s_lc_ph = 7;
     /* rissa128 RSX_LANES_VCPRO: promotions first (entries older than the stores below). Every lane is idle here, as for the coordinator's own promote.
      * An entry that is gone, replaced (gen) or already promoted is skipped. A promotion changes no lookup result (key, gen, content stay): s_lc.gen is not bumped for it. */
     for (u32 i = 0; i < s_lc.vpq_n; i++) {
@@ -9038,16 +9414,18 @@ static void lc_vc_flush(void)
         if (ex && ex->key == s_lc.vpq[i].key && ex->gen == s_lc.vpq[i].gen && !ex->buf && !eng_slow() && pm && ex->bytes >= pm) { eng_vc_promote(ex); s_lc.n_vpro_ap++; }
     }
     s_lc.vpq_n = 0;
-    const u32 had_stores = s_lc.vcq_n;
+    u32 had_stores = s_lc.vcq_n; u32 n_real = 0;
     for (u32 i = 0; i < s_lc.vcq_n; i++) {
         LcVcStore* e = &s_lc.vcq[i];
         EngVCEntry* ex = s_vc ? eng_vc_slot(e->key) : NULL;
-        if (ex && ex->key == e->key && ex->content == e->f.content && !getenv_lanes_nodupfix()) s_lc.n_vc_dup++;   /* lane110: an entry with the SAME key but other content is stale (the lane missed it for that reason): it is replaced, as the serial path does (before, it stayed stale and every later draw of the key missed again) */
-        else { eng_vc_store(e->key, &e->f, e->verts, e->n_verts, e->stride, e->n_source_refs, e->indexed, e->indices, e->n_draw); s_lc.n_vc_flush++; }
+        if (ex && ex->key == e->key && ex->content == e->f.content && !getenv_lanes_nodupfix()) s_lc.n_vc_dup++;
+        else if (eng_vc_churn_skip(e->key, e->f.content)) {}   /* rissa15i: no lookup result changes */   /* lane110: an entry with the SAME key but other content is stale (the lane missed it for that reason): it is replaced, as the serial path does (before, it stayed stale and every later draw of the key missed again) */
+        else { eng_vc_store(e->key, &e->f, e->verts, e->n_verts, e->stride, e->n_source_refs, e->indexed, e->indices, e->n_draw); s_lc.n_vc_flush++; n_real++; }
         free(e->verts); free(e->indices);
     }
+    if (eng_vc_nochurn()) had_stores = n_real;   /* rissa15i: skipped and duplicate stores change no lookup: the finished chunks stay valid */
     s_lc.vcq_n = 0; if (had_stores) { s_lc.gen++; s_lc.n_ledger_flush++; }
-    s_lc.ledger_q += b2_qpc() - q0;
+    s_lc.ledger_q += b2_qpc() - q0; s_lc_ph = ph_;
 }
 static u64 lc_sig(void) { return rsx_d3d12_lane_sig() + (u64)g.n_textures * 40503ull + (u64)g.n_pipelines * 9176ull + (u64)g.n_surfaces * 733ull + (u64)g.n_zdepths * 311ull + (u64)s_vcstat.miss * 17ull; }
 
@@ -9069,10 +9447,10 @@ static int eng_v2_engine(char* out, size_t n)
     char wf[80]; snprintf(wf, sizeof wf, ",\"faults\":[%u,%.2f,%u,%u]", s_v2e.wf_n, s_v2e.wf_ms, s_v2e.wf_pr, s_v2e.wf_max);   /* tex-watch page faults this second: [n, ms in the handler, protect calls, most in one frame] */
     char sj2[170]; sj2[0] = 0;   /* longest SPU run of the last ~1-2 s (cellSpurs.c) */
     { extern int spurs_v2_longest_job(char*, size_t); char t[160]; if (spurs_v2_longest_job(t, sizeof t)) snprintf(sj2, sizeof sj2, ",%s", t); }
-    snprintf(out, n, "\"eng\":{\"rtc\":[%u,%.1f],\"rtd\":[%u,%.1f],\"zdc\":[%u,%.1f],\"zdd\":[%u,%.1f],\"snap\":%u,\"pack\":%u,\"gov\":[%u,%u],\"rec\":%u,\"abort\":%llu,\"serial\":%llu,\"zpre\":[%u,%u],\"rel\":[%u,%.1f],\"reap\":[%u,%.1f,%u,%llu],\"snapres\":[%u,%.1f,%u,%u,%u]%s%s%s%s%s}",
+    snprintf(out, n, "\"eng\":{\"rtc\":[%u,%.1f],\"rtd\":[%u,%.1f],\"zdc\":[%u,%.1f],\"zdd\":[%u,%.1f],\"snap\":%u,\"pack\":%u,\"gov\":[%u,%u],\"rec\":%u,\"abort\":%llu,\"serial\":%llu,\"zpre\":[%u,%u],\"rel\":[%u,%.1f],\"reap\":[%u,%.1f,%u,%llu],\"snapres\":[%u,%.1f,%u,%u,%u,%u,%u,%u]%s%s%s%s%s}",
              s_v2e.rt_c, s_v2e.rt_c_ms, s_v2e.rt_d, s_v2e.rt_d_ms, s_v2e.zd_c, s_v2e.zd_c_ms, s_v2e.zd_d, s_v2e.zd_d_ms, s_v2e.snap, s_v2e.pack,
              s_v2e.gov_c, s_v2e.gov_z, s_v2e.rec, ab - ab0, ser - ser0, s_v2e.zpre, s_v2e.zpre_skip, s_v2e.rel_n, s_v2e.rel_ms, s_v2e.reap_n, s_v2e.reap_ms, s_v2e.backlog, s_v2e.doomed >> 20,
-             s_v2e.sn_new, s_v2e.sn_ms, s_v2e.sn_big, s_v2e.sn_hit, s_v2e.sn_pool, pl, zm, sj2, mm, wf);
+             s_v2e.sn_new, s_v2e.sn_ms, s_v2e.sn_big, s_v2e.sn_hit, s_v2e.sn_pool, s_v2e.sn_ev, s_v2e.sn_rej, s_v2e.sn_mb, pl, zm, sj2, mm, wf);
     ab0 = ab; ser0 = ser;
     memset(&s_v2e, 0, sizeof s_v2e);
     return 1;
@@ -9096,6 +9474,10 @@ static void lc_zpre(u32 cur)
         if (samp && z->samp_frame + samp < g.frames) { s_lc.n_zpre_skip++; s_v2e.zpre_skip++; continue; }
         s_zc_pre = 1;
         if (z->snap_w && !(z->snapshot_valid && z->snapshot)) { eng_zdepth_snapshot(i, z->snap_w, z->snap_h); s_lc.n_zpre++; s_v2e.zpre++; }
+        if (z->snap2 && !z->snap2_valid && z->snap2_w && g.be->depth_resnap) {   /* RSX_ZSNAP_ALT: the alternate slot re-taken into its own texture */
+            V2CTX(z->offset, z->location);
+            if (g.be->depth_resnap(g.be->user, z->handle, z->snap2, z->snap2_w, z->snap2_h, 0)) { eng_zcopy_waste(z->snap2_w, z->snap2_h, z->snap2_used); z->snap2_used = 0; z->snap2_pre = 1; z->snap2_valid = 1; s_v2e.snap++; s_v2e.zc_pre++; s_lc.n_zpre++; s_v2e.zpre++; }
+        }
         if (z->packed_w && !(z->packed_valid && z->packed)) { eng_zdepth_packed(i, z->packed_w, z->packed_h); s_lc.n_zpre++; s_v2e.zpre++; }
         s_zc_pre = 0;
     }
@@ -9104,7 +9486,7 @@ static void lc_zpre(u32 cur)
 static void lc_serial_job(EngJob* j)
 {
     LaneState* const L = &s_lane0;
-    const long long q0 = b2_qpc(); const u64 sg0 = lc_sig();
+    const long long q0 = b2_qpc(); const u64 sg0 = lc_sig(); const int ph_ = s_lc_ph; s_lc_ph = 5;
     const int cl = lc_job_class(j);
     if (g_b2p_on) b2p_job_begin();
     b2_exec(j);
@@ -9114,17 +9496,17 @@ static void lc_serial_job(EngJob* j)
     if (cl == 0) {   /* the pass prologue of this draw (if it ran) is the one the following chunks use */
         s_lc.pass_cur = j->pass; s_lc.frame_cur = g.frames; s_lc.last_blk = j->blk;
         s_lc.pro_ok = L->mode > 0 && L->blk.open && L->pro.valid_t && L->pro.epoch == L->epoch && L->pro.zslot != ENG_INVALID;
-        if (s_lc.pro_ok) { s_lc.pro = L->pro; if (s_lc.zpre) lc_zpre(s_lc.pro.zslot); }
+        if (s_lc.pro_ok) { s_lc.pro = L->pro; s_lc.pro.pshadow = g_rsx_pass_shadow; s_lc.pro.pcw = g_rsx_pass_cw; s_lc.pro.pch = g_rsx_pass_ch; if (s_lc.zpre) lc_zpre(s_lc.pro.zslot); }
         else s_lc.n_serial_pro++;
     }
     s_lc.n_serial++;
-    s_lc.serial_q += b2_qpc() - q0;
+    s_lc.serial_q += b2_qpc() - q0; s_lc_ph = ph_;
 }
 /* a chunk run serially (an abort, or CHECK=2): today's per-draw path through the chunk's view; records go to the chunk's list */
 static void lc_serial_chunk(LcChunk* c)
 {
     LaneState* const L = &s_lane0;
-    const long long q0 = b2_qpc(); const u64 sg0 = lc_sig();
+    const long long q0 = b2_qpc(); const u64 sg0 = lc_sig(); const int ph_ = s_lc_ph; s_lc_ph = 6;
     L->blk.open = 0; L->have_prev = 0; L->zmodel_ok = 0; L->pro.valid_t = 0;   /* no prologue: every draw resolves its own targets */
     L->km.valid = 0; L->vp_cb_valid = 0; L->vp_cb_bound = 0; L->cur_pipe = NULL;
     rsx_d3d12_lane_be_reset_serial();
@@ -9143,7 +9525,7 @@ static void lc_serial_chunk(LcChunk* c)
     rsx_d3d12_lane_be_reset_serial();
     if (lc_sig() != sg0) s_lc.gen++;
     s_lc.cq_att = g.q_attempts; s_lc.cq_drw = g.q_draws;   /* the real bracket counters after the serial run */
-    s_lc.serial_q += b2_qpc() - q0;
+    s_lc.serial_q += b2_qpc() - q0; s_lc_ph = ph_;
 }
 static void lc_free_chunk_results(LcChunk* c)
 {
@@ -9184,9 +9566,10 @@ static void lc_zown_assign(LcChunk* c)
         k++;
     }
     if (s_lc.zlean) {   /* lane113 RSX_LANES_ZLEAN=1: an object is made only for a pass that has been using them, at most 4 a frame, and never under VRAM pressure (user's log: 53 made, 0.9 used, 150 ms of dispatch) */
-        if (s_lc.zpress_chk != (g.frames >> 6)) { s_lc.zpress_chk = g.frames >> 6; unsigned long long u = 0, bud = 0; static unsigned long long bmax; if (g_rsx_vram_hook && g_rsx_vram_hook(&u, &bud)) { if (bud > bmax) bmax = bud; s_lc.zpress = (bmax && u * 100ull >= bmax * 80ull) ? 1 : 0; } }   /* one query, budget = the largest seen (it swings 7250 <-> 6500 with the sweep) */
+        if (s_lc.zpress_chk != (g.frames >> 6)) { s_lc.zpress_chk = g.frames >> 6; unsigned long long u = 0, bud = 0; static unsigned long long bmax; if (g_rsx_vram_hook && g_rsx_vram_hook(&u, &bud)) { if (bud > bmax) bmax = bud; s_lc.zpress = (bmax && u * 100ull >= bmax * (unsigned long long)lc_zpress_pct()) ? 1 : 0; } }   /* one query, budget = the largest seen (it swings 7250 <-> 6500 with the sweep) */
         if (s_lc.zpress) { s_lc.n_zown_press++; return; }
         if (s_lc.zmk_frame != g.frames) { s_lc.zmk_frame = g.frames; s_lc.zmk_n = 0; }
+        if (s_zdem_ask[s_lc.pro.zslot]) { s_zdem_ask[s_lc.pro.zslot] = 0; if (s_lc.zdem[s_lc.pro.zslot] < 2) s_lc.zdem[s_lc.pro.zslot] = 2; }
         if (!s_lc.zdem[s_lc.pro.zslot] || s_lc.zmk_n >= 4) { s_lc.n_zown_skip++; return; }
         s_lc.zdem[s_lc.pro.zslot]--; s_lc.zmk_n++;
     }
@@ -9212,7 +9595,7 @@ static void lc_commit(LcChunk* c)
     if (c->nvr) rsx_d3d12_lane_vis_append(c->vr, c->nvr);
     for (u32 k = 0; k < c->nzev; k++) {
         const u32 z = c->zz[k];
-        if (c->zk[k] == LZ_WRITE && z < ENG_MAX_ZDEPTHS) { g.zdepths[z].had_write = 1; g.zdepths[z].snapshot_valid = 0; g.zdepths[z].packed_valid = 0; }
+        if (c->zk[k] == LZ_WRITE && z < ENG_MAX_ZDEPTHS) { g.zdepths[z].had_write = 1; g.zdepths[z].snapshot_valid = 0; g.zdepths[z].snap2_valid = 0; g.zdepths[z].packed_valid = 0; }
     }
     lc_zown_commit(c);
     for (u32 k = 0; k < c->nqr; k++) {   /* the query reports, in job order, with the counters of the whole bracket */
@@ -9337,10 +9720,10 @@ static int lc_arena_nw(void)
     return v;
 }
 /* the jobs [next, p) the next chunk may take; returns their count (0 = none), *nqb = query begins inside, *lb = block id of the last draw */
-static u32 lc_form(u64 p, u32* nqb_out, u32* lb_out)
+static u32 lc_form(u64 p, u32* nqb_out, u32* lb_out, u32 cap)
 {
     u32 n = 0, last_ok = 0, nqb = 0, nqb_ok = 0, qo = 0, lb = s_lc.last_blk, lb_ok = lb;
-    for (u64 i = s_lc.next; i < p && n < (u32)s_lc.kmax; i++) {
+    for (u64 i = s_lc.next; i < p && n < cap; i++) {
         const EngJob* j = lc_job(i);
         const int cl = lc_job_class(j);
         if (cl == 3) break;
@@ -9352,11 +9735,48 @@ static u32 lc_form(u64 p, u32* nqb_out, u32* lb_out)
     *nqb_out = nqb_ok; *lb_out = lb_ok;
     return last_ok;
 }
+/* rissa15g RSX_LANES_PROQ=1 (default 0): a draw that opens a new pass (or follows a boundary) was a serial unit: every lane drained, then the
+ * coordinator ran the draw itself (~52 us) only to learn the pass's target set and depth slot. Under PROQ the coordinator resolves them here on
+ * a scratch copy of its view moved to this draw, with the lanes still recording the previous pass; the draw then starts a chunk like any other.
+ * Objects the lookup creates record into a list opened after the lists in flight (in order); if shared state moved, gen moves and the chunks in
+ * flight are redone (as after a serial unit). Returns 0 when there is no usable prologue (the serial path runs, as today). */
+static int lc_proq(EngJob* j)
+{
+    static rsx_dispatch* tmp;
+    if (!tmp) tmp = snap_view_new();
+    if (!tmp) return 0;
+    const long long q0 = b2_qpc();
+    const u64 sg0 = lc_sig();
+    snap_view_copy(tmp, snap_view());
+    snap_apply(&j->snap, tmp);
+    rsx_dispatch* const save = t_rv;
+    t_rv = tmp;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(RV, &sf);
+    const u32 psig[8] = { sf.clip_x, sf.clip_y, sf.color_pitch[0], sf.color_pitch[1], rsx_dsp_reg(RV, 0x0208), sf.color_target, sf.depth_format, sf.color_format };   /* as the lane computes it */
+    u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+    const u32 nt = eng_current_target_set(targets);
+    const u32 zs = nt ? eng_zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h) : ENG_INVALID;
+    t_rv = save;
+    if (lc_sig() != sg0) { s_lc.gen++; s_lc.n_proq_gen++; }
+    if (!nt || zs == ENG_INVALID) { s_lc.n_proq_fail++; s_lc.proq_q += b2_qpc() - q0; return 0; }
+    EngLanePro* const P = &s_lc.pro;
+    memset(P, 0, sizeof *P);
+    P->valid_t = 1; P->epoch = 0x40000000u | ++s_lc.proq_epoch; memcpy(P->sig, psig, sizeof psig);
+    P->n_targets = nt; memcpy(P->targets, targets, nt * sizeof *targets); P->zslot = zs;
+    P->pshadow = g_rsx_pass_shadow; P->pcw = g_rsx_pass_cw; P->pch = g_rsx_pass_ch;   /* eng_note_pass just set them for this pass */
+    s_lc.pro_ok = 1; s_lc.pass_cur = j->pass; s_lc.last_blk = j->blk;
+    if (s_lc.cnt) s_lc.n_proq_fly++;
+    else if (s_lc.zpre) lc_zpre(zs);   /* the pre-snapshots record copies: only with every chunk closed, as after a serial unit */
+    s_lc.n_proq++;
+    s_lc.proq_q += b2_qpc() - q0;
+    return 1;
+}
 static int lc_dispatch(u64 p)
 {
     EngJob* const j = lc_job(s_lc.next);
     const int cl = lc_job_class(j);
-    const int lane_ok = s_lc.pro_ok && g.frames == s_lc.frame_cur &&
+    int lane_ok = s_lc.pro_ok && g.frames == s_lc.frame_cur &&
         (cl == 1 || cl == 2 || (cl == 0 && j->pass == s_lc.pass_cur && (j->blk == s_lc.last_blk || j->blk == s_lc.last_blk + 1u)));
     const int draining = s_b2_waiting > 0;
     int why = 0;
@@ -9367,27 +9787,44 @@ static int lc_dispatch(u64 p)
         s_lc.next++; s_lc.n_label_q++;
         return 1;
     }
+    if (!lane_ok && s_lc.proq && cl == 0 && g.frames == s_lc.frame_cur && s_lc.proq_skip != s_lc.next + 1u && s_lc.cnt < LC_NCH - 1u) {
+        if (lc_proq(j)) lane_ok = 1; else s_lc.proq_skip = s_lc.next + 1u;   /* not retried while this job waits for the serial path */
+    }
     if (!lane_ok) why = !s_lc.pro_ok ? 1 : g.frames != s_lc.frame_cur ? 3 : cl == 3 ? 4 : 5;
     if (lane_ok) {
         u32 nqb = 0, lb = 0;
-        const u32 n = lc_form(p, &nqb, &lb);
+        u32 n = lc_form(p, &nqb, &lb, (u32)s_lc.kmax);
+        /* rissa15e RSX_LANES_SPLIT=<min> (default 0 = off): passes are ~45 draws, so K=32 gave 32 + 13 and one lane idle before the pass drain.
+         * When the whole rest of the pass is visible (the stop job is already in the ring), it is split evenly over the idle lanes. */
+        if (s_lc.split > 0 && n >= (u32)(2 * s_lc.split)) {
+            u32 nqb2 = 0, lb2 = 0;
+            const u32 cap = (u32)s_lc.kmax * (u32)s_lc.n;
+            const u32 tot = lc_form(p, &nqb2, &lb2, cap);
+            int fl = lc_flight();
+            int idle = s_lc.n - fl; if (idle < 1) idle = 1;
+            if (tot < cap && s_lc.next + tot < p) {   /* seen whole */
+                u32 parts = (tot + (u32)s_lc.split - 1u) / (u32)s_lc.split; if (parts > (u32)idle) parts = (u32)idle; if (parts < 1u) parts = 1u;
+                u32 m = (tot + parts - 1u) / parts; if (m > (u32)s_lc.kmax) m = (u32)s_lc.kmax;
+                if (m < n) { n = lc_form(p, &nqb, &lb, m); s_lc.n_split++; }
+            }
+        }
         const u64 avail = p - s_lc.next;
         const int flight = lc_flight();
         if (!n) {
-            if (!(draining || avail >= (u64)s_lc.kmax)) return 0;   /* an open query bracket: more jobs are coming */
+            if (!(draining || avail >= (u64)s_lc.kmax)) { s_lc.wr = 1; return 0; }   /* an open query bracket: more jobs are coming */
             why = 6; goto serial;
         }
-        if (s_lc.cnt >= LC_NCH - 1u) return 0;
-        if (s_lc.seq && s_lc.cnt) return 0;
-        if (avail < (u64)s_lc.kmin && flight > 0 && !draining) return 0;   /* lanes are busy and the chunk is small: let it grow */
-        if (flight >= s_lc.n && avail < (u64)s_lc.kmax && !draining) return 0;   /* every lane busy: let the chunk grow */
+        if (s_lc.cnt >= LC_NCH - 1u) { s_lc.wr = 2; return 0; }
+        if (s_lc.seq && s_lc.cnt) { s_lc.wr = 3; return 0; }
+        if (avail < (u64)s_lc.kmin && flight > 0 && !draining) { s_lc.wr = 4; return 0; }   /* lanes are busy and the chunk is small: let it grow */
+        if (flight >= s_lc.n && avail < (u64)s_lc.kmax && !draining) { s_lc.wr = 5; return 0; }   /* every lane busy: let the chunk grow */
         if (!s_lc.cnt && (s_lc.vcq_n >= 8 || s_lc.vpq_n >= 4)) lc_vc_flush();   /* every lane is idle and everything is closed: apply the deferred vertex-cache stores now (later chunks hit them) */
         if (rsx_d3d12_lane_arena_free() < lc_arena_thr()) {   /* the tail chunk of the arena is nearly full: a new one is taken with every lane idle (it may submit or wait) */
             const long long a0 = b2_qpc();
             if (lc_arena_nw() && rsx_d3d12_lane_arena_extend_nowait()) {   /* rissa128: chained with the lanes in flight */
                 s_lc.n_arena_nw++; s_lc.t_arena_q += b2_qpc() - a0;
             } else {
-                if (flight > 0) return 0;
+                if (flight > 0) { s_lc.wr = 6; return 0; }
                 const long long a0b = b2_qpc();
                 rsx_d3d12_lane_arena_extend(); s_lc.n_arena_ext++;
                 s_lc.t_arena_q += b2_qpc() - a0b;
@@ -9395,7 +9832,7 @@ static int lc_dispatch(u64 p)
         }
         /* a list for the records; the lists of the frame are flattened with every chunk closed when the table is nearly full */
         u32 list = rsx_d3d12_lane_list_new(j->blk, j->pass);
-        if (list == ~0u) { if (s_lc.cnt) return 0; rsx_d3d12_lane_flatten(); list = rsx_d3d12_lane_list_new(j->blk, j->pass); if (list == ~0u) return 0; }
+        if (list == ~0u) { if (s_lc.cnt) { s_lc.wr = 7; return 0; } rsx_d3d12_lane_flatten(); list = rsx_d3d12_lane_list_new(j->blk, j->pass); if (list == ~0u) return 0; }
         u32 shadow = ~0u;
         if (s_lc.check) { shadow = rsx_d3d12_lane_list_new(j->blk, j->pass); if (shadow == ~0u) return 0; }
         const long long q0 = b2_qpc();
@@ -9426,9 +9863,9 @@ static int lc_dispatch(u64 p)
         return 1;
     }
 serial:
-    if (s_lc.cnt) return 0;   /* a serial unit runs with every chunk before it closed */
+    if (s_lc.cnt) { s_lc.wr = 8; return 0; }   /* a serial unit runs with every chunk before it closed */
     s_lc.ser_why[why]++;
-    if (cl == 3) { if (j->kind == 1) s_lc.cj_k1++; else { s_lc.cj_k2++; u32 q = 0; while (q < 8 && s_lc.cj_cn[q] && s_lc.cj_ca[q] != j->c_a) q++; if (q < 8) { s_lc.cj_ca[q] = j->c_a; s_lc.cj_cn[q]++; } } }
+    if (cl == 3 && j->kind != 3) { if (j->kind == 1) s_lc.cj_k1++; else { s_lc.cj_k2++; u32 q = 0; while (q < 8 && s_lc.cj_cn[q] && s_lc.cj_ca[q] != j->c_a) q++; if (q < 8) { s_lc.cj_ca[q] = j->c_a; s_lc.cj_cn[q]++; } } }
     lc_vc_flush();
     lc_serial_job(j);
     s_lc.next++;
@@ -9452,6 +9889,18 @@ static void lc_report(void)
             ch_ok + ch_ab + s_lc.chk_chunks ? (double)s_lc.n_jobs_lane / (double)(ch_ok + ch_ab + s_lc.chk_chunks) : 0.0, (double)s_lc.n_serial / fr, (double)s_lc.n_serial_pro / fr,
             (double)s_lc.serial_q * ms / fr, (double)s_lc.close_q * ms / fr, (double)s_lc.disp_q * ms / fr, (double)s_lc.ledger_q * ms / fr, (double)s_lc.wait_lane_q * ms / fr, (double)s_lc.idle_q * ms / fr,
             lanes, s_lc.max_flight, (double)s_lc.n_vc_defer / fr, (double)s_lc.n_vc_flush / fr, (double)s_lc.n_vc_dup / fr);
+    fprintf(stderr, "[lanes3-wait] wait-lanes ms/frame by cause: walker-empty %.2f query-open %.2f ring-full %.2f seq %.2f small-chunk %.2f all-lanes-busy %.2f arena %.2f list %.2f serial-drain %.2f other %.2f\n",
+            (double)s_lc.wr_q[0] * ms / fr, (double)s_lc.wr_q[1] * ms / fr, (double)s_lc.wr_q[2] * ms / fr, (double)s_lc.wr_q[3] * ms / fr, (double)s_lc.wr_q[4] * ms / fr,
+            (double)s_lc.wr_q[5] * ms / fr, (double)s_lc.wr_q[6] * ms / fr, (double)s_lc.wr_q[7] * ms / fr, (double)s_lc.wr_q[8] * ms / fr, (double)s_lc.wr_q[9] * ms / fr);
+    memset(s_lc.wr_q, 0, sizeof s_lc.wr_q);
+    if (lc_wf_on()) {
+        const double T = s_wf.tot > 0 ? (double)s_wf.tot : 1.0;
+        fprintf(stderr, "[lanes3-wf] walker ring-full ms/frame %.2f | head chunk: none %.2f queued %.2f running %.2f done-not-closed %.2f abort %.2f marker %.2f other %.2f | coordinator: other %.2f close %.2f dispatch %.2f wait-lanes %.2f idle %.2f serial-job %.2f serial-chunk %.2f vc-flush %.2f | avg undispatched jobs %.0f chunks %.1f in flight %.1f head jobs %.0f\n",
+                (double)s_wf.tot * ms / fr, (double)s_wf.hq[0] * ms / fr, (double)s_wf.hq[1] * ms / fr, (double)s_wf.hq[2] * ms / fr, (double)s_wf.hq[3] * ms / fr, (double)s_wf.hq[4] * ms / fr, (double)s_wf.hq[5] * ms / fr, (double)s_wf.hq[6] * ms / fr,
+                (double)s_wf.pq[0] * ms / fr, (double)s_wf.pq[1] * ms / fr, (double)s_wf.pq[2] * ms / fr, (double)s_wf.pq[3] * ms / fr, (double)s_wf.pq[4] * ms / fr, (double)s_wf.pq[5] * ms / fr, (double)s_wf.pq[6] * ms / fr, (double)s_wf.pq[7] * ms / fr,
+                s_wf.und / T, s_wf.nch / T, s_wf.fl / T, s_wf.hj / T);
+        memset(&s_wf, 0, sizeof s_wf);
+    }
     fprintf(stderr, "[lanes3-disp] dispatch ms/frame: enc-join %.2f query-reserve %.2f view-copy %.2f view-copy+apply %.2f | arena-extend %.2f\n",
             (double)s_lc.t_join_q * ms / fr, (double)s_lc.t_qres_q * ms / fr, (double)s_lc.t_view_q * ms / fr, (double)s_lc.t_apply_q * ms / fr, (double)s_lc.t_arena_q * ms / fr);
     s_lc.t_join_q = s_lc.t_qres_q = s_lc.t_view_q = s_lc.t_apply_q = s_lc.t_arena_q = 0;
@@ -9460,10 +9909,14 @@ static void lc_report(void)
     if (lc_arena_thr() != (1u << 20) || lc_arena_nw()) fprintf(stderr, "[lanes3-arena] RSX_LANES_ARENA_MB threshold %u MB nowait %d: extensions without waiting %.2f/frame, with every lane idle %.2f/frame\n", lc_arena_thr() >> 20, lc_arena_nw(), (double)s_lc.n_arena_nw / fr, (double)s_lc.n_arena_ext / fr);
     fprintf(stderr, "[lanes3-ctl] serial control jobs per frame: label %.1f other %.1f (methods:", (double)s_lc.cj_k1 / fr, (double)s_lc.cj_k2 / fr);
     for (int q = 0; q < 8; q++) if (s_lc.cj_cn[q]) fprintf(stderr, " 0x%X x%.1f", (unsigned)s_lc.cj_ca[q], (double)s_lc.cj_cn[q] / fr);
-    fprintf(stderr, ") | labels queued without a drain %.1f (RSX_LANES_LABELQ=%d)\n", (double)s_lc.n_label_q / fr, s_lc.lblq);
+    fprintf(stderr, ") | labels queued without a drain %.1f (RSX_LANES_LABELQ=%d) | clears queued %.1f run %.1f (RSX_CLEAR_Q)\n", (double)s_lc.n_label_q / fr, s_lc.lblq, (double)s_clq_post / fr, (double)s_clq_exec / fr);
+    s_clq_post = s_clq_exec = 0;
     fprintf(stderr, "[lanes3-zown] RSX_LANES_ZOWN=%d: objects made ahead %.2f/frame, consumed by a chunk %.2f, returned unused %.2f, stock %u\n", s_lc.zown, (double)s_lc.n_zown_make / fr, (double)s_lc.n_zown_used / fr, (double)s_lc.n_zown_ret / fr, s_lc.nzstock);
     if (s_lc.zlru) fprintf(stderr, "[lanes3-zown-lru] RSX_LANES_ZOWN_LRU=1: stock evictions %.2f/frame\n", (double)s_lc.n_zown_evict / fr);
     s_lc.n_zown_make = s_lc.n_zown_used = s_lc.n_zown_ret = 0; s_lc.n_zown_evict = 0;
+    if (s_lc.proq) { fprintf(stderr, "[lanes3-proq] RSX_LANES_PROQ=1 per frame: prologues %.1f (with lanes in flight %.1f) failed %.2f state-moved %.2f | ms/frame %.2f\n",
+                             (double)s_lc.n_proq / fr, (double)s_lc.n_proq_fly / fr, (double)s_lc.n_proq_fail / fr, (double)s_lc.n_proq_gen / fr, (double)s_lc.proq_q * ms / fr);
+                     s_lc.n_proq = s_lc.n_proq_fly = s_lc.n_proq_fail = s_lc.n_proq_gen = 0; s_lc.proq_q = 0; }
     s_lc.cj_k1 = s_lc.cj_k2 = s_lc.n_label_q = 0; memset(s_lc.cj_ca, 0, sizeof s_lc.cj_ca); memset(s_lc.cj_cn, 0, sizeof s_lc.cj_cn);
     memset(s_lc.ser_why, 0, sizeof s_lc.ser_why); s_lc.n_arena_ext = 0; s_lc.n_arena_nw = 0; s_lc.n_join_redo = 0;
     if (s_lc.check) { extern unsigned long long rsx_d3d12_lane_cmp_zown(unsigned long long* tex); unsigned long long zt = 0, zn = rsx_d3d12_lane_cmp_zown(&zt); fprintf(stderr, "[lanes-check2] ZOWN verified: %llu packed own-zeta copies compared (lane object vs serial object), %llu texture slots matched through them (RSX_LANES_ZOWN=%d)\n", zn, zt, s_lc.zown); }
@@ -9474,6 +9927,10 @@ static void lc_report(void)
     if (s_lc.zlean) { fprintf(stderr, "[lanes3-zlean] RSX_LANES_ZLEAN=1: makes skipped for lack of demand %.2f/frame, for VRAM pressure %.2f/frame\n", (double)s_lc.n_zown_skip / fr, (double)s_lc.n_zown_press / fr); s_lc.n_zown_skip = s_lc.n_zown_press = 0; }
     fprintf(stderr, "[lanes3-zpre] pre-snapshots at pass prologues: %.2f/frame, skipped as not sampled lately %.2f/frame (RSX_LANES_ZPRE=%d)\n", (double)s_lc.n_zpre / fr, (double)s_lc.n_zpre_skip / fr, s_lc.zpre); s_lc.n_zpre = 0; s_lc.n_zpre_skip = 0;
     if (lane_vcpro_on()) { fprintf(stderr, "[lanes3-vcpro] RSX_LANES_VCPRO=1: promotions queued %.2f/frame, applied %.2f/frame\n", (double)s_lc.n_vpro_q / fr, (double)s_lc.n_vpro_ap / fr); s_lc.n_vpro_q = s_lc.n_vpro_ap = 0; }
+    if (lc_wf_on()) { fprintf(stderr, "[lanes3-zab] snapshot aborts/frame: no object %.2f other size %.2f invalid-after-zpre %.2f invalid-lazy %.2f (zeta <=256: %.2f %.2f %.2f %.2f) | own-zeta: no zent %.2f mismatch %.2f second copy %.2f\n",
+                      s_zab[0] / (double)fr, s_zab[1] / (double)fr, s_zab[2] / (double)fr, s_zab[3] / (double)fr, s_zab_small[0] / (double)fr, s_zab_small[1] / (double)fr, s_zab_small[2] / (double)fr, s_zab_small[3] / (double)fr, s_zab[4] / (double)fr, s_zab[5] / (double)fr, s_zab[6] / (double)fr);
+                      for (int k_ = 0; k_ < 8; k_++) s_zab[k_] = 0; for (int k_ = 0; k_ < 4; k_++) s_zab_small[k_] = 0; }
+    if (zsnap_alt()) { fprintf(stderr, "[lanes3-zalt] RSX_ZSNAP_ALT=1: alternate-slot hits %.2f/frame, swaps %.2f/frame\n", (double)s_alt_hit / fr, (double)s_alt_swap / fr); s_alt_hit = s_alt_swap = 0; }
     fprintf(stderr, "[lanes3-abort] per frame:");
     static const char* const nm[RSX_LAB_N] = { "none", "tex-new", "tex-changed", "standin", "pipe-new", "pipe-building", "vc-promote", "prologue", "depth-clear", "own-snapshot", "depth-snapshot", "enc-join", "view-new", "sampler-new", "arena", "query", "zev-overflow", "depth-packed", "depth-packed-own-zeta", "other" };
     for (int k = 1; k < RSX_LAB_N; k++) { if (s_lc.ab[k]) fprintf(stderr, " %s %.2f", nm[k], (double)s_lc.ab[k] / fr); s_lc.ab[k] = 0; }
@@ -9494,14 +9951,17 @@ static DWORD WINAPI lc_coord_main(LPVOID arg)
     if (g_b2p_on) b2p_calibrate();
     const int prof = s_wp_on > 0 || g_b2p_on;
     for (;;) {
+        s_lc_ph = 1;
         int moved = lc_close() ? 1 : 0;
         const u64 p = __atomic_load_n(&s_b2_prod, __ATOMIC_ACQUIRE);
+        s_lc_ph = 2;
         if (s_lc.next < p) moved |= lc_dispatch(p);
+        s_lc_ph = 0;
         lc_report();
         if (moved) continue;
         if (s_lc.cnt == 0 && s_lc.next == p) {   /* nothing to do: wait for the walker like b2_main */
             if (__atomic_load_n(&s_b2_stop, __ATOMIC_ACQUIRE)) break;
-            const long long i0 = b2_qpc();
+            const long long i0 = b2_qpc(); s_lc_ph = 4;
             unsigned long long pp = p;
             for (int i = 0; i < 3000 && pp == p; i++) { YieldProcessor(); pp = __atomic_load_n(&s_b2_prod, __ATOMIC_ACQUIRE); }
             if (pp == p) {
@@ -9514,7 +9974,27 @@ static DWORD WINAPI lc_coord_main(LPVOID arg)
             s_lc.idle_q += b2_qpc() - i0;
             continue;
         }
-        if (s_lc.cnt) { const long long w0 = b2_qpc(); WaitForSingleObject(s_lc.done_ev, 1); s_lc.wait_lane_q += b2_qpc() - w0; }
+        if (s_lc.cnt) {
+            const long long w0 = b2_qpc(); s_lc_ph = 3; const long long sp = lc_spin_ticks(); int got = 0;
+            if (sp) { const LONG d0 = s_lc_done_seq; while (b2_qpc() - w0 < sp) { if (s_lc_done_seq != d0) { got = 1; break; } YieldProcessor(); } }
+            if (!got) {
+                long long tgt = 0;
+                if (s_lc_wwake) {
+                    const int r = s_lc.next == p ? 0 : s_lc.wr;
+                    if (r == 0 || r == 1) tgt = (long long)p + 1;
+                    else if (r == 4) tgt = (long long)(s_lc.next + (u64)s_lc.kmin);
+                    else if (r == 5) tgt = (long long)(s_lc.next + (u64)s_lc.kmax);
+                    if (tgt && tgt <= (long long)p) tgt = (long long)p + 1;
+                }
+                if (tgt) {
+                    __atomic_store_n(&s_lc_wwant, tgt, __ATOMIC_SEQ_CST);
+                    if ((long long)__atomic_load_n(&s_b2_prod, __ATOMIC_SEQ_CST) < tgt) WaitForSingleObject(s_lc.done_ev, 1);
+                    __atomic_store_n(&s_lc_wwant, 0, __ATOMIC_SEQ_CST);
+                } else WaitForSingleObject(s_lc.done_ev, 1);
+            }
+            s_lc.wait_lane_q += b2_qpc() - w0;
+            s_lc.wr_q[s_lc.next == p ? 0 : (s_lc.wr > 0 && s_lc.wr < 10 ? s_lc.wr : 9)] += b2_qpc() - w0; s_lc.wr = 0;
+        }
         else YieldProcessor();   /* waiting for the walker to finish a query bracket */
     }
     return 0;
@@ -9882,9 +10362,11 @@ static void eng_b2_enqueue_impl(void)
         const long long q0 = s_wp_on > 0 ? b2_qpc() : 0;
         const int wo_ = WKP_ENTER(WKP_WAIT);
         unsigned spins = 0;
+        const int wf_ = s_lc.ready && lc_wf_on(); long long tl_ = wf_ ? b2_qpc() : 0;
         while (p - __atomic_load_n(&s_b2_cons, __ATOMIC_ACQUIRE) >= B2_SLOTS) {
             if (__atomic_load_n(&s_b2_sleeping, __ATOMIC_SEQ_CST)) SetEvent(s_b2_ev);
             if (++spins < 2000) YieldProcessor(); else SwitchToThread();
+            if (wf_) { const long long tn_ = b2_qpc(); lc_wf_sample(p, tn_ - tl_); tl_ = tn_; }
         }
         WKP_LEAVE(wo_);
         if (g_wkp_on > 0) s_wkp.full_n++;
@@ -9921,6 +10403,7 @@ static void eng_b2_enqueue_impl(void)
     __atomic_store_n(&s_b2_prod, p + 1, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s_b2_sleeping, __ATOMIC_SEQ_CST)) SetEvent(s_b2_ev);
+    if (s_lc_wwake) lc_wwant_check(p + 1);
     if (s_wk_n && s_wk_sleepers > 0) ReleaseSemaphore(s_wk_sem, 1, NULL);
     if (s_wp_on > 0) { const unsigned q = (unsigned)(p + 1 - s_b2_cons); if (q > s_b2_maxq) s_b2_maxq = q; }
 }
@@ -9953,9 +10436,55 @@ static int b2_post_ctrl_impl(u32 kind, u32 a, u32 b)
     __atomic_store_n(&s_b2_prod, p + 1, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s_b2_sleeping, __ATOMIC_SEQ_CST)) SetEvent(s_b2_ev);
+    if (s_lc_wwake) lc_wwant_check(p + 1);
     return 1;
 }
 static int b2_post_ctrl(u32 kind, u32 a, u32 b) { const int wo_ = WKP_ENTER(WKP_ENQ); const int r = b2_post_ctrl_impl(kind, a, b); WKP_LEAVE(wo_); if (r && g_wkp_on > 0) s_wkp.ctrl++; return r; }
+/* rissa15c RSX_CLEAR_Q=1 (default off): a CLEAR_SURFACE is queued as job kind 3 with a register snapshot, instead of drain + direct clear. The walker
+ * keeps the lanes' block numbering (the boundary) and the executing thread runs the clear in order with the boundary's list (wp37d: the clear drain
+ * blocked the walker 55-244 ms every 2 s). Returns 0 when it cannot queue (the caller drains as before). */
+static int s_clq_on = -1;
+static int b2_post_clear_impl(u32 mask)
+{
+    if (s_clq_on < 0) { const char* e = getenv("RSX_CLEAR_Q"); s_clq_on = (e && e[0] == '1') ? 1 : 0; if (s_clq_on) fprintf(stderr, "[clearq] RSX_CLEAR_Q=1: clears queued as ordered jobs\n"); }
+    if (!s_clq_on || !s_b2_started || t_on_b2 || s_b2_prod_tid != GetCurrentThreadId()) return 0;
+    if (s_ring_on < 0) s_ring_on = (getenv("RSX_TRACE_ON_WHITE") || getenv("RSX_TRACE_ON_COLOR")) ? 1 : 0;
+    if (s_ring_on) return 0;
+    const unsigned long long p = s_b2_prod;
+    if (p - __atomic_load_n(&s_b2_cons, __ATOMIC_ACQUIRE) >= B2_SLOTS) {
+        unsigned spins = 0;
+        const long long q0 = s_wp_on > 0 ? b2_qpc() : 0;
+        const int wo_ = WKP_ENTER(WKP_WAIT);
+        while (p - __atomic_load_n(&s_b2_cons, __ATOMIC_ACQUIRE) >= B2_SLOTS) {
+            if (__atomic_load_n(&s_b2_sleeping, __ATOMIC_SEQ_CST)) SetEvent(s_b2_ev);
+            if (++spins < 2000) YieldProcessor(); else SwitchToThread();
+        }
+        WKP_LEAVE(wo_);
+        if (s_wp_on > 0) { s_b2_nfull++; s_b2_full_q += b2_qpc() - q0; }
+    }
+    EngJob* j = &s_b2_jobs[B2_IDX(p)];
+    __atomic_store_n(&j->pstate, 3, __ATOMIC_RELEASE);
+    j->kind = 3; j->c_a = mask; j->c_b = 0;
+    { const int wo_ = WKP_ENTER(WKP_SNAP); snap_fill_into(&j->snap, &g.rsx); WKP_LEAVE(wo_); }
+    j->n_arr = j->n_idx = j->n_packets = j->inl_bytes = 0;
+    j->vp_branch = s_vp_branch_bits_reg;
+    j->seq_id = p;
+    j->blk = j->pass = 0;
+    if (s_ln.on < 0) lanes_init();
+    if (s_ln.on > 0) {   /* lanes_boundary's walker half; the list switch runs with the job */
+        s_ln.blk_open = 0; s_ln.nd = 0;
+        s_ln.blk_id++; s_ln.f_blk_bound++;
+        j->blk = s_ln.blk_id; j->pass = s_ln.pass_id;
+    }
+    __atomic_store_n(&j->pstate, 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_b2_prod, p + 1, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_b2_sleeping, __ATOMIC_SEQ_CST)) SetEvent(s_b2_ev);
+    if (s_lc_wwake) lc_wwant_check(p + 1);
+    s_clq_post++;
+    return 1;
+}
+static int b2_post_clear(u32 mask) { const int wo_ = WKP_ENTER(WKP_ENQ); const int r = b2_post_clear_impl(mask); WKP_LEAVE(wo_); return r; }
 static int eng_b2_post_query(u32 m, u32 arg) { return b2_post_ctrl(2, m, arg); }
 void rsx_draw_engine_b2_ordered_write32(unsigned addr, unsigned val)
 {
@@ -10017,6 +10546,7 @@ void rsx_draw_engine_b2_drain_at(const char* file, int line) { (void)file; (void
 unsigned long long rsx_draw_engine_b2_seq(void) { return 0; }
 void rsx_draw_engine_b2_wait(unsigned long long seq) { (void)seq; }
 static void eng_b2_stop(void) {}
+static int b2_post_clear(u32 mask) { (void)mask; return 0; }
 #endif
 
 /* RSX_QUERY_NOSYNC (see the fence in rsx_draw_engine_method): -1 undecided.
@@ -10218,6 +10748,12 @@ void rsx_draw_engine_query_result(u32 report_index, u64 count)
 {
     static int log = -1; if (log < 0) log = getenv("RSX_QUERY_LOG") ? 1 : 0;
     if (log) fprintf(stderr, "[query] f%u report %u = %llu\n", g.frames, report_index, (unsigned long long)count);
+    { /* RSX_QUERY_MIN=<n> (test, 09/11, Clank disappearing at some camera angles): an occlusion count below n is reported as n, so no
+       * object is ever hidden by a query. Off (0) by default. */
+      static long long qmin = -1;
+      if (qmin < 0) { const char* e = getenv("RSX_QUERY_MIN"); qmin = e ? atoll(e) : 0; if (qmin < 0) qmin = 0;
+                      if (qmin) fprintf(stderr, "[query] RSX_QUERY_MIN=%lld: occlusion counts below it reported as it (test)\n", qmin); }
+      if (qmin && count < (u64)qmin) count = (u64)qmin; }
     cellGcm_set_report_value(report_index, count > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)count);
 }
 

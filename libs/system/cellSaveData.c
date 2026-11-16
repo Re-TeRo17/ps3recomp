@@ -418,6 +418,7 @@ typedef int (*cellSaveData_pick_hook_t)(int is_save, int n, const char* const* n
                                         int new_idx, int def_idx);
 static cellSaveData_pick_hook_t s_pick_hook;
 void cellSaveData_set_pick_hook(cellSaveData_pick_hook_t fn) { s_pick_hook = fn; }
+const char* cellSaveData_root(void) { return s_save_root; }   /* the host save folder (the picker shows each save's ICON0.PNG) */
 
 #define CELL_SAVEDATA_RET_CANCEL_HLE 1   /* CELL_CANCEL: what the system returns when the user cancels the list dialog */
 static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);

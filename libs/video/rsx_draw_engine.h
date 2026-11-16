@@ -155,6 +155,11 @@ typedef struct rsx_draw_backend {
      * A8R8G8B8 texture (R = depth[15:8], G = depth[7:0], B = stencil,
      * A = depth[23:16]); 0 when unsupported. */
     u32  (*depth_snapshot_rgba8)(void* user, u32 depth, u32 w, u32 h);
+    /* RSX_ZSNAP_KEEP: copy the depth target again into an existing snapshot
+     * (the one depth_snapshot*() returned for the same size); returns dst, or
+     * 0 when it cannot (the caller then makes a new one). Draws recorded
+     * before keep reading the old contents: the copy is ordered in the stream. */
+    u32  (*depth_resnap)(void* user, u32 depth, u32 dst, u32 w, u32 h, int packed);
     /* A copy of a colour target as it stands at this point of the stream,
      * for a draw that samples the target it writes (a title's in-place
      * post-process, legal on the RSX and undefined on every host API); 0
@@ -340,6 +345,8 @@ float rsx_present_window_aspect(void);
  * viewport is not the window's whenever the bars are cut away, whatever it
  * returns. */
 int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4]);
+int rsx_present_frame_video(void);          /* the current frame has drawn a movie (read when the frame is handed over) */
+void rsx_present_set_layout_video(int v);   /* the shown frame's movie flag, set before rsx_present_layout */
 
 /* The draws of the last frame presented. */
 extern volatile unsigned g_rsx_frame_draws;

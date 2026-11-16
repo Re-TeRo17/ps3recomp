@@ -496,7 +496,7 @@ static struct SpursInst {
     struct SpursPmSlot slots[6];
     u8 active[16], idle[16];
     u32 dispatches[16]; unsigned long long stats_t0;
-    u32 cursor, pass_no;
+    u32 cursor, pass_no; int kick_pass, kick_pass_idle;
     long long pass_qpc;   /* SPURS_WAKE_GUARD: QPC of the kernel's last scheduling pass */
     /* SPURS_WID_STATS: host time inside the PM per workload, and dispatches
      * made by a pass that followed a 1 ms timeout (kick seen late). */
@@ -1951,6 +1951,10 @@ static int spurs_dispatch_slot(struct SpursInst* si, u32 sn, u32 enabled, int ti
                 if (s_solo_bo < 0) { const char* e = getenv("SPURS_SOLO_BACKOFF"); s_solo_bo = (e && e[0] == '1'); }
                 if (!kicked && (s_solo_bo || si->nspus != 1) && (si->pass_no & ((1u << si->idle[wid]) - 1)))
                     continue;
+                /* Spin mode: a pass woken by a kick runs only kicked workloads. Passes
+                 * come far faster than 1 ms there, so the pass_no back-off above would
+                 * let idle WWS jobs in early (the geomcullclip deadlock, rzs11k). */
+                if (!kicked && si->kick_pass) continue;
                 spu_lockline_lock();
                 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
                 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
@@ -2222,7 +2226,9 @@ static int spurs_quick_kicked(struct SpursInst* si)
     if (!free_lane) return 0;
     const uint8_t* b = vm_base + ea;
     u32 sig = ((u32)b[SPURS_WKL_SIGNAL1] << 8) | b[SPURS_WKL_SIGNAL1 + 1];
+    u32 en = vm_read32(ea + SPURS_WKL_ENABLED);
     for (u32 wid = 0; wid < 16; wid++) {
+        if (!(en & (0x80000000u >> wid))) continue;
         if (b[SPURS_WKL_STATE1 + wid] != 2) continue;
         u32 maxc = b[SPURS_WKL_MAXCONT + wid];
         if (!maxc || si->active[wid] >= maxc) continue;
@@ -2242,7 +2248,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         fprintf(stderr, "[cellSpurs] coordinator wait: %s (%d us)\n", s_spin_us ? "spin" : "1 ms condvar", s_spin_us); }
     while (!si->stopping) {
         int timed_out = 0;
-        if (s_spin_us > 0) {
+        if (s_spin_us > 0 && !si->kick_pass_idle) {
             /* The PPU kicks with inline atomics on the instance line, which never
              * signal the condvar: poll the ready/signal bytes instead of sleeping
              * a timer tick per kick. */
@@ -2259,6 +2265,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         } else
             timed_out = !spl_sleep(&si->wake, &si->lock, 1, __func__, __LINE__);
         if (timed_out) si->wakes_to++; else si->wakes_cv++;
+        si->kick_pass = s_spin_us > 0 && !timed_out && !si->kick_pass_idle;
+        si->kick_pass_idle = 0;
         if (si->stopping) break;
         if (disabled) continue;
         u32 ea = si->ea;
@@ -2266,6 +2274,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         si->pass_no++;
         if (spurs_wake_guard_ms()) { LARGE_INTEGER pq; QueryPerformanceCounter(&pq); si->pass_qpc = pq.QuadPart; }
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+        int kick_done = 0;
         for (u32 sn_i = 0; sn_i < si->nspus; sn_i++) {
             /* SPURS_LANE_AFFINITY=1: lanes are filled last-first, and each lane first takes a workload that is eligible
              * on that lane ONLY (priority nonzero on no other lane) before a shared one: the title pins its heavy
@@ -2274,8 +2283,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             const u32 sn = spurs_lane_aff() ? si->nspus - 1 - sn_i : sn_i;
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
-            int done_slot = spurs_dispatch_slot(si, sn, enabled, timed_out); (void)done_slot;
+            int done_slot = spurs_dispatch_slot(si, sn, enabled, timed_out);
+            if (done_slot) kick_done = 1;
         }
+        /* A kick that dispatched nothing (lane ineligible, max contention): sleep the
+         * next wait on the condvar instead of spinning hot on the same kick. */
+        if (si->kick_pass && !kick_done) si->kick_pass_idle = 1;
         /* SPURS_WID_STATS=1: every 5 s, per workload: dispatches since the last
          * report, readyCount, state, enable bit, maxcont/active, lane priorities,
          * PM resolved. Says whether a stuck job's workload is ever run. */
@@ -2405,7 +2418,7 @@ static DWORD WINAPI spurs_lane_prof_thread(LPVOID p)
 
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
-    si->stopping = 0; si->cursor = si->pass_no = 0;
+    si->stopping = 0; si->cursor = si->pass_no = 0; si->kick_pass = si->kick_pass_idle = 0;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
     for (u32 sn = 0; sn < si->nspus; sn++) {

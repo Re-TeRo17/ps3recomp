@@ -147,6 +147,8 @@ typedef struct {
     u32 mt_ford, mt_lord;       /* ordinals (draws of the frame so far) of the first / last draw into the twin this frame */
     u32 mt_robbed;              /* RSX_MS_TWIN_POOL: s_enc_frame + 1 when this object's twin was taken over by another one */
     u32 v2_site, v2_born, v2_gaddr, v2_ginfo;   /* logv2: allocation site (index in s_v2s), present frame of creation, guest address / info of the caller */
+    u32 bc_dec;                 /* issue #28: the BC1/2/3 DXGI format this texture is decoded from (stored as RGBA8), 0 = none */
+    u8 zown;                    /* rissa15f: made by rsx_d3d12_zown_make (RSX_SURFVIEW_LAZYZOWN: its views are looked up without the join) */
 } EngObj;
 static void eng_ms_drop(EngObj* o);   /* vram106: a twin released with its target */
 
@@ -192,6 +194,7 @@ static EngDisplayMode s_display = DISP_WINDOWED;
 static int s_shadow_k = 2, s_bloom_k = 2;
 extern volatile int g_rsx_pass_shadow;          /* rsx_draw_engine.c */
 extern volatile u32 g_rsx_pass_cw, g_rsx_pass_ch;
+extern int rsx_pass_shadow(void); extern u32 rsx_pass_cw(void); extern u32 rsx_pass_ch(void);   /* rissa15g: a lane's own pass under RSX_LANES_PROQ */
 extern unsigned g_rsx_gov_ev[6];   /* rsx_draw_engine.c: governor frees by kind, printed in the [rt-heap] vram guard line */
 extern float (*g_rsx_poly_target_scale_fn)(void);   /* rsx_draw_engine.c, shad114 RSX_DBIAS_EPILOGUE */
 extern int rsx_dbias_epilogue_on(void);
@@ -208,7 +211,7 @@ static void scf_rect(u32* x, u32* y, u32* w, u32* h, float f)
  * It must fit the canvas-sized depth (guest canvas x RSX_SCALE) and stay under 2048 host pixels. */
 static int eng_shadow_k(u32 w, u32 h)
 {
-    if (s_shadow_k < 2 || !g_rsx_pass_shadow || !w || !h) return 1;
+    if (s_shadow_k < 2 || !rsx_pass_shadow() || !w || !h) return 1;
     int k = s_shadow_k;
     while (k > 1 && ((u64)w * k > s_width || (u64)h * k > s_height ||
                      (float)w * s_scale * (float)k > 2048.0f || (float)h * s_scale * (float)k > 2048.0f)) k >>= 1;
@@ -218,7 +221,7 @@ static int eng_shadow_k(u32 w, u32 h)
  * s_scale, times the extra shadow-map k for Z16 shadow passes. */
 static float eng_poly_target_scale(void)
 {
-    const int ks = eng_shadow_k(g_rsx_pass_cw, g_rsx_pass_ch);
+    const int ks = eng_shadow_k(rsx_pass_cw(), rsx_pass_ch());
     return s_scale * (float)(ks > 1 ? ks : 1);
 }
 static int eng_bloom_k(u32 w, u32 h)
@@ -711,7 +714,12 @@ static int ep_on(void) { if (s_encprof < 0) { const char* e = getenv("RSX_ENCPRO
 static double ep_now(void) { static double inv; LARGE_INTEGER q; if (!inv) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); inv = 1000.0 / (double)f.QuadPart; } QueryPerformanceCounter(&q); return (double)q.QuadPart * inv; }
 static double ep_cpu(void) { FILETIME c, e, k, u; if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
     return (double)((((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime)) / 10000.0; }
-#define ENG_JOIN(why) do { if (s_enc_pending && !t_on_enc) { if (LB->spec) rsx_lane_abort(RSX_LAB_JOIN); eng_enc_join_why((why), 0); } } while (0)
+/* rissa15k: which call made a lane give its chunk back for the encode join (the walker then waits for the previous frame's encode) */
+static const char* volatile s_ljw_why[16]; static volatile long s_ljw_n[16];
+static void eng_ljw_count(const char* why) { for (int i = 0; i < 16; i++) { const char* w = s_ljw_why[i];
+    if (!w) { w = __sync_val_compare_and_swap(&s_ljw_why[i], (const char*)0, why); if (!w) w = why; }
+    if (w == why) { __atomic_fetch_add(&s_ljw_n[i], 1, __ATOMIC_RELAXED); return; } } }
+#define ENG_JOIN(why) do { if (s_enc_pending && !t_on_enc) { if (LB->spec) { eng_ljw_count(why); rsx_lane_abort(RSX_LAB_JOIN); } eng_enc_join_why((why), 0); } } while (0)
 static u32 s_enc_seq;            /* submit number of the frame being encoded (RT AO reads it) */
 static int s_frame_has_rt;       /* RSX_ENCODE_THREAD: a RT AO record is in the frame being built; it goes the synchronous way */
 /* (the vertex-constant memo s_vs_cb_*: EngLaneBe) */
@@ -743,6 +751,7 @@ static u32 s_stat_tex, s_stat_snap, s_stat_snap_reused, s_stat_buf, s_stat_rt;  
  * size and format: a committed D3D12 resource costs the walker a kernel
  * round trip to create and another to free, and this title asks for a few
  * snapshots a frame. */
+static unsigned s_v2_snap_ev, s_v2_snap_rej;   /* log v2 snapres: pool entries evicted for room, returned snapshots destroyed (no room) */
 #define ENG_SNAP_POOL 512          /* array size; the working cap is s_snap_pool_cap (RSX_SNAP_POOL, default 256; 64 before 31/10) */
 static struct { ID3D12Resource* res; DXGI_FORMAT fmt; u32 w, h; u64 fence; D3D12_RESOURCE_STATES state; u32 heap; u64 heap_off, heap_size; } s_snap_pool[ENG_SNAP_POOL];   /* heap*: RSX_DS_HEAP, a placed snapshot keeps its range while pooled */
 static u32 s_snap_pool_n;
@@ -1642,7 +1651,9 @@ extern unsigned long long (*g_rsx_parked_hook)(void);
 static unsigned long long eng_parked_twin_bytes(void);
 extern int (*g_rsx_zeta_direct_hook)(u32 depth, u32 gw, u32 gh);   /* RSX_ZETA_SRV (rsx_draw_engine.c) */
 extern int rsx_d3d12_zeta_direct_ok(u32 depth, u32 gw, u32 gh);
-extern unsigned long long (*g_rsx_target_info_hook)(u32 handle, int* has_twin);   /* rissa128 RSX_SURF_POOL2 (rsx_draw_engine.c) */
+extern unsigned long long (*g_rsx_target_info_hook)(u32 handle, int* has_twin);
+extern unsigned long long (*g_rsx_obj_bytes_hook)(u32 handle, unsigned long long* twin);   /* 14/11 RSX_ZDUMP */
+static unsigned long long eng_obj_bytes(u32 handle, unsigned long long* twin);   /* rissa128 RSX_SURF_POOL2 (rsx_draw_engine.c) */
 static unsigned long long eng_target_info(u32 handle, int* has_twin);
 extern int (*g_rsx_placed_hook)(u32 handle); extern unsigned g_rsx_gov_ev[6];   /* the governor's view of RSX_RT_HEAP / RSX_DS_HEAP (rsx_draw_engine.c) */
 static int eng_gov_placed(u32 handle) { const EngObj* o = eng_obj(handle); if (!o || (o->kind != OBJ_COLOR && o->kind != OBJ_DEPTH) || o->heap < RTH_TAG) return 0; return o->ms ? 2 : 1; }
@@ -1969,7 +1980,7 @@ static int eng_snap_pool_make_room(DXGI_FORMAT fmt, u32 w, u32 h)
         if (v < 0) return 0;
         eng_snap_pool_free_entry((u32)v);
         s_snap_pool[(u32)v] = s_snap_pool[--s_snap_pool_n];
-        { static unsigned ne; ne++; (void)ne; }
+        s_v2_snap_ev++;
     }
 }
 static u32 s_retired[ENG_MAX_OBJECTS]; static u32 s_retired_count;
@@ -2021,9 +2032,11 @@ static void eng_reap_drain(double budget_ms)   /* encode thread after SetEvent(s
 unsigned long long eng_doomed_bytes(void) { return s_doom_bytes; }
 /* log v2: zeta copies this frame: resources created (with their ms; big = >= 1 Mpx host) and taken from the snapshot pool; zeroed after the read */
 static u32 s_v2_snap_new, s_v2_snap_hit, s_v2_snap_big; static double s_v2_snap_ms;
-void rsx_d3d12_snap_frame(unsigned* nw, double* ms, unsigned* big, unsigned* hit, unsigned* pool_n)
+void rsx_d3d12_snap_frame(unsigned* nw, double* ms, unsigned* big, unsigned* hit, unsigned* pool_n, unsigned* ev, unsigned* rej, unsigned* pool_mb)
 {
     *nw = s_v2_snap_new; *ms = s_v2_snap_ms; *big = s_v2_snap_big; *hit = s_v2_snap_hit; *pool_n = s_snap_pool_n;
+    *ev = s_v2_snap_ev; *rej = s_v2_snap_rej; s_v2_snap_ev = s_v2_snap_rej = 0;
+    { u64 b = 0; for (u32 i = 0; i < s_snap_pool_n; i++) b += (u64)s_snap_pool[i].w * s_snap_pool[i].h * eng_px_bytes(s_snap_pool[i].fmt); *pool_mb = (unsigned)(b >> 20); }
     s_v2_snap_new = s_v2_snap_hit = s_v2_snap_big = 0; s_v2_snap_ms = 0.0;
 }
 /* log v2 "zmix": copies run on the ENCODE thread (DEPTH_RESOLVE records) and the GPU ms of those passes (RSX_GPU_TIME=2); read and zeroed by the walker.
@@ -2188,6 +2201,7 @@ static void eng_collect_retired(void)
             s_snap_pool_n++;
             o->res = NULL;
         }
+        if (o->kind == OBJ_SNAPSHOT && o->res) s_v2_snap_rej++;
         if (o->kind == OBJ_DEPTH && o->res && o->fmt == ENG_DEPTH_FMT && !o->dsinit && dpool_on() && !t_on_enc && eng_dpool_park(o)) { /* parked: o->res / heap now belong to the pool */ }
         if (o->v2_site) v2_site_bump(o->v2_site, 1);
         if (reap_on() && !o->heap_size && o->res) eng_res_free(&o->res, (unsigned long long)o->w * o->h * eng_px_bytes(o->fmt));   /* committed: off the walker */
@@ -2330,6 +2344,7 @@ static int eng_stage_pick(u32 need)
  * old one, which broke the rule). */
 static u32 s_stage_align = ENG_ALIGN;
 static int s_copy_relaxed = 1, s_copy_strict_test, s_list_bad_copy;
+static int s_bc_unaligned = 1;   /* issue #28: D3D12_OPTIONS8.UnalignedBlockTexturesSupported (see bc_decode) */
 static u32 s_bad_copies;
 
 static void eng_check_copy(u64 offset, u32 row_pitch, const char* what)
@@ -3225,7 +3240,7 @@ static int eng_init_device(u32 width, u32 height)
                             (unsigned long long)(desc.DedicatedVideoMemory >> 20));
                     { LARGE_INTEGER umd; umd.QuadPart = 0; if (SUCCEEDED(CALL(ad, CheckInterfaceSupport, &IID_IDXGIDevice, &umd))) s_pc_umd = (unsigned long long)umd.QuadPart; }
                     if (FAILED(CALL(ad, QueryInterface, &IID_IDXGIAdapter3, (void**)&s_adapter3))) s_adapter3 = NULL;
-                    else { g_rsx_target_info_hook = eng_target_info; g_rsx_placed_hook = eng_gov_placed; g_rsx_zeta_direct_hook = rsx_d3d12_zeta_direct_ok;g_rsx_doomed_hook = eng_doomed_bytes; g_rsx_vram_hook = eng_vram_query; g_rsx_parked_hook = eng_parked_twin_bytes; g_v2_vram_hook = eng_v2_vram; g_rsx_cache_dir_hook = eng_cache_dir_hook; g_rsx_level_hook = eng_level_hook;
+                    else { g_rsx_target_info_hook = eng_target_info; g_rsx_obj_bytes_hook = eng_obj_bytes; g_rsx_placed_hook = eng_gov_placed; g_rsx_zeta_direct_hook = rsx_d3d12_zeta_direct_ok;g_rsx_doomed_hook = eng_doomed_bytes; g_rsx_vram_hook = eng_vram_query; g_rsx_parked_hook = eng_parked_twin_bytes; g_v2_vram_hook = eng_v2_vram; g_rsx_cache_dir_hook = eng_cache_dir_hook; g_rsx_level_hook = eng_level_hook;
                            g_rsx_cache_sig_hook = eng_cache_sig_hook; g_rsx_cache_warm_hook = eng_cache_warm_hook; g_rsx_cache_flush_hook = eng_cache_flush_hook; }
                     RELEASE(ad); break;
                 }
@@ -3238,6 +3253,15 @@ static int eng_init_device(u32 width, u32 height)
         RELEASE(factory); return -1;
     }
     if (getenv("D3D12_DBG") && FAILED(CALL(s_dev, QueryInterface, &IID_ID3D12InfoQueue, (void**)&s_infoq))) s_infoq = NULL;
+    {   /* issue #28 (11/11): D3D12_FEATURE_DATA_D3D12_OPTIONS8 (feature 36), spelt out for SDKs older than it */
+        BOOL o8 = FALSE;
+        s_bc_unaligned = SUCCEEDED(CALL(s_dev, CheckFeatureSupport, (D3D12_FEATURE)36, &o8, sizeof o8)) && o8;
+        const char* e = getenv("RSX_BC_UNALIGNED");   /* test: 0 = behave as a driver without it (Windows 10) */
+        if (e && e[0] == '0') s_bc_unaligned = 0;
+        fprintf(stderr, "[rsx engine/d3d12] block-compressed textures with sides not a multiple of 4: %s%s\n",
+                s_bc_unaligned ? "supported" : "not supported, decoded to RGBA8 when loaded", (e && e[0] == '0') ? " (RSX_BC_UNALIGNED=0)" : "");
+        V2EV("caps", "\"bc_unaligned\":%d", s_bc_unaligned);
+    }
     {   /* D3D12_FEATURE_DATA_D3D12_OPTIONS13, spelt out for SDKs older than it */
         struct { BOOL unrestricted_copy_pitch, unrestricted_vertex_alignment, flip_y, flip_z, copy_between_dimensions,
                       alpha_blend_factor; } o13;
@@ -3436,6 +3460,57 @@ static void eng_shutdown(void* user)
     s_active = 0;
 }
 
+/* ---- issue #28 (11/11): block-compressed textures with sides not a multiple of 4 ------------------------------------------------
+ * D3D12 creates a BC1/2/3 texture whose top level is not a multiple of 4 wide / high only when the device reports
+ * D3D12_FEATURE_DATA_D3D12_OPTIONS8.UnalignedBlockTexturesSupported (recent runtimes and drivers, Windows 11); elsewhere
+ * (issue #28: Windows 10, RTX 4060) CreateCommittedResource fails with E_INVALIDARG and the texture stays empty: 23 HUD pieces
+ * (182x182, 90x90, 66x76 BC3) of the quick-select ring at Imperial Fight Fest were missing. Without the capability those
+ * textures (only those) are created RGBA8 and every level is decoded here when it is uploaded: the same texels, no change
+ * where the capability exists. RSX_BC_UNALIGNED=0 forces the decode path (test). */
+static int eng_is_bc(DXGI_FORMAT f) { return f == DXGI_FORMAT_BC1_UNORM || f == DXGI_FORMAT_BC2_UNORM || f == DXGI_FORMAT_BC3_UNORM; }
+static void bc_565(u32 c, u8* o) { const u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, b = c & 31u;
+    o[0] = (u8)((r << 3) | (r >> 2)); o[1] = (u8)((g << 2) | (g >> 4)); o[2] = (u8)((b << 3) | (b >> 2)); o[3] = 255; }
+/* one 4x4 block -> px[16][4] (RGBA, row-major) */
+static void bc_block(const u8* b, DXGI_FORMAT f, u8 px[16][4])
+{
+    const u8* cb = f == DXGI_FORMAT_BC1_UNORM ? b : b + 8;
+    const u32 c0 = (u32)cb[0] | ((u32)cb[1] << 8), c1 = (u32)cb[2] | ((u32)cb[3] << 8);
+    u8 p[4][4];
+    bc_565(c0, p[0]); bc_565(c1, p[1]);
+    if (f != DXGI_FORMAT_BC1_UNORM || c0 > c1) {
+        for (int k = 0; k < 3; k++) { p[2][k] = (u8)((2u * p[0][k] + p[1][k]) / 3u); p[3][k] = (u8)((p[0][k] + 2u * p[1][k]) / 3u); }
+        p[2][3] = p[3][3] = 255;
+    } else {
+        for (int k = 0; k < 3; k++) { p[2][k] = (u8)((p[0][k] + p[1][k]) / 2u); p[3][k] = 0; }
+        p[2][3] = 255; p[3][3] = 0;
+    }
+    const u32 idx = (u32)cb[4] | ((u32)cb[5] << 8) | ((u32)cb[6] << 16) | ((u32)cb[7] << 24);
+    for (int i = 0; i < 16; i++) memcpy(px[i], p[(idx >> (2 * i)) & 3u], 4);
+    if (f == DXGI_FORMAT_BC2_UNORM) {
+        for (int i = 0; i < 16; i++) px[i][3] = (u8)(((b[i >> 1] >> (4 * (i & 1))) & 15u) * 17u);
+    } else if (f == DXGI_FORMAT_BC3_UNORM) {
+        u8 a[8]; a[0] = b[0]; a[1] = b[1];
+        if (a[0] > a[1]) for (u32 k = 1; k < 7; k++) a[k + 1] = (u8)(((7u - k) * a[0] + k * a[1]) / 7u);
+        else { for (u32 k = 1; k < 5; k++) a[k + 1] = (u8)(((5u - k) * a[0] + k * a[1]) / 5u); a[6] = 0; a[7] = 255; }
+        u64 ai = 0; for (int k = 0; k < 6; k++) ai |= (u64)b[2 + k] << (8 * k);
+        for (int i = 0; i < 16; i++) px[i][3] = a[(ai >> (3 * i)) & 7u];
+    }
+}
+/* src: rows of blocks (row_bytes apart, `rows` of them) of a w x h level -> out (w * 4 bytes a row, h rows) */
+static void bc_decode(DXGI_FORMAT f, u32 w, u32 h, const u8* src, u32 row_bytes, u32 rows, u8* out)
+{
+    const u32 bs = f == DXGI_FORMAT_BC1_UNORM ? 8u : 16u, bw = (w + 3u) / 4u, bh = (h + 3u) / 4u;
+    u8 px[16][4];
+    for (u32 by = 0; by < bh && by < rows; by++)
+        for (u32 bx = 0; bx < bw && (bx + 1u) * bs <= row_bytes; bx++) {
+            bc_block(src + (size_t)by * row_bytes + (size_t)bx * bs, f, px);
+            for (u32 y = 0; y < 4u; y++) for (u32 x = 0; x < 4u; x++) {
+                const u32 X = bx * 4u + x, Y = by * 4u + y;
+                if (X < w && Y < h) memcpy(out + ((size_t)Y * w + X) * 4u, px[y * 4u + x], 4);
+            }
+        }
+}
+
 /* ---- resources ------------------------------------------------------------- */
 
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -3444,7 +3519,12 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     ENG_JOIN("tex_create");
     (void)user;
     if (!s_dev || !w || !h) return 0;
-    const DXGI_FORMAT df = eng_dxgi(fmt);
+    DXGI_FORMAT df = eng_dxgi(fmt);
+    u32 bc_dec = 0;   /* issue #28 */
+    if (!s_bc_unaligned && eng_is_bc(df) && ((w & 3u) || (h & 3u))) {
+        static unsigned n; if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] texture %ux%u fmt %d: sides not a multiple of 4, kept as RGBA8 (decoded)\n", w, h, (int)df);
+        bc_dec = (u32)df; df = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
     u32 heap = 0; u64 heap_off = 0, heap_size = 0;
     ID3D12Resource* t = make_placed_texture(df, w, h, mips, faces, D3D12_RESOURCE_STATE_COPY_DEST, &heap, &heap_off, &heap_size);
     if (!t) t = make_texture(df, w, h, mips, faces, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
@@ -3452,6 +3532,7 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     const u32 handle = eng_obj_add(t, OBJ_TEXTURE, df, w, h, mips, faces, D3D12_RESOURCE_STATE_COPY_DEST);
     if (!handle) { if (t) theap_done(heap, heap_off, heap_size); return 0; }   /* eng_obj_add released it */
     s_obj[handle - 1].heap = heap; s_obj[handle - 1].heap_off = heap_off; s_obj[handle - 1].heap_size = heap_size;
+    s_obj[handle - 1].bc_dec = bc_dec;
     eng_write_srv(handle, t, df, mips ? mips : 1, faces, eng_mapping(remap, rsx_fmt));
     return handle;
 }
@@ -3480,6 +3561,14 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
     (void)user;
     EngObj* o = eng_obj(handle);
     if (!o || !o->res || !src || !row_bytes || !rows) return;
+    if (o->bc_dec) {   /* issue #28: RGBA8 copy of a BC level */
+        u8* px = (u8*)calloc((size_t)w * h, 4);
+        if (!px) return;
+        bc_decode((DXGI_FORMAT)o->bc_dec, w, h, (const u8*)src, row_bytes, rows, px);
+        eng_upload_rows(handle, face * o->mips + mip, w, h, px, w * 4u, h);
+        free(px);
+        return;
+    }
     eng_upload_rows(handle, face * o->mips + mip, w, h, src, row_bytes, rows);
 }
 
@@ -3581,14 +3670,49 @@ static int eng_surfview_lazy(void)
     return v;
 }
 
+/* rissa15f RSX_SURFVIEW_LAZYZOWN=1 (default 0): the lookup before the join only for the ZOWN objects (packed own-zeta copies made ahead by the
+ * coordinator). The kPerf defaults turn RSX_LANES_ZOWN on but RSX_SURFVIEW_LAZYJOIN is off (it breaks the shadows), so ZOWN made nothing
+ * ("objects made ahead 0.00/frame") and every pass sampling its own zeta aborted its chunk (depth-packed-own-zeta). */
+static int eng_surfview_lazyzown(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_SURFVIEW_LAZYZOWN"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v;
+}
+
+/* rissa15k RSX_SURFVIEW_LAZYCOLOR=1 (default 0): the lookup before the join also in a LANE for a COLOR surface. Seed 37: every chunk a lane gave back
+ * for the encode join (~2/frame, each making the walker wait for the previous frame's encode, 0.7-1.9 ms/frame) was a colour surface whose view
+ * already existed. Depth surfaces (the shadow maps; RSX_SURFVIEW_LAZYJOIN broke the shadows) and the walker's own calls keep the join. */
+static int eng_surfview_lazycolor(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_SURFVIEW_LAZYCOLOR"); v = (e && e[0] == '1') ? 1 : 0; if (v) fprintf(stderr, "[rsx engine/d3d12] RSX_SURFVIEW_LAZYCOLOR=1: a lane looks up colour views without the encode join\n"); }
+    return v;
+}
+
 static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
 {
-    if (eng_surfview_lazy()) {
+    if (LB->spec && eng_surfview_lazycolor()) {
         EngObj* lo = eng_obj(surface);
-        if (lo && lo->res)
+        if (lo && lo->res && lo->kind == OBJ_COLOR)
             for (u32 i = 0; i < s_view_count; i++)
                 if (s_view[i].surface == surface && s_view[i].remap == remap && s_view[i].format == rsx_format)
                     return s_view[i].view;
+    }
+    if (eng_surfview_lazy() || eng_surfview_lazyzown()) {
+        EngObj* lo = eng_obj(surface);
+        if (lo && lo->res && (lo->zown || eng_surfview_lazy()))
+            for (u32 i = 0; i < s_view_count; i++)
+                if (s_view[i].surface == surface && s_view[i].remap == remap && s_view[i].format == rsx_format)
+                    return s_view[i].view;
+    }
+    if (LB->spec && s_enc_pending && !t_on_enc) {   /* rissa15k: classify the lane's join (kind of surface, view already there or not) */
+        EngObj* co = eng_obj(surface); int hit = 0;
+        if (co && co->res) for (u32 i = 0; i < s_view_count; i++) if (s_view[i].surface == surface && s_view[i].remap == remap && s_view[i].format == rsx_format) { hit = 1; break; }
+        const int k = co ? (int)co->kind : 0;
+        static const char* const nmh[6] = { "sv-none-hit", "sv-tex-hit", "sv-color-hit", "sv-depth-hit", "sv-snap-hit", "sv-view-hit" };
+        static const char* const nmm[6] = { "sv-none-new", "sv-tex-new", "sv-color-new", "sv-depth-new", "sv-snap-new", "sv-view-new" };
+        eng_ljw_count((hit ? nmh : nmm)[k >= 0 && k < 6 ? k : 0]);
     }
     ENG_JOIN("surface_view");
     (void)user;
@@ -3615,11 +3739,12 @@ u32 rsx_d3d12_zown_gen(void) { return s_zown_gen; }
 static u32 eng_depth_snapshot_make_fwd(u32 depth, u32 w, u32 h, int packed, int emit);
 u32 rsx_d3d12_zown_make(u32 depth, u32 w, u32 h, u32 remap, u32 rsx_format, u32* view_out)
 {
-    if (!join_lite_on() || !eng_surfview_lazy()) return 0;
+    if (!join_lite_on() || !(eng_surfview_lazy() || eng_surfview_lazyzown())) return 0;
     const u32 dst = eng_depth_snapshot_make_fwd(depth, w, h, 1, 0);
     if (!dst) return 0;
     EngObj* o = eng_obj(dst);
     if (!o || !o->res || s_view_count >= ENG_MAX_VIEWS) { eng_obj_release(NULL, dst); return 0; }
+    o->zown = 1;
     const u32 handle = eng_obj_add(NULL, OBJ_VIEW, o->fmt, o->w, o->h, 1, 1, o->state);
     if (!handle) { eng_obj_release(NULL, dst); return 0; }
     s_obj[handle - 1].alias = dst;
@@ -3851,6 +3976,32 @@ static u32 eng_depth_snapshot_make(u32 depth, u32 w, u32 h, int packed, int emit
 }
 static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 { (void)user; return eng_depth_snapshot_common(depth, w, h, 0); }
+/* RSX_ZSNAP_KEEP (15/11): a new DEPTH_RESOLVE record into the snapshot the zeta already holds, instead of
+ * releasing it and making another (1-1.5 ms each, ~100-200 a second in the wave brawl). The records are
+ * encoded in order on one list, and the resolve transitions dst SRV -> RT, so draws recorded before it
+ * still read the old copy and later ones the new copy. */
+static u32 eng_depth_resnap(void* user, u32 depth, u32 dst, u32 w, u32 h, int packed)
+{
+    (void)user;
+    if (!join_lite_on()) ENG_JOIN("depth_snapshot");
+    EngObj* z = eng_obj(depth); EngObj* o = eng_obj(dst);
+    if (!z || !z->res || !o || !o->res || !o->has_rtv || !(packed ? s_depth_pack_pso : s_depth_pso)) return 0;
+    if (o->fmt != (packed ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT) || o->gw != w || o->gh != h) return 0;
+    const u32 gw = w, gh = h;
+    if (z->pf > 0.0f) { w = scf_dim(w, z->pf); h = scf_dim(h, z->pf); }
+    else if (z->xx > 0.0f && gw == 960 && gh == 704 && eng_obj_scaled(depth)) { w = scf_dim(w, s_scale * z->xx); h = sc_dim(h); }
+    else if (eng_obj_scaled(depth)) { w = sc_dim(w); h = sc_dim(h); }
+    if (o->w != w || o->h != h) return 0;   /* the zeta's scale changed: a new snapshot */
+    if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return 0; }
+    EngRecord* rec = eng_rec_new();
+    memset(rec, 0, sizeof *rec);
+    rec->kind = ENG_REC_DEPTH_RESOLVE;
+    rec->depth = depth;
+    rec->resolve_dst = dst;
+    rec->resolve_packed = packed;
+    s_v2_snap_hit++;   /* log v2 snapres: counted as a hit, so 'new' shows what is still created */
+    return dst;
+}
 static u32 eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
 { (void)user; return eng_depth_snapshot_common(depth, w, h, 1); }
 
@@ -4733,9 +4884,9 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 dep
     if (depth && count) {
         EngObj* z = eng_owner(depth); const EngObj* c = eng_owner(surfaces[0]);
         if (z && z->kind == OBJ_DEPTH) z->pf = (c && c->xk > 0.0f && !c->xbloom) ? eng_xk_f(c) : 0.0f;
-        if (z && z->kind == OBJ_DEPTH) z->zshadow = g_rsx_pass_shadow ? 1 : 0;   /* RSX_MS_NO_SHADOW */
+        if (z && z->kind == OBJ_DEPTH) z->zshadow = rsx_pass_shadow() ? 1 : 0;   /* RSX_MS_NO_SHADOW */
         if (z && z->kind == OBJ_DEPTH && c && c->xx > 0.0f) z->xx = c->xx;   /* sticky: a 960x704 request/clear rect on this depth is the stretched scene's */
-        if (z && z->kind == OBJ_DEPTH && c && g_rsx_pass_shadow) { u32 v[8] = { c->gw, c->gh, c->w, c->h, z->w, z->h, (u32)(z->pf * 100.f), (u32)(c->xk * 100.f) };
+        if (z && z->kind == OBJ_DEPTH && c && rsx_pass_shadow()) { u32 v[8] = { c->gw, c->gh, c->w, c->h, z->w, z->h, (u32)(z->pf * 100.f), (u32)(c->xk * 100.f) };
             if (cut88_uniq(v, 8)) fprintf(stderr, "[cut88 bind] shadow pass colour guest %ux%u host %ux%u xk=%g, depth host %ux%u, pf=%g\n", c->gw, c->gh, c->w, c->h, (double)c->xk, z->w, z->h, (double)z->pf); }
     }
 }
@@ -4905,7 +5056,7 @@ static void eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags, float
     (void)user;
     if (!w || !h) return;
     if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return; }
-    { const int ks = eng_shadow_k(g_rsx_pass_cw, g_rsx_pass_ch);
+    { const int ks = eng_shadow_k(rsx_pass_cw(), rsx_pass_ch());
       if (ks > 1 && eng_obj_scaled(depth)) scf_rect(&x, &y, &w, &h, s_scale * (float)ks);
       else if (eng_obj_scaled(depth)) {
           /* 02/11 aa110: the depth of the horizontally stretched scene: a guest rect is x*scale*xx wide on the host (else the right quarter keeps stale depth and nothing passes the test there) */
@@ -5553,6 +5704,14 @@ static unsigned long long eng_target_info(u32 handle, int* has_twin)
     if (!o || o->kind != OBJ_COLOR) return 0;
     if (has_twin) *has_twin = o->ms != NULL;
     return (unsigned long long)o->w * o->h * eng_px_bytes(o->fmt);
+}
+static unsigned long long eng_obj_bytes(u32 handle, unsigned long long* twin)   /* 14/11 RSX_ZDUMP: any object's host bytes + its MSAA twin */
+{
+    if (twin) *twin = 0;
+    const EngObj* o = eng_obj(handle);
+    if (!o || !o->res) return 0;
+    if (twin && o->ms) *twin = eng_mt_bytes(o);
+    return (unsigned long long)o->w * o->h * eng_px_bytes(o->kind == OBJ_DEPTH ? ENG_DEPTH_RES_FMT : o->fmt);
 }
 static void eng_ms_drop(EngObj* o)     /* a twin released with its target (retire, rescale, new sample count) */
 {
@@ -7313,8 +7472,10 @@ typedef struct {
     EngRecord* rec;
     int chain[ENG_STAGE_POOL];
     EngVisReport* reports;       /* the frame's pending reports (malloc), moved into the submit record */
+    int video;                   /* uwfix: the frame drew a movie (taken at the hand-over, for the present layout) */
 } EngJob;
 static EngJob s_job;
+static volatile int s_exec_video;   /* uwfix: the movie flag of the frame eng_exec_frame is presenting */
 static HANDLE s_enc_thread, s_enc_go, s_enc_done;
 static volatile LONG s_enc_quit;
 static int s_enc_mode = -1;      /* RSX_ENCODE_THREAD */
@@ -7333,6 +7494,9 @@ static void eng_enc_stats(void)
             s_enc_n_async, s_enc_n_sync, (double)(now.QuadPart - last.QuadPart) / (double)f.QuadPart,
             s_enc_n_async ? s_enc_wait_prev_ms / s_enc_n_async : 0.0, s_enc_n_idle);
     for (unsigned i = 0; i < s_enc_njw; i++) fprintf(stderr, " %s x%u (%.2f ms)", s_enc_jw[i].why, s_enc_jw[i].n, s_enc_jw[i].ms);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[enc-thread] lane chunks given back for the join, by call:");
+    for (int i = 0; i < 16 && s_ljw_why[i]; i++) { fprintf(stderr, " %s x%ld", s_ljw_why[i], s_ljw_n[i]); s_ljw_n[i] = 0; }
     fprintf(stderr, "\n");
     if (ep_on() && s_ep_n) {
         fprintf(stderr, "[encprof] per encoded frame (%u): job wall %.2f ms, thread CPU %.2f ms, Present+pacing %.2f ms, fence waits %.2f ms (GPU/in-flight, not CPU)\n",
@@ -7379,6 +7543,7 @@ static DWORD WINAPI eng_encode_thread(LPVOID arg)
         EngSubmit* sub = &s_sub[j->sub_idx];
         BEACON_PUSH("eng_encode_job");
         const int epo = ep_on(); const double ew0 = epo ? ep_now() : 0.0, ec0 = epo ? ep_cpu() : 0.0;
+        s_exec_video = j->video;
         eng_exec_frame(j->present_surface, 0, j->seq, j->rec, j->n_rec, sub, j->reports, j->n_reports, j->chain, &j->chain_n, 1);
         BEACON_POP();
         if (epo) { s_ep_wall += ep_now() - ew0; s_ep_cpu += ep_cpu() - ec0; s_ep_n++; }
@@ -7441,6 +7606,7 @@ static int eng_submit_async(u32 present_surface)
     }
     EngJob* j = &s_job;
     j->present_surface = present_surface;
+    j->video = rsx_present_frame_video();
     j->seq = s_submit_seq;
     j->rec = s_rec; j->n_rec = s_rec_count;
     j->chain_n = s_chain_n; memcpy(j->chain, s_chain, s_chain_n * sizeof s_chain[0]);
@@ -7511,6 +7677,7 @@ static void eng_submit_impl(u32 present_surface, int wait)
     eng_poll_submits();
     PW_LAP(0, pt);
 
+    s_exec_video = present_surface ? rsx_present_frame_video() : 0;
     eng_exec_frame(present_surface, wait, s_submit_seq, s_rec, s_rec_count, NULL, s_vis_pending, s_vis_npending,
                    s_chain, &s_chain_n, 0);
     pt = pw_on() ? pw_t() : 0.0;
@@ -7586,6 +7753,7 @@ static void eng_exec_frame(u32 present_surface, int wait, u32 seq, const EngReco
              * rsx_present_layout; the headless target keeps the plain one
              * over the whole of it, which the replay references were made with. */
             float lvp[4]; int lrect[4];
+            rsx_present_set_layout_video(s_exec_video);
             if (!s_headless && rsx_present_layout(src->w, src->h, s_win_w, s_win_h, lvp, lrect)) {
                 const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                 CALL(s_list, ClearRenderTargetView, rtv, black, 0, NULL);
@@ -8121,6 +8289,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
     .depth_snapshot_rgba8 = eng_depth_snapshot_rgba8,
+    .depth_resnap = eng_depth_resnap,
     .color_snapshot       = eng_color_snapshot,
     .color_copy_rect      = eng_color_copy_rect,
     .query_begin          = eng_query_begin,

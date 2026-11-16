@@ -75,6 +75,8 @@ static void ring_clear_flags(uint32_t line_ea, uint32_t mask)
     __atomic_fetch_add(&c_rrel, 1, __ATOMIC_RELAXED);
 }
 
+static volatile long c_s111full;
+static double s_ins_s110;
 static void ring_sync_111(L2* l, uint32_t alias110)
 {
     static __thread const uint8_t* c_raw111;
@@ -85,6 +87,7 @@ static void ring_sync_111(L2* l, uint32_t alias110)
     if (l->ls111_ok && memcmp(l->ls111 + 0x13930, raw + 0x13930, 96) == 0) return;
     l2_sync_ls(l->ls111, k_l2_bin111, sizeof k_l2_bin111, raw);
     l->ls111_ok = 1;
+    __atomic_fetch_add(&c_s111full, 1, __ATOMIC_RELAXED);
 }
 
 static void ring_print_stats(const char* why)
@@ -382,12 +385,25 @@ static int s_ign12_cfg;
 static __thread L2* t_ri;
 static volatile long c_iok, c_ifail, c_ifk[16];
 static double s_ins_sync, s_ins_l2, s_ins_put;
+/* SPU_COLL_INLINE_DIRECT=1: il ticket in linea gira sul thread raw 110, che e' il solo a scrivere quella LS: il motore lavora sull'LS vera
+ * invece che su una copia di 256 KB (8 us a ticket). Si riempiono solo i quad nulli della regione immagine (28 KB) col modello, come fa la copia;
+ * le scritture del ticket in LS restano nell'LS vera, come quando gira il lifted. */
+static int s_idirect;
+static void ring_fill_image110(uint8_t* ls)
+{
+    sync_tmpl_init();
+    const uint32_t r0 = 0x60u & ~15u, r1 = (0x60u + (uint32_t)sizeof k_l2_bin110 + 15u) & ~15u;
+    for (uint32_t off = r0; off < r1; off += 16u) {
+        uint64_t a, b; memcpy(&a, ls + off, 8); memcpy(&b, ls + off + 8, 8);
+        if (!(a | b)) memcpy(ls + off, s_tmpl110 + off, 16);
+    }
+}
 static void ring_inline_line(void)
 {
     const long n = c_iok ? c_iok : 1;
     fprintf(stderr, "[coll-ring] in linea: eseguiti %ld, ricaduti sul lifted %ld (", c_iok, c_ifail);
     for (int k = 0; k < 16; k++) if (c_ifk[k]) fprintf(stderr, " k%d=%ld", k, c_ifk[k]);
-    fprintf(stderr, " ) | us/ticket: sync LS %.1f, motore %.1f, PUT+chiusura %.1f\n", s_ins_sync / n / 1000.0, s_ins_l2 / n / 1000.0, s_ins_put / n / 1000.0);
+    fprintf(stderr, " ) | us/ticket: sync LS %.1f, motore %.1f, PUT+chiusura %.1f (di cui sync110 %.1f; sync111 piene %ld)\n", s_ins_sync / n / 1000.0, s_ins_l2 / n / 1000.0, s_ins_put / n / 1000.0, s_ins_s110 / n / 1000.0, c_s111full);
 }
 static int ring_inline(spu_context* ctx)
 {
@@ -399,7 +415,12 @@ static int ring_inline(spu_context* ctx)
         t_ri = l;
     }
     L2* l = t_ri;
-    sync_full_fast(l->ls110, ctx->ls);
+    if (s_idirect) {
+        static __thread int t_ri_direct;   /* ls110 punta gia' a un'LS vera (non va liberata) */
+        if (l->ls110 != ctx->ls) { if (!t_ri_direct) _aligned_free(l->ls110); t_ri_direct = 1; l->ls110 = ctx->ls; }
+        ring_fill_image110(ctx->ls);
+    } else sync_full_fast(l->ls110, ctx->ls);
+    { const long long ta = rq_now(); s_ins_s110 += (double)(ta - t0) * 1e9 / (double)s_rqfreq; }
     ring_sync_111(l, l2_be32(l->ls110 + 0x6DC4));
     if (!l->ls111_ok) { __atomic_fetch_add(&c_ifail, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&c_ifk[15], 1, __ATOMIC_RELAXED); return 0; }
     l2_ign12 = s_ign12_cfg;
@@ -486,6 +507,7 @@ __attribute__((constructor)) static void spu_coll_ring_init(void)
     s_rmode = (m == 2 || m == 3) ? m : 1;
     { const char* e = getenv("SPU_COLL_RING_IGN12"); s_ign12_cfg = e ? e[0] == '1' : perf_def; }
     { const char* e = getenv("SPU_COLL_RING_HDR"); s_ring_hdr = e && e[0] == '1'; }
+    { const char* e = getenv("SPU_COLL_INLINE_DIRECT"); s_idirect = e && e[0] == '1'; }
     if (s_rmode >= 2) QueryPerformanceFrequency((LARGE_INTEGER*)&s_rqfreq);
     if (s_rmode == 1) ring_start(s_rn);
     if (s_rmode == 2) { extern void (*g_spu_ring_preput)(uint32_t, const uint8_t*, uint32_t); g_spu_ring_preput = ring_preput; }

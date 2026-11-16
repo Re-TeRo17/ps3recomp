@@ -1390,9 +1390,14 @@ static void gcm_sub1_observe(u32 method, u32 data)
 extern int g_wkp_on; extern int rsx_wkp_enter(int); extern void rsx_wkp_leave(int); extern void rsx_wkp_pass_begin(void); extern void rsx_wkp_pass_end(void);
 #define WKP_ENTER(b) (g_wkp_on > 0 ? rsx_wkp_enter(b) : -1)
 #define WKP_LEAVE(o) do { if ((o) >= 0) rsx_wkp_leave(o); } while (0)
+/* rissa15d RSX_2D_LAZYDRAIN=1 (default off): drain only before the methods that touch guest memory (NV0039 copy, NV3089 blit, inline COLOR
+ * words); the register setters only fill s_nv0039/s_gcm2d/s_nv3089/s_nv309e, which no queued draw reads. */
+static int s_2d_lazy = -1;
+static void gcm_2d_lazy_drain(void) { if (s_2d_lazy > 0) rsx_draw_engine_b2_drain(); }
 static void gcm_2d_method_impl(u32 subch, u32 method, u32 data)
 {
-    rsx_draw_engine_b2_drain();   /* RSX_DRAW_SPLIT=2: 2D copies read/write guest memory the queued draws may not have consumed yet */
+    if (s_2d_lazy < 0) { const char* e = getenv("RSX_2D_LAZYDRAIN"); s_2d_lazy = (e && e[0] == '1') ? 1 : 0; if (s_2d_lazy) printf("[2d] RSX_2D_LAZYDRAIN=1: drain only before copy/blit/inline writes%c", 10); }
+    if (!s_2d_lazy) rsx_draw_engine_b2_drain();   /* RSX_DRAW_SPLIT=2: 2D copies read/write guest memory the queued draws may not have consumed yet */
     if (subch == 1) {                       /* NV0039 memory to memory */
         /* libgcm's own bindings put NV0039 on subchannel 1 (Drakengard 3's
          * cellGcmSetTransferReportData writes 0x00082184/0x0020230C headers)
@@ -1408,7 +1413,7 @@ static void gcm_2d_method_impl(u32 subch, u32 method, u32 data)
         case 0x031C: s_nv0039.len       = data; return;
         case 0x0320: s_nv0039.lines     = data; return;
         case 0x0324: s_nv0039.fmt       = data; return;
-        case 0x0328: nv0039_copy();             return;
+        case 0x0328: gcm_2d_lazy_drain(); nv0039_copy(); return;
         case 0x0000: case 0x0180:               return;   /* SET_OBJECT, DMA_NOTIFIES */
         }
         /* Anything else here is not an NV0039 method: the title has NV4097
@@ -1481,6 +1486,7 @@ static void gcm_2d_method_impl(u32 subch, u32 method, u32 data)
             u32 py  = s_gcm2d.point >> 16;
             u32 dst_pitch = s_gcm2d.pitch >> 16;
             int local = (s_gcm2d.dst_dma != 0xFEED0001u);
+            gcm_2d_lazy_drain();
             u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
             { static int _it = 0;
               if (_it < 6 && ++_it)
@@ -1517,7 +1523,7 @@ static void gcm_2d_method_impl(u32 subch, u32 method, u32 data)
         case 0x0400: s_nv3089.in_sz     = data; return;
         case 0x0404: s_nv3089.in_fmt    = data; return;
         case 0x0408: s_nv3089.in_off    = data; return;
-        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        case 0x040C: s_nv3089.in_uv     = data; gcm_2d_lazy_drain(); nv3089_blit(); return;
         }
         return;
     }
@@ -3433,9 +3439,31 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
  * gcmSetFlip import (NID 0xDC09357E) lands here; without it vkcube's flip was
  * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
+/* g_gcm_flip_sync_hook (09/11, weapon vendor / weapons menu flicker): when it answers 1, the title's flip first waits until the
+ * walker has consumed every command put so far (control get == put), at most 30 ms. The menus write their UI vertices into the
+ * same main-memory bytes every frame and rely on the RSX having read the last frame's before the next frame writes them; the
+ * walker can still be behind then, and when a menu element appears or goes away (the layout shifts by a few quads) a frame
+ * draws two quads from the next frame's bytes (log\shop116 r_T83: positions read as texture coordinates). */
+int (*g_gcm_flip_sync_hook)(void);
+static void gcm_flip_sync(void)
+{
+    if (!g_gcm_flip_sync_hook || !g_gcm_flip_sync_hook()) return;
+    const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    unsigned spins = 0;
+    for (;;) {
+        if (vm_read32(GCM_CONTROL_GUEST_ADDR + 4) == put) break;
+        QueryPerformanceCounter(&t);
+        if ((t.QuadPart - t0.QuadPart) * 1000 > f.QuadPart * 30) { static unsigned nto; if (nto++ < 8) fprintf(stderr, "[flip-sync] timeout (get %08X put %08X)\n", vm_read32(GCM_CONTROL_GUEST_ADDR + 4), put); break; }
+        if (++spins < 200) YieldProcessor(); else Sleep(0);
+    }
+    { static unsigned n; static double tot; QueryPerformanceCounter(&t); tot += (double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+      if (++n % 600 == 1) fprintf(stderr, "[flip-sync] %u flips waited, %.3f ms average\n", n, tot / n); }
+}
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
     { extern void ps3_cpu_note(void); ps3_cpu_note(); }
+    gcm_flip_sync();
     (void)context;   /* command context — flip is immediate in HLE */
     return cellGcmSetFlipCommand(bufferId);
 }
@@ -4255,6 +4283,7 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    gcm_flip_sync();
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
     /* No room for the marker: the drain flips at this position instead (see
