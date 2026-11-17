@@ -367,14 +367,22 @@ static int savedata_pick_legacy(void)
 }
 
 /* Modification time of a save directory: GAME.SAV when present, else the directory; 0 when it does not exist. */
+/* The st_mtime macros are undefined above (they collide with CellSaveData*Stat), so read the platform field. */
+#if defined(_WIN32)
+#  define SD_HOST_MTIME(st) ((st).st_mtime)
+#elif defined(__APPLE__)
+#  define SD_HOST_MTIME(st) ((st).st_mtimespec.tv_sec)
+#else
+#  define SD_HOST_MTIME(st) ((st).st_mtim.tv_sec)
+#endif
 static long long savedata_dir_mtime(const char* name)
 {
     char path[1100];
     struct stat st;
     snprintf(path, sizeof path, "%s/%s/GAME.SAV", s_save_root, name);
-    if (stat(path, &st) == 0) return (long long)st.st_mtime;
+    if (stat(path, &st) == 0) return (long long)SD_HOST_MTIME(st);
     snprintf(path, sizeof path, "%s/%s", s_save_root, name);
-    if (stat(path, &st) == 0) return (long long)st.st_mtime;
+    if (stat(path, &st) == 0) return (long long)SD_HOST_MTIME(st);
     return 0;
 }
 

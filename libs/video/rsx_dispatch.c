@@ -41,6 +41,10 @@
  */
 
 #include "rsx_dispatch.h"
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"
+#endif
 
 #include <string.h>
 #include <stdio.h>

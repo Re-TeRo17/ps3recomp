@@ -12,6 +12,11 @@
 #include <intrin.h>
 #include <xmmintrin.h>
 #endif
+#ifndef _WIN32   /* off Windows: Win32 names from the shims; __rdtsc/_mm_pause/_mm_prefetch via ps3_cpu.h */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"
+#include "../../runtime/platform/ps3_cpu.h"
+#endif
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"

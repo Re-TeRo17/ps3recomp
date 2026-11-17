@@ -18,7 +18,11 @@
 #include "spu_context.h"
 #include "spu_coherency.h"
 #include <stdint.h>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include "../platform/ps3_cpu.h"   /* _mm_pause on x86 and arm64 */
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>

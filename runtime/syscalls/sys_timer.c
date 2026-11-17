@@ -6,6 +6,11 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#include "../platform/win32_diag_compat.h"
+#endif
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
@@ -55,6 +60,19 @@ int lv2_deadline_passed(int64_t deadline)
     return now.QuadPart >= deadline;
 }
 #endif
+#ifndef _WIN32
+/* The same contract off Windows, on the monotonic clock in nanoseconds (what win32_compat.h's QPC returns). */
+int64_t lv2_usec_deadline(uint64_t usec)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec + (int64_t)usec * 1000ll;
+}
+int lv2_deadline_passed(int64_t deadline)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec >= deadline;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * PPU timebase (mftb/mftbu) -- THE guest clock.
@@ -70,7 +88,7 @@ int lv2_deadline_passed(int64_t deadline)
 /* TOD_DT_DIAG=1: per-thread count of timebase reads + sampled cost (TSC cycles per read, every 64th call);
  * dt_diag_report() (called from the host flip) prints deltas every 5 s. */
 #if defined(__GNUC__)
-#include <x86intrin.h>
+#include "../platform/ps3_cpu.h"   /* __rdtsc/_mm_pause: x86intrin.h on x86, CNTVCT_EL0/yield on arm64 */
 #endif
 #define DT_MAX_THR 48
 struct dt_thr { uint64_t calls, cyc, cyc_n, last_calls; unsigned tid; };

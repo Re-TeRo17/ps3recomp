@@ -11,6 +11,11 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"
+#include "../../runtime/platform/ps3_cpu.h"
+#endif
 #include "rsx_draw_snap.h"
 #include "rsx_logv2.h"
 #include "rsx_capture.h"

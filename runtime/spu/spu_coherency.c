@@ -217,8 +217,14 @@ int spu_coh_is_reserved(uint32_t addr)
  * before notifying; this gives the DMA path the same ability. */
 void spu_hangline_note(char kind, int img, uint32_t spu, uint32_t pc, uint32_t ea, const uint8_t* line);
 extern uint8_t* vm_base;
+#if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
+#else
+#include "../platform/ps3_cpu.h"
+#include "../platform/msvc_compat.h"   /* _InterlockedExchange & co. in spu_c37.inc */
+#include "../platform/win32_compat.h"
+#endif
 #include "spu_c37.inc"
 /* SPU_COH_WATCH=<hex ea>: who writes that 128-byte line (SPU DMA: image + pc; PPU: host return
  * address, resolve with llvm-symbolizer against tod.pdb). First 24 events, then a count every 200k. */

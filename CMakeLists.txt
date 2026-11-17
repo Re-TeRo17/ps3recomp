@@ -43,6 +43,12 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+# RT ambient occlusion is DXR (D3D12) only: off Windows rsx_rt_off.c answers the draw engine with "RT off".
+if(WIN32)
+    list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_rt_off\\.c$")
+else()
+    list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_rt\\.c$")
+endif()
 
 # The Vulkan RSX backend (Linux) is opt-in. It loads libvulkan at run time,
 # so building needs only the Vulkan headers -- no target-architecture

@@ -15,6 +15,25 @@
 #include "spu_helpers.h"
 #include <string.h>
 #include <stdio.h>
+
+#if !(defined(_M_X64) || defined(__x86_64__))
+/* Not x86-64: the native reference is written with SSE intrinsics and is not ported yet. Every command
+ * answers ANIM_NOT_COVERED, which anim_hle.c already handles by running the game's own lifted SPU
+ * animation job (docs/BUILDING.md: same result, slower). The globals stay so the callers link. */
+int g_f5160_off = 0, g_f4d70_off = 0, g_anim_trace = 0, g_anim_sab = 0, g_anim_why = 0;
+uint32_t g_anim_ea_limit = 0;
+int g_anim_strict = 0;
+int (*g_anim_ea_ok)(uint32_t ea, uint32_t size) = 0;
+ANIM_TLS void (*g_anim_note_cb)(uint32_t ea, uint32_t lsa, uint32_t size) = 0;
+int anim_cmd_ref(const uint8_t* vm, uint32_t cmd_ea, uint8_t* ls, anim_fx* fx)
+{ (void)vm; (void)cmd_ea; (void)ls; (void)fx; return ANIM_NOT_COVERED; }
+int anim_gen_call(int which, const uint8_t* vm, uint8_t* ls, anim_fx* fx, uint32_t a3, uint32_t a4, uint32_t a5,
+                  uint32_t a6, uint32_t a7, uint32_t a8, uint32_t sp)
+{ (void)which; (void)vm; (void)ls; (void)fx; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)sp; return ANIM_NOT_COVERED; }
+int anim_cmd_fast(uint8_t* vm, uint32_t cmd_ea, uint8_t* ls) { (void)vm; (void)cmd_ea; (void)ls; return ANIM_NOT_COVERED; }
+int anim_cmd_compute(const uint8_t* vm, uint32_t cmd_ea, uint8_t* ls, anim_commit* cm)
+{ (void)vm; (void)cmd_ea; (void)ls; (void)cm; return ANIM_NOT_COVERED; }
+#else   /* x86-64: the native reference */
 #include <immintrin.h>
 
 /* anim46: profilo opzionale (-DANIM_PROF): cicli TSC per fase */
@@ -666,7 +685,7 @@ uint32_t g_anim_ea_limit = 0;
  * secondo g_anim_ea_ok); altrimenti d->fault e l'esecuzione ritorna ANIM_NOT_COVERED (il chiamante ricade sul lifted). */
 int g_anim_strict = 0;
 int (*g_anim_ea_ok)(uint32_t ea, uint32_t size) = 0;
-__declspec(thread) void (*g_anim_note_cb)(uint32_t ea, uint32_t lsa, uint32_t size) = 0;   /* dopo ogni GET: contabilita' degli overlay del runtime (spu_overlay_note_get) */
+ANIM_TLS void (*g_anim_note_cb)(uint32_t ea, uint32_t lsa, uint32_t size) = 0;   /* dopo ogni GET: contabilita' degli overlay del runtime (spu_overlay_note_get) */
 typedef struct { const uint8_t* vm; uint8_t* vmw; uint8_t* ls; anim_fx* fx; anim_commit* cm; uint32_t lsa, eal, size, tag, mask; int fault; } dctx;
 /* anim46: fx == NULL -> percorso veloce (nessun log degli effetti); vmw != NULL -> i PUT/PUTLLC sono memcpy diretti in memoria */
 
@@ -1103,3 +1122,4 @@ int anim_cmd_compute(const uint8_t* vm, uint32_t cmd_ea, uint8_t* ls, anim_commi
 {
     return anim_cmd_impl(vm, 0, cmd_ea, ls, 0, cm);
 }
+#endif   /* x86-64 */

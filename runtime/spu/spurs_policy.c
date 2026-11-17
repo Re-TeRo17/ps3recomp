@@ -23,6 +23,11 @@
  * kernel side: select = "no contention, keep running", exit = end of run.
  */
 #include "spu_context.h"
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#include "../platform/win32_diag_compat.h"   /* __try around the stall dump */
+#endif
 #include "spu_coherency.h"
 #include "../platform/win32_compat.h"
 #include "spu_workload.h"
