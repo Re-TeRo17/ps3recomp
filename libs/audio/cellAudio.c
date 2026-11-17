@@ -13,7 +13,7 @@
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
-#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/platform/msvc_compat.h"
 #endif

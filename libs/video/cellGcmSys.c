@@ -12,7 +12,7 @@
 #include <intrin.h>
 #include <xmmintrin.h>
 #endif
-#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: Win32 names via the shims; __rdtsc/_mm_pause/_mm_prefetch via ps3_cpu.h */
+#ifndef _WIN32   /* off Windows: Win32 names from the shims; __rdtsc/_mm_pause/_mm_prefetch via ps3_cpu.h */
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/platform/msvc_compat.h"
 #include "../../runtime/platform/ps3_cpu.h"

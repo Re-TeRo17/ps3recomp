@@ -18,7 +18,7 @@
  *   4. ritorno al chiamante come il lifted: r0/r1/r80-r91 invariati, pc = r0, int_enable = 1, r3 = stato del tag. */
 #define _CRT_SECURE_NO_WARNINGS
 #include "anim_ref.h"
-#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
 #include "../platform/win32_compat.h"
 #include "../platform/msvc_compat.h"
 #include "../platform/win32_diag_compat.h"   /* __try around the stall dump */

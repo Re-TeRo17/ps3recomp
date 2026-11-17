@@ -6,7 +6,7 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
-#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
 #include "../platform/win32_compat.h"
 #include "../platform/msvc_compat.h"
 #include "../platform/win32_diag_compat.h"

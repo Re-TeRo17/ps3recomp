@@ -11,7 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
-#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#ifndef _WIN32   /* off Windows: the Win32 names this file uses come from the shims (Windows has <windows.h>) */
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/platform/msvc_compat.h"
 #include "../../runtime/platform/ps3_cpu.h"
