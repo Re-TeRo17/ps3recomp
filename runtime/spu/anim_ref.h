@@ -59,7 +59,12 @@ int anim_cmd_compute(const uint8_t* vm, uint32_t cmd_ea, uint8_t* ls, anim_commi
 /* anim47: modalita' "stretta" per il gioco (vedi d_ok in anim_ref.c) */
 extern int g_anim_strict;
 extern int (*g_anim_ea_ok)(uint32_t ea, uint32_t size);
-extern __declspec(thread) void (*g_anim_note_cb)(uint32_t ea, uint32_t lsa, uint32_t size);
+#if defined(_MSC_VER)
+#  define ANIM_TLS __declspec(thread)
+#else
+#  define ANIM_TLS __thread
+#endif
+extern ANIM_TLS void (*g_anim_note_cb)(uint32_t ea, uint32_t lsa, uint32_t size);
 
 /* anim45: limite EA del banco (0 = nessuno) e chiamata diretta delle funzioni generate 0x5B78 / 0x53B8 (test unit). */
 extern uint32_t g_anim_ea_limit;

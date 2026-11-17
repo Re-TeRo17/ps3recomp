@@ -13,6 +13,10 @@
  */
 
 #include <time.h>
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"
+#endif
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>

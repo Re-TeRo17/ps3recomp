@@ -3,6 +3,10 @@
  */
 
 #include "sys_semaphore.h"
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#endif
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"

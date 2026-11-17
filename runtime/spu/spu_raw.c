@@ -27,6 +27,10 @@
  */
 
 #include "spu_raw.h"
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#endif
 #include "spu_context.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"

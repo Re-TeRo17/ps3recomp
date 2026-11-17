@@ -12,6 +12,10 @@
  * tools/timeline_analyze.py. See RIPARTENZA.md (26/10 timeline).
  */
 #include <stdint.h>
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +24,7 @@
 #include <intrin.h>
 #define TL_TLS __declspec(thread)
 #else
-#include <x86intrin.h>
+#include "../platform/ps3_cpu.h"   /* __rdtsc/_mm_pause on x86 and arm64 */
 #define TL_TLS __thread
 #endif
 

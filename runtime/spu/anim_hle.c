@@ -18,15 +18,24 @@
  *   4. ritorno al chiamante come il lifted: r0/r1/r80-r91 invariati, pc = r0, int_enable = 1, r3 = stato del tag. */
 #define _CRT_SECURE_NO_WARNINGS
 #include "anim_ref.h"
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#include "../platform/win32_diag_compat.h"   /* __try around the stall dump */
+#endif
 #include "capture_patch.h"
 #include "spu_helpers.h"
 #include "spu_context.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <intrin.h>
 #include <immintrin.h>
 #include <windows.h>
+#else
+#include "../platform/ps3_cpu.h"   /* __rdtsc, _mm_pause, ps3_fpcsr_* */
+#endif
 
 extern uint8_t* vm_base;
 extern int g_spu_pcheck;
@@ -41,6 +50,9 @@ int g_anim_hle_mode = 0;
 static int s_inited;
 
 /* ------------------------------------------------------------------ contatori */
+#ifdef R_OK   /* <unistd.h> access() mode off Windows; this file's R_* counters reuse the name */
+#undef R_OK
+#endif
 enum { R_OK = 0, R_R3, R_PEND, R_DIAG, R_NOTE, R_CNC, R_COVF, R_OTHER, R_N };
 static const char* const R_NAME[R_N] = { "ok", "r3!=7A80", "evento/irq pendente", "diagnostica armata", "overlay-note", "non coperto", "arena/heqi", "altro" };
 static volatile long long s_cnt[R_N];
@@ -166,11 +178,19 @@ static int hle_gate(spu_context* c)
 /* calcolo con MXCSR RZ|DAZ|FTZ. Ritorna il codice di anim_cmd_compute. */
 static int hle_compute(const uint8_t* vm, uint32_t cmd_ea, uint8_t* ls, anim_commit* cm)
 {
+#if defined(_M_X64) || defined(__x86_64__)
     const unsigned old = _mm_getcsr();
     const int old_rz = g_spu_rz;
     _mm_setcsr(0xFFC0u); g_spu_rz = 1;
     int rc = anim_cmd_compute(vm, cmd_ea, ls, cm);
     g_spu_rz = old_rz; _mm_setcsr(old);
+#else   /* the same mode on the host's control register (arm64 FPCR: round toward zero, flush to zero) */
+    const uint64_t old = ps3_fpcsr_get();
+    const int old_rz = g_spu_rz;
+    ps3_fpcsr_set((old & ~PS3_FPCSR_MASK) | PS3_FPCSR_RZ | PS3_FPCSR_FTZ); g_spu_rz = 1;
+    int rc = anim_cmd_compute(vm, cmd_ea, ls, cm);
+    g_spu_rz = old_rz; ps3_fpcsr_set(old);
+#endif
     return rc;
 }
 

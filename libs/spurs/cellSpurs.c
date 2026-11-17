@@ -11,6 +11,11 @@
  */
 
 #include "cellSpurs.h"
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../../runtime/platform/win32_compat.h"
+#include "../../runtime/platform/msvc_compat.h"
+#include "../../runtime/platform/win32_diag_compat.h"
+#endif
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -530,8 +535,12 @@ static void spl_init(void)
 }
 static void spl_who(char* out, size_t n)
 {
+#ifdef _WIN32
     PWSTR w = NULL; out[0] = 0;
     if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &w)) && w) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL); LocalFree(w); }
+#else
+    out[0] = 0; pthread_getname_np(pthread_self(), out, n);
+#endif
     if (!out[0]) snprintf(out, n, "?");
 }
 static void spl_acq(SRWLOCK* lk, const char* fn, int line)
@@ -2334,6 +2343,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
  * reads RIP and counts it per (workload, 16-byte exe RVA); every 20 s it prints the
  * top buckets ([lprof] wid=.. rva=0x..) for offline llvm-symbolizer against tod.pdb
  * (lifted functions are <img>_spu_func_<LS>), plus per-workload totals. */
+#ifdef _WIN32   /* SPURS_LANE_PROF: a Windows-only sampling profiler (SuspendThread/GetThreadContext) */
 struct LprofArg { struct SpursInst* si; unsigned mask; unsigned us; };
 static struct { unsigned wid, rva, lw; char nm[40]; unsigned long long n; } wt[1024]; static int nwt;   /* SPURS_LANE_PROF_WAIT */
 static DWORD WINAPI spurs_lane_prof_thread(LPVOID p)
@@ -2415,6 +2425,7 @@ static DWORD WINAPI spurs_lane_prof_thread(LPVOID p)
     }
     return 0;
 }
+#endif /* _WIN32: SPURS_LANE_PROF */
 
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
@@ -2430,12 +2441,14 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
+#ifdef _WIN32   /* SPURS_LANE_PROF samples lanes with SuspendThread/GetThreadContext */
     { const char* lp = getenv("SPURS_LANE_PROF");
       if (lp && ({ const char* so = getenv("SPURS_LANE_PROF_SOLO"); so ? (so[0] == '2' || (si->nspus == 1)) : si->nspus > 1; })) { struct LprofArg* a = (struct LprofArg*)malloc(sizeof *a);
           const char* us = getenv("SPURS_LANE_PROF_US");
           a->si = si; a->mask = (unsigned)strtoul(lp, NULL, 16); if (!a->mask) a->mask = 1; a->us = us ? (unsigned)atoi(us) : 400;
           CreateThread(NULL, 1u << 18, spurs_lane_prof_thread, a, 0, NULL);
           fprintf(stderr, "[cellSpurs] SPURS_LANE_PROF lanes mask %X on instance 0x%08X\n", a->mask, si->ea); } }
+#endif
     /* A one-SPU instance is a title's dedicated SPU (ToD's NextSynth audio
      * synth): on hardware nothing preempts it, here a run of its 0.4 ms
      * job took up to 20 ms under load and the audio ring went unwritten.

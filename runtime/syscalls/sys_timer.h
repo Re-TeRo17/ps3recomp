@@ -51,9 +51,10 @@ void    ps3_guest_clock_pause(int paused);
  * inflates ~50x even with timeBeginPeriod(1). Waits under 1 ms must instead
  * poll their wake predicate and yield to a QueryPerformanceCounter deadline
  * (same approach sys_timer_usleep already uses). */
+#endif
+/* (declared on every host: sys_timer.c has a POSIX version on the monotonic clock) */
 int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
 int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
-#endif
 
 #define SYS_TIMER_MAX  64
 

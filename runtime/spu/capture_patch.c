@@ -40,6 +40,10 @@
  * =================================================================================================== */
 #define _CRT_SECURE_NO_WARNINGS
 #include "capture_patch.h"
+#ifndef _WIN32   /* PS3_M1_POSIX_COMPAT: the Win32 names this file uses (on Windows it already has <windows.h>) */
+#include "../platform/win32_compat.h"
+#include "../platform/msvc_compat.h"
+#endif
 #include "anim_ref.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,10 +280,10 @@ volatile uint8_t g_anim_cap_on = 0;
 #include "spu_context.h"
 #ifdef _WIN32
 #include <windows.h>
+#endif   /* off Windows CRITICAL_SECTION comes from win32_compat.h (included above) */
 static CRITICAL_SECTION s_cs; static int s_cs_init;
 #define CAP_LOCK()   EnterCriticalSection(&s_cs)
 #define CAP_UNLOCK() LeaveCriticalSection(&s_cs)
-#endif
 extern uint8_t* vm_base;
 static __declspec(thread) int t_in;      /* guardia di rientro: il gancio richiama la funzione lifted stessa */
 

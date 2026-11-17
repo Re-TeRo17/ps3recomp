@@ -14,6 +14,11 @@
  */
 
 #include "spu_dma.h"
+#ifdef _WIN32
+#define SPU_LPROF_TID() __readgsdword(0x48)   /* TEB thread id */
+#else
+#define SPU_LPROF_TID() ((unsigned)GetCurrentThreadId())
+#endif
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -1191,7 +1196,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         }
     }
     { extern int g_lprof_wait_on; extern volatile unsigned g_lprof_wrch[64];
-      if (__builtin_expect(g_lprof_wait_on, 0)) g_lprof_wrch[__readgsdword(0x48) & 63] = (channel << 24) | (v & 0xFFFFFF); }
+      if (__builtin_expect(g_lprof_wait_on, 0)) g_lprof_wrch[SPU_LPROF_TID() & 63] = (channel << 24) | (v & 0xFFFFFF); }
 
     if (__builtin_expect(g_ctw_on != 0, 0) && ctx->image_id == 110) {   /* SPU_COLLTAB_WATCH */
         spu_colltab_check(ctx, "before a channel write");
